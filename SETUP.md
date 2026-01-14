@@ -57,6 +57,7 @@ pip install --upgrade pip
 
 ```bash
 pip install -e .
+
 ```
 
 If `pip` command is not found, use:
