@@ -1,0 +1,170 @@
+# Setup Guide
+
+## System Requirements
+
+- Python 3.8 or higher
+- pip (Python package installer)
+
+## Step-by-Step Setup
+
+### 1. Check Python Installation
+
+First, verify Python is installed:
+
+```bash
+python3 --version
+```
+
+You should see something like `Python 3.8.x` or higher. If not, install Python 3.8+ from [python.org](https://www.python.org/downloads/).
+
+### 2. Create Virtual Environment
+
+Navigate to the project directory and create a virtual environment:
+
+```bash
+cd /home/aj/dev/door_detector
+python3 -m venv venv
+```
+
+This creates a `venv` directory with an isolated Python environment.
+
+### 3. Activate Virtual Environment
+
+**On Linux/macOS:**
+```bash
+source venv/bin/activate
+```
+
+**On Windows:**
+```bash
+venv\Scripts\activate
+```
+
+You should see `(venv)` in your terminal prompt, indicating the virtual environment is active.
+
+### 4. Upgrade pip (Recommended)
+
+```bash
+python3 -m pip install --upgrade pip
+```
+
+Or if `pip` is available:
+```bash
+pip install --upgrade pip
+```
+
+### 5. Install the Package
+
+```bash
+pip install -e .
+```
+
+If `pip` command is not found, use:
+```bash
+python3 -m pip install -e .
+```
+
+This installs the package in "editable" mode, so code changes are immediately available.
+
+### 6. Verify Installation
+
+Check that the CLI command is available:
+
+```bash
+door-detector-step1 --help
+```
+
+You should see usage information. If you get a "command not found" error:
+- Make sure the virtual environment is activated
+- Try: `python3 -m door_detector.step1_pipeline --help`
+
+## Troubleshooting
+
+### "pip: command not found"
+
+**Solution 1:** Use `python3 -m pip` instead:
+```bash
+python3 -m pip install -e .
+```
+
+**Solution 2:** Install pip:
+```bash
+python3 -m ensurepip --upgrade
+```
+
+**Solution 3:** On some systems, pip3 is available:
+```bash
+pip3 install -e .
+```
+
+### "python3: command not found"
+
+- On some systems, use `python` instead of `python3`
+- Check what's available: `which python` or `which python3`
+- You may need to install Python 3.8+ from your system package manager
+
+### "venv: command not found" or "No module named venv"
+
+Install the venv module:
+```bash
+# On Ubuntu/Debian
+sudo apt-get install python3-venv
+
+# On macOS (if using Homebrew)
+brew install python3
+
+# Or use virtualenv as alternative
+pip install virtualenv
+virtualenv venv
+```
+
+### Virtual Environment Not Activating
+
+- Make sure you're in the project directory
+- Check that `venv` directory exists: `ls -la venv/`
+- Try the full path: `source /home/aj/dev/door_detector/venv/bin/activate`
+
+### Package Installation Fails
+
+**Check Python version:**
+```bash
+python3 --version  # Must be 3.8 or higher
+```
+
+**Install build tools (if needed):**
+```bash
+# On Ubuntu/Debian
+sudo apt-get install python3-dev build-essential
+
+# On macOS
+xcode-select --install
+```
+
+**Try installing dependencies separately:**
+```bash
+pip install pymupdf pillow numpy setuptools wheel
+pip install -e .
+```
+
+## Quick Reference
+
+```bash
+# Create venv
+python3 -m venv venv
+
+# Activate (Linux/macOS)
+source venv/bin/activate
+
+# Activate (Windows)
+venv\Scripts\activate
+
+# Install package
+pip install -e .
+
+# Deactivate venv (when done)
+deactivate
+```
+
+## Next Steps
+
+After successful installation, see [TESTING.md](TESTING.md) for how to test the implementation.
