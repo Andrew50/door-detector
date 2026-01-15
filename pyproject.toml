@@ -17,8 +17,8 @@ dependencies = [
 [project.scripts]
 door-detector-step1 = "door_detector.step1_pipeline:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = ["door_detector"]
 
 
 
