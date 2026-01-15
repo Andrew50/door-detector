@@ -40,65 +40,43 @@ For each processed PDF, the following artifacts are generated in the output dire
 - `meta.json` - Metadata including page mode (scan/vector/hybrid), stats, and timings
 - `debug_overlay.png` - Optional visualization showing primitives overlaid on the raster
 
-### Artifact Structure
+## Full Pipeline: PDF → Doors
 
-See the plan document for detailed schema specifications.
+Door Detector now supports a multi-step pipeline with feedback-driven improvement.
 
-## Testing Step 1
-
-### Quick Start
-
-1. **Set up virtual environment (if not already done):**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   pip install -e .
-   ```
-   
-   If `pip` is not found, use:
-   ```bash
-   python3 -m pip install -e .
-   ```
-
-2. **Get test data:**
-   - Download floor plans from the [provided Google Drive folder](https://drive.google.com/drive/folders/1QSsrLCr13xX6h-LYBolEslI369vtahwc?usp=sharing)
-   - Place PDF files in an `inputs/` directory (or any directory you prefer)
-
-3. **Run on a single PDF:**
-   ```bash
-   door-detector-step1 inputs/your_floor_plan.pdf --out artifacts/test_output --dpi 400
-   ```
-
-4. **Verify output:**
-   Check that the following files were created in `artifacts/test_output/`:
-   - `page.png` - Should show the rendered floor plan
-   - `primitives.json` - Should contain extracted vector data
-   - `transform.json` - Should contain transformation matrices
-   - `meta.json` - Should contain metadata and classification
-   - `debug_overlay.png` - Should show primitives overlaid on the raster
-
-### Testing Checklist
-
-- [ ] Installation completes without errors
-- [ ] CLI command runs successfully
-- [ ] All 5 artifact files are generated
-- [ ] `page.png` is a valid image file
-- [ ] `primitives.json` contains non-empty arrays for lines/beziers/rects
-- [ ] `transform.json` contains valid affine matrices
-- [ ] `meta.json` shows a valid mode (scan/vector/hybrid)
-- [ ] `debug_overlay.png` shows primitives aligned with the raster
-- [ ] Transform validation passes (check console output for warnings)
-
-### Test Script
-
-Run the automated test script:
+### 1. Step 1: PDF → Normalized Artifacts
 ```bash
-python tests/test_step1.py inputs/your_floor_plan.pdf
+door-detector-step1 inputs/floor_plan.pdf --out artifacts/floor_plan
 ```
 
-This will verify all artifacts are generated correctly and check data integrity.
+### 2. Step 2: Detection
+```bash
+door-detector-step2 --artifacts artifacts/floor_plan --config configs/door_rules.json
+```
+This generates `doors.json` and `doors_overlay.png`.
+
+### 3. Review & Feedback (UI)
+```bash
+./venv/bin/streamlit run door_detector/review_app.py
+```
+Open the web app, select your artifact directory, and mark detections as **Accepted** or **Rejected**. Click **Save Labels** to generate `labels.json`.
+
+### 4. Reweighting (Learning from Feedback)
+Once you have reviewed a few plans:
+```bash
+door-detector-reweight --artifacts artifacts --out models/reweighter_v1.json
+```
+To use the learned weights in future detections, update your `configs/door_rules.json` to include:
+```json
+{
+  "reweighter_path": "models/reweighter_v1.json",
+  ...
+}
+```
+
+## Testing
+Run the full smoke test:
+```bash
+./venv/bin/python tests/test_step2_smoke.py
+```
 

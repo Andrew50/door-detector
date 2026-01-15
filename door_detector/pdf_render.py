@@ -8,6 +8,9 @@ from typing import Tuple
 import fitz  # PyMuPDF
 from PIL import Image
 
+# Increase PIL pixel limit for large floor plans
+Image.MAX_IMAGE_PIXELS = None
+
 
 def render_page(
     page: fitz.Page, dpi: int = 400, output_path: Path | None = None
