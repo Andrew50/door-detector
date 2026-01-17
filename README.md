@@ -42,35 +42,67 @@ For each processed PDF, the following artifacts are generated in the output dire
 
 ## Full Pipeline: PDF → Doors
 
-Door Detector now supports a multi-step pipeline with feedback-driven improvement.
+Door Detector supports a multi-step pipeline with feedback-driven improvement, all accessible via a unified Streamlit UI.
 
-### 1. Step 1: PDF → Normalized Artifacts
+### 1. Launch the Unified UI
+```bash
+./venv/bin/streamlit run door_detector/review_app.py
+```
+
+The UI is organized into three tabs:
+
+- **🚀 Run Pipeline**: Upload PDFs, select page index, and run the full Step 1 (normalization) and Step 2 (detection) process.
+- **🔍 Review Detections**: Navigate through detections, cycle through doors, and provide feedback:
+    - **Accept/Reject**: Mark model predictions as true or false positives.
+    - **Add Missed Doors**: Use the drawing tool to mark false negatives (missed doors).
+    - **Save Labels**: Feedback is saved to `labels.json` in the artifact directory.
+- **🧠 Train Reweighter**: Train a logistic regression model on your saved labels to improve future detection confidence.
+
+### 2. Command Line Usage (Optional)
+
+If you prefer using the CLI:
+
+#### Step 1: PDF → Normalized Artifacts
 ```bash
 door-detector-step1 inputs/floor_plan.pdf --out artifacts/floor_plan
 ```
 
-### 2. Step 2: Detection
+#### Step 2: Detection
 ```bash
 door-detector-step2 --artifacts artifacts/floor_plan --config configs/door_rules.json
 ```
-This generates `doors.json` and `doors_overlay.png`.
 
-### 3. Review & Feedback (UI)
-```bash
-./venv/bin/streamlit run door_detector/review_app.py
-```
-Open the web app, select your artifact directory, and mark detections as **Accepted** or **Rejected**. Click **Save Labels** to generate `labels.json`.
-
-### 4. Reweighting (Learning from Feedback)
-Once you have reviewed a few plans:
+#### Step 3: Reweighting (Learning from Feedback)
 ```bash
 door-detector-reweight --artifacts artifacts --out models/reweighter_v1.json
 ```
-To use the learned weights in future detections, update your `configs/door_rules.json` to include:
+
+To use the learned weights, update your `configs/door_rules.json` to include:
 ```json
 {
   "reweighter_path": "models/reweighter_v1.json",
   ...
+}
+```
+
+## Feedback Data Model (`labels.json`)
+
+Reviewer feedback is persisted alongside the artifacts:
+
+```json
+{
+  "schema_version": 1,
+  "page_id": "floor_plan_p0",
+  "reviewed_at": "2026-01-14T12:40:00Z",
+  "accepted_ids": ["d_000123"],
+  "rejected_ids": ["d_000124"],
+  "added_boxes": [
+    {
+      "bbox_xyxy": [512.0, 220.0, 605.0, 310.0],
+      "note": "Added via UI"
+    }
+  ],
+  "notes": "..."
 }
 ```
 

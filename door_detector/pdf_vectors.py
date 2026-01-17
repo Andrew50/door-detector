@@ -82,13 +82,19 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
 
             elif item_type == "re":  # Rectangle
                 rect_coords = item[1]
+                # Re-normalize just in case fitz returns non-standard coords
+                x0 = min(rect_coords[0], rect_coords[2])
+                y0 = min(rect_coords[1], rect_coords[3])
+                x1 = max(rect_coords[0], rect_coords[2])
+                y1 = max(rect_coords[1], rect_coords[3])
+                
                 rects.append(
                     {
                         "rect": {
-                            "x0": rect_coords[0],
-                            "y0": rect_coords[1],
-                            "x1": rect_coords[2],
-                            "y1": rect_coords[3],
+                            "x0": x0,
+                            "y0": y0,
+                            "x1": x1,
+                            "y1": y1,
                         },
                         "stroke_width": stroke_width,
                         "color": stroke_color,
@@ -165,8 +171,15 @@ def apply_transform_to_primitives(
     # Transform rectangles
     for rect in primitives["rects"]:
         r = rect["rect"]
-        x0, y0 = transform_func(r["x0"], r["y0"])
-        x1, y1 = transform_func(r["x1"], r["y1"])
+        tx0, ty0 = transform_func(r["x0"], r["y0"])
+        tx1, ty1 = transform_func(r["x1"], r["y1"])
+        
+        # Re-normalize to ensure x0 <= x1 and y0 <= y1 after transformation
+        x0 = min(tx0, tx1)
+        x1 = max(tx0, tx1)
+        y0 = min(ty0, ty1)
+        y1 = max(ty0, ty1)
+        
         transformed["rects"].append(
             {
                 **rect,

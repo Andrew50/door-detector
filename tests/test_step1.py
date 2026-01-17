@@ -16,15 +16,20 @@ def test_artifacts(output_dir: Path) -> Tuple[bool, List[str]]:
         Tuple of (all_passed, list_of_errors)
     """
     errors = []
+    page_size = None
+    primitives_data = None
     required_files = [
         "page.png",
         "primitives.json",
         "transform.json",
         "meta.json",
+    ]
+    optional_files = [
+        # Produced by step1 unless `--no-debug-overlay` is passed.
         "debug_overlay.png",
     ]
 
-    # Check all files exist
+    # Check all required files exist
     for filename in required_files:
         filepath = output_dir / filename
         if not filepath.exists():
@@ -36,6 +41,7 @@ def test_artifacts(output_dir: Path) -> Tuple[bool, List[str]]:
                     img = Image.open(filepath)
                     img.verify()
                     if filename == "page.png":
+                        page_size = (img.width, img.height)
                         print(f"  ✓ {filename}: {img.width}x{img.height} pixels")
                     else:
                         print(f"  ✓ {filename}: Valid image")
@@ -50,6 +56,7 @@ def test_artifacts(output_dir: Path) -> Tuple[bool, List[str]]:
 
                     # Validate specific schemas
                     if filename == "primitives.json":
+                        primitives_data = data
                         if not isinstance(data, dict):
                             errors.append("primitives.json: Expected dict")
                         else:
@@ -101,6 +108,59 @@ def test_artifacts(output_dir: Path) -> Tuple[bool, List[str]]:
                     errors.append(f"Invalid JSON {filename}: {e}")
                 except Exception as e:
                     errors.append(f"Error reading {filename}: {e}")
+
+    # Check optional files (do not fail if missing)
+    for filename in optional_files:
+        filepath = output_dir / filename
+        if not filepath.exists():
+            print(f"  INFO: {filename}: (optional) not present")
+            continue
+        try:
+            img = Image.open(filepath)
+            img.verify()
+            print(f"  ✓ {filename}: Valid image")
+        except Exception as e:
+            errors.append(f"Invalid optional image {filename}: {e}")
+
+    # Additional validation: primitives should lie within the rendered page image.
+    # If they do not, downstream detections (bbox_xyxy) will be off-screen.
+    if page_size and isinstance(primitives_data, dict):
+        w, h = page_size
+        tol = 5.0  # pixels of tolerance for float rounding
+
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+
+        def upd(x: float, y: float) -> None:
+            nonlocal min_x, min_y, max_x, max_y
+            min_x = min(min_x, x)
+            min_y = min(min_y, y)
+            max_x = max(max_x, x)
+            max_y = max(max_y, y)
+
+        for line in primitives_data.get("lines", []):
+            upd(line["p0"]["x"], line["p0"]["y"])
+            upd(line["p1"]["x"], line["p1"]["y"])
+        for bez in primitives_data.get("beziers", []):
+            upd(bez["p0"]["x"], bez["p0"]["y"])
+            upd(bez["p1"]["x"], bez["p1"]["y"])
+            upd(bez["p2"]["x"], bez["p2"]["y"])
+            upd(bez["p3"]["x"], bez["p3"]["y"])
+        for rect in primitives_data.get("rects", []):
+            r = rect["rect"]
+            upd(r["x0"], r["y0"])
+            upd(r["x1"], r["y1"])
+
+        if min_x != float("inf"):
+            print(f"  ✓ primitives bounds: x=[{min_x:.1f}, {max_x:.1f}], y=[{min_y:.1f}, {max_y:.1f}]")
+            if min_x < -tol or min_y < -tol or max_x > (w + tol) or max_y > (h + tol):
+                errors.append(
+                    "primitives.json: Primitive coordinates fall outside page.png bounds "
+                    f"(page={w}x{h}, bounds=[{min_x:.1f},{min_y:.1f},{max_x:.1f},{max_y:.1f}]). "
+                    "This usually indicates a PDF↔pixel transform mismatch (often on rotated pages)."
+                )
 
     return len(errors) == 0, errors
 

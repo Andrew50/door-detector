@@ -22,84 +22,55 @@ def compute_transform(
         Tuple of (transform_dict, pdf_to_pix_func, pix_to_pdf_func)
     """
     scale = dpi / 72.0
-    rotation_deg = page.rotation
+    rotation_deg = int(page.rotation) % 360
+    # PyMuPDF exposes multiple relevant rectangles / coordinate spaces:
+    # - `page.cropbox` / `page.mediabox`: *unrotated* page space (where `page.get_drawings()`
+    #   coordinates land for rotated pages).
+    # - `page.rect`: rotated / display space.
+    cropbox = page.cropbox
+    mediabox = page.mediabox
     page_rect = page.rect
 
-    # Get page dimensions in PDF coordinates
-    x0, y0 = page_rect.x0, page_rect.y0
-    x1, y1 = page_rect.x1, page_rect.y1
-    width_pdf = x1 - x0
-    height_pdf = y1 - y0
+    # IMPORTANT: Rendering uses `fitz.Matrix(scale, scale).prerotate(page.rotation)`,
+    # which rotates around the origin. We derive the coordinate transform from the exact
+    # same matrix and then shift into the pixmap's (0,0)-based coordinate system.
+    base = fitz.Matrix(scale, scale).prerotate(rotation_deg)
 
-    # Use provided pixel dimensions or compute from scale
+    # Transform the page rect to find the pixel-space bounding box (may include negatives
+    # depending on rotation), then translate so the bbox starts at (0, 0).
+    bbox = page_rect * base
+    shift_x = -bbox.x0
+    shift_y = -bbox.y0
+
+    # `page.get_drawings()` coordinates for rotated PDFs are in *unrotated* space (cropbox).
+    # To align vectors with the rendered pixmap, we need:
+    #   (unrotated coords) --[page.rotation_matrix]--> (page.rect / rotated coords)
+    #                     --[base + shift]-----------> (pixmap coords)
+    #
+    # We pre-compose these two affine transforms into a single 2D affine:
+    # M = rotation_matrix ∘ (base+shift)  (applied in that order to points).
+    rot = page.rotation_matrix  # unrotated -> rotated/page.rect coords
+
+    r_a, r_b, r_c, r_d, r_e, r_f = float(rot.a), float(rot.b), float(rot.c), float(rot.d), float(rot.e), float(rot.f)
+    b_a, b_b, b_c, b_d = float(base.a), float(base.b), float(base.c), float(base.d)
+    b_e, b_f = float(base.e + shift_x), float(base.f + shift_y)
+
+    # Compose M = R then B  (i.e., p -> p*R -> (p*R)*B).
+    pdf_to_pix_affine = [
+        b_a * r_a + b_c * r_b,               # a
+        b_b * r_a + b_d * r_b,               # b
+        b_a * r_c + b_c * r_d,               # c
+        b_b * r_c + b_d * r_d,               # d
+        b_a * r_e + b_c * r_f + b_e,         # e
+        b_b * r_e + b_d * r_f + b_f,         # f
+    ]
+
+    computed_pix_width = int(round(bbox.width))
+    computed_pix_height = int(round(bbox.height))
+
     if pix_width is None or pix_height is None:
-        # When PyMuPDF renders with prerotate, it computes the bounding box
-        # For simplicity, if no dimensions provided, use simple calculation
-        # (This should match what PyMuPDF produces for rotation=0)
-        if rotation_deg == 0:
-            pix_width = int(round(width_pdf * scale))
-            pix_height = int(round(height_pdf * scale))
-        else:
-            # For rotated pages, PyMuPDF computes the bounding box
-            # We'll use a temporary pixmap to get the actual dimensions
-            temp_matrix = fitz.Matrix(scale, scale).prerotate(rotation_deg)
-            temp_pixmap = page.get_pixmap(matrix=temp_matrix, alpha=False)
-            pix_width = temp_pixmap.width
-            pix_height = temp_pixmap.height
-            temp_pixmap = None  # Free memory
-
-    # Convert rotation to radians
-    rotation_rad = math.radians(rotation_deg)
-    cos_r = math.cos(rotation_rad)
-    sin_r = math.sin(rotation_rad)
-
-    # Build transformation matrix
-    # PyMuPDF's prerotate applies rotation before scaling
-    # The matrix order is: scale * rotation
-    # We need to match PyMuPDF's coordinate system
-    
-    # For rotation, compute the bounding box of rotated page
-    if rotation_deg == 0:
-        # No rotation - simple scale and translate
-        pdf_to_pix_affine = [
-            scale,
-            0.0,
-            0.0,
-            scale,
-            -x0 * scale,
-            -y0 * scale,
-        ]
-    else:
-        # Rotate corners to find bounding box (matching PyMuPDF's prerotate behavior)
-        center_x = (x0 + x1) / 2
-        center_y = (y0 + y1) / 2
-        
-        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-        rotated_corners = []
-        for cx, cy in corners:
-            dx = cx - center_x
-            dy = cy - center_y
-            # Rotate around center
-            rx = dx * cos_r - dy * sin_r
-            ry = dx * sin_r + dy * cos_r
-            rotated_corners.append((rx + center_x, ry + center_y))
-        
-        # Find bounding box of rotated page
-        min_x = min(p[0] for p in rotated_corners)
-        max_x = max(p[0] for p in rotated_corners)
-        min_y = min(p[1] for p in rotated_corners)
-        max_y = max(p[1] for p in rotated_corners)
-        
-        # Build transformation: rotate around center, then scale, then translate to pixel origin
-        # The translation accounts for the bounding box offset
-        pdf_to_pix_affine = [
-            scale * cos_r,
-            scale * sin_r,
-            -scale * sin_r,
-            scale * cos_r,
-            -min_x * scale,
-            -min_y * scale,
-        ]
+        pix_width = computed_pix_width
+        pix_height = computed_pix_height
 
     # Pixel to PDF transformation (inverse)
     a, b, c, d, e, f = pdf_to_pix_affine
@@ -119,10 +90,15 @@ def compute_transform(
     transform_dict = {
         "dpi": dpi,
         "scale": scale,
-        "page_rect": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+        "page_rect": {"x0": float(page_rect.x0), "y0": float(page_rect.y0), "x1": float(page_rect.x1), "y1": float(page_rect.y1)},
+        "cropbox": {"x0": float(cropbox.x0), "y0": float(cropbox.y0), "x1": float(cropbox.x1), "y1": float(cropbox.y1)},
+        "mediabox": {"x0": float(mediabox.x0), "y0": float(mediabox.y0), "x1": float(mediabox.x1), "y1": float(mediabox.y1)},
+        "rotation_matrix": [r_a, r_b, r_c, r_d, r_e, r_f],
         "rotation_deg": rotation_deg,
         "pdf_to_pix_affine": pdf_to_pix_affine,
         "pix_to_pdf_affine": pix_to_pdf_affine,
+        "computed_pix_width": computed_pix_width,
+        "computed_pix_height": computed_pix_height,
         "pix_width": int(round(pix_width)),
         "pix_height": int(round(pix_height)),
     }

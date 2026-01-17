@@ -40,17 +40,21 @@ def create_door_overlay(
         dtype = door["type"]
         conf = door["confidence"]
         
+        # Ensure bbox is normalized for PIL
+        x0, y0, x1, y1 = bbox
+        norm_bbox = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+        
         color = colors.get(dtype, default_color)
         
         # Draw rectangle
-        draw.rectangle(bbox, outline=color, width=3)
+        draw.rectangle(norm_bbox, outline=color, width=3)
         
         # Draw label
         label = f"{dtype} {conf:.2f}"
         # Draw background for text readability
-        text_bbox = draw.textbbox((bbox[0], bbox[1] - 20), label, font=font)
+        text_bbox = draw.textbbox((norm_bbox[0], norm_bbox[1] - 20), label, font=font)
         draw.rectangle(text_bbox, fill=color)
-        draw.text((bbox[0], bbox[1] - 20), label, fill=(0, 0, 0), font=font)
+        draw.text((norm_bbox[0], norm_bbox[1] - 20), label, fill=(0, 0, 0), font=font)
 
     overlay.save(output_path, "PNG")
 

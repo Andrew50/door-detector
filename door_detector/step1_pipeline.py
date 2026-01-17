@@ -35,8 +35,8 @@ def process_pdf(
     # Load PDF page
     doc, page = load_pdf_page(pdf_path, page_index)
     try:
-        # Extract page ID from filename
-        page_id = pdf_path.stem
+        # Extract page ID from filename and page index to ensure uniqueness
+        page_id = f"{pdf_path.stem}_p{page_index}"
 
         # Render to PNG
         image, render_time_ms = render_page(page, dpi=dpi)
@@ -128,8 +128,12 @@ def _create_debug_overlay(output_dir: Path, image, primitives: dict) -> None:
             draw.line([p0, p3], fill=(0, 255, 0), width=2)
         elif "rect" in prim:  # Rectangle
             r = prim["rect"]
+            x0, y0 = int(r["x0"]), int(r["y0"])
+            x1, y1 = int(r["x1"]), int(r["y1"])
+            
+            # Ensure x0 <= x1 and y0 <= y1 for PIL
             draw.rectangle(
-                [(int(r["x0"]), int(r["y0"])), (int(r["x1"]), int(r["y1"]))],
+                [(min(x0, x1), min(y0, y1)), (max(x0, x1), max(y0, y1))],
                 outline=(0, 0, 255),
                 width=2,
             )
