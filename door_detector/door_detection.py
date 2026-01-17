@@ -1,5 +1,6 @@
 """Core door detection logic using vector primitives."""
 
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -177,8 +178,12 @@ def detect_doors(
                 )
                 
                 if confidence >= config["output"]["min_confidence"]:
+                    # Create a stable ID based on the primitives used
+                    stable_key = f"swing|b={b_idx}|l={l_idx}"
+                    door_id = "d_" + hashlib.sha1(stable_key.encode()).hexdigest()[:10]
+                    
                     candidates.append({
-                        "id": f"d_{len(candidates):06d}",
+                        "id": door_id,
                         "type": "swing",
                         "bbox_xyxy": get_bbox(pts + [p0, p1]),
                         "confidence": float(confidence),

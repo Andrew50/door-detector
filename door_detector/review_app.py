@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import streamlit as st
 from PIL import Image, ImageDraw
 from streamlit_drawable_canvas import st_canvas
 
+from door_detector.library import Library
 from door_detector.step1_pipeline import process_pdf
 from door_detector.step2_pipeline import run_step2
 from door_detector.reweight_fit import fit_reweighter
@@ -16,23 +18,58 @@ from door_detector.reweight_fit import fit_reweighter
 # Increase PIL pixel limit
 Image.MAX_IMAGE_PIXELS = None
 
-st.set_page_config(page_title="Door Detector: Door Detection & Review", layout="wide")
+st.set_page_config(page_title="Door Detector: Door Detection & Review", layout="wide", initial_sidebar_state="expanded")
 
-# --- Helpers ---
+# --- UI Styling ---
+st.markdown("""
+<style>
+    [data-testid="stSidebar"] .stButton button {
+        height: 28px;
+        padding-top: 0px;
+        padding-bottom: 0px;
+        font-size: 13px !important;
+    }
+    [data-testid="stSidebar"] .stButton p {
+        font-size: 13px;
+    }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+        gap: 0.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def get_artifact_dirs(root: Path) -> List[Path]:
-    """Find all directories that contain meta.json (Step 1 output)."""
-    if not root.exists():
-        return []
-    return sorted([p.parent for p in root.glob("**/meta.json")])
+# --- Initialize Library ---
+if "library" not in st.session_state:
+    st.session_state.library = Library(Path("artifacts"))
+    # One-time discovery of existing artifacts
+    st.session_state.library.discover_existing()
 
+lib = st.session_state.library
+
+# --- Session State Helpers ---
+def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
+    if "files" not in st.session_state:
+        st.session_state.files = {}
+    
+    if file_id not in st.session_state.files:
+        st.session_state.files[file_id] = {
+            "accepted": set(labels_data.get("accepted_ids", [])),
+            "rejected": set(labels_data.get("rejected_ids", [])),
+            "added_boxes": labels_data.get("added_boxes", []),
+            "notes": labels_data.get("notes", ""),
+            "selected_door_id": None,
+            "viewer_mode": "Highlight All",
+            "overlay_opacity": 0.5,
+        }
+
+# --- Data Loading ---
 @st.cache_data
-def load_artifact_bundle(dir_path: Path):
-    """Load image, detections, and existing labels."""
-    image_path = dir_path / "page.png"
-    doors_path = dir_path / "doors.json"
-    labels_path = dir_path / "labels.json"
-    meta_path = dir_path / "meta.json"
+def load_file_artifacts(file_dir_str: str):
+    file_dir = Path(file_dir_str)
+    image_path = file_dir / "page.png"
+    doors_path = file_dir / "doors.json"
+    labels_path = file_dir / "labels.json"
+    meta_path = file_dir / "meta.json"
 
     image = Image.open(image_path) if image_path.exists() else None
     
@@ -63,337 +100,381 @@ def save_labels(dir_path: Path, labels_data: Dict[str, Any]):
     with open(labels_path, "w") as f:
         json.dump(labels_data, f, indent=2)
 
-# --- UI Setup ---
+def get_current_signature(config_path: str):
+    try:
+        with open(config_path, "rb") as f:
+            config_bytes = f.read()
+        config = json.loads(config_bytes)
+        sig_content = config_bytes
+        if "reweighter_path" in config:
+            re_path = Path(config["reweighter_path"])
+            if re_path.exists():
+                with open(re_path, "rb") as f:
+                    sig_content += b"|" + f.read()
+        return hashlib.sha256(sig_content).hexdigest()
+    except Exception:
+        return None
 
-st.title("Door Detector: Door Detection & Review")
+# --- UI Components ---
 
-tab_run, tab_review, tab_learn = st.tabs(["🚀 Run Pipeline", "🔍 Review Detections", "🧠 Train Reweighter"])
+def sidebar_library():
+    col1, col2 = st.sidebar.columns([4, 1])
+    col1.title("Library")
+    if col2.button("X", key="collapse_sidebar", help="Collapse sidebar"):
+        st.info("Use the arrow at the top left to collapse/expand the sidebar.")
 
-# --- Tab 1: Run Pipeline ---
-
-with tab_run:
-    st.header("Run Detection Pipeline")
+    # Search
+    search_query = st.sidebar.text_input("Search files...", "").lower()
     
-    col_a, col_b = st.columns(2)
-    with col_a:
-        uploaded_files = st.file_uploader("Upload Floor Plan PDFs", type=["pdf"], accept_multiple_files=True)
-        dpi = st.slider("Rendering DPI", 100, 600, 400)
-        page_index = st.number_input("Page Index", min_value=0, value=0)
-        
-    with col_b:
-        config_path = st.text_input("Config Path", value="configs/door_rules.json")
-        debug_overlay = st.checkbox("Generate Debug Overlay", value=True)
-        
-    if st.button("Run Full Pipeline", type="primary"):
-        if not uploaded_files:
-            st.error("Please upload at least one PDF.")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            upload_root = Path("artifacts/_uploads")
-            upload_root.mkdir(parents=True, exist_ok=True)
-            
-            results = []
-            
-            for i, uploaded_file in enumerate(uploaded_files):
-                pdf_path = upload_root / uploaded_file.name
-                with open(pdf_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                # Output dir naming: artifacts/<pdf_stem>/p<page_index>/
-                out_dir = Path("artifacts") / pdf_path.stem / f"p{page_index}"
-                
-                status_text.text(f"Processing {uploaded_file.name} (Page {page_index})...")
-                
-                try:
-                    # Step 1
-                    process_pdf(
-                        pdf_path=pdf_path,
-                        output_dir=out_dir,
-                        dpi=dpi,
-                        page_index=page_index,
-                        enable_debug_overlay=debug_overlay
-                    )
-                    
-                    # Step 2
-                    run_step2(
-                        artifacts_dir=out_dir,
-                        config_path=Path(config_path)
-                    )
-                    
-                    results.append({
-                        "File": uploaded_file.name,
-                        "Page": page_index,
-                        "Status": "✅ Success",
-                        "Output": str(out_dir)
-                    })
-                except Exception as e:
-                    results.append({
-                        "File": uploaded_file.name,
-                        "Page": page_index,
-                        "Status": f"❌ Error: {str(e)}",
-                        "Output": str(out_dir)
-                    })
-                
-                progress_bar.progress((i + 1) / len(uploaded_files))
-            
-            st.table(results)
-            st.cache_data.clear() # Refresh directories in Review tab
-
-# --- Tab 2: Review Detections ---
-
-with tab_review:
-    st.header("Review & Feedback")
+    st.sidebar.divider()
     
-    artifact_dirs = get_artifact_dirs(Path("artifacts"))
+    # Upload
+    uploaded_file = st.sidebar.file_uploader("Upload Floor Plan PDF", type=["pdf"])
+    if uploaded_file:
+        if st.sidebar.button("Add to Library"):
+            file_id = lib.add_file(uploaded_file.name, uploaded_file.getvalue())
+            st.rerun()
+
+    items = lib.get_items()
+    if search_query:
+        items = [i for i in items if search_query in i["original_name"].lower()]
     
-    if not artifact_dirs:
-        st.info("No artifacts found. Run the pipeline first.")
+    if not items:
+        st.sidebar.info("No files in library.")
     else:
-        # Sidebar-like selection within the tab for better layout
-        selected_dir = st.selectbox(
-            "Select Artifact Directory",
-            artifact_dirs,
-            format_func=lambda x: str(x.relative_to(Path("artifacts")))
-        )
-        
-        image, doors_data, labels_data, meta_data = load_artifact_bundle(selected_dir)
-        
-        if image is None:
-            st.error(f"Image not found in {selected_dir}")
+        for item in items:
+            col_sel, col_del = st.sidebar.columns([5, 1])
+            
+            display_name = item["original_name"]
+            # Manual truncation to keep it on one line
+            if len(display_name) > 22:
+                display_name = display_name[:19] + "..."
+            
+            status = item.get("status", "not_processed")
+            status_tag = ""
+            if status == "processing":
+                status_tag = "(P) "
+            elif status == "error":
+                status_tag = "(E) "
+            elif status == "done":
+                status_tag = "(D) "
+            
+            label = f"{status_tag}{display_name}"
+            
+            if col_sel.button(label, key=f"sel_{item['id']}", use_container_width=True, help=item["original_name"]):
+                st.session_state.selected_file_id = item["id"]
+                st.rerun()
+                
+            if col_del.button("X", key=f"del_{item['id']}", help="Delete file"):
+                lib.delete_item(item["id"])
+                if st.session_state.get("selected_file_id") == item["id"]:
+                    st.session_state.selected_file_id = None
+                st.rerun()
+
+def main_viewer(item: Dict):
+    file_id = item["id"]
+    file_dir = Path(item["path"])
+    
+    image, doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+    init_file_state(file_id, doors_data, labels_data)
+    fstate = st.session_state.files[file_id]
+    
+    st.title(item['original_name'])
+    
+    # Controls bar
+    col_run, col_mode, col_add = st.columns([1, 1, 1])
+    
+    config_path = "configs/door_rules.json" # Default
+    current_sig = get_current_signature(config_path)
+    stored_sig = doors_data.get("analysis_signature")
+    is_out_of_date = stored_sig and current_sig and stored_sig != current_sig
+    
+    with col_run:
+        status = item.get("status", "not_processed")
+        if status == "processing":
+            st.button("Processing...", disabled=True)
         else:
-            detections = doors_data.get("doors", [])
+            label = "Rerun Analysis" if status == "done" else "Run Analysis"
+            if is_out_of_date:
+                label = f"{label} (Out of Date)"
+                st.warning("Analysis config changed. Rerun recommended.")
             
-            # Initialize session state for this directory
-            if "current_dir" not in st.session_state or st.session_state.current_dir != selected_dir:
-                st.session_state.current_dir = selected_dir
-                st.session_state.accepted = set(labels_data.get("accepted_ids", []))
-                st.session_state.rejected = set(labels_data.get("rejected_ids", []))
-                st.session_state.added_boxes = labels_data.get("added_boxes", [])
-                st.session_state.notes = labels_data.get("notes", "")
-                st.session_state.door_idx = 0 if detections else -1
+            if st.button(label, type="primary" if not status == "done" else "secondary"):
+                run_pipeline(file_id, file_dir, config_path)
+                st.rerun()
+
+    with col_mode:
+        fstate["viewer_mode"] = st.selectbox(
+            "Overlay Mode", 
+            ["Highlight All", "Highlight Selected", "Off"],
+            index=["Highlight All", "Highlight Selected", "Off"].index(fstate["viewer_mode"])
+        )
+
+    with col_add:
+        if st.button("Add Door"):
+            fstate["viewer_mode"] = "Add Door"
+
+    # Display Image / Canvas
+    if image:
+        detections = doors_data.get("doors", [])
+        
+        # Filter detections: keep undecided and accepted, exclude rejected
+        active_doors = [d for d in detections if d["id"] not in fstate["rejected"]]
+        # Add user added boxes as pseudo-detections
+        for box in fstate["added_boxes"]:
+            bbox = box["bbox_xyxy"]
+            # Stable ID for added box based on coordinates
+            box_id = f"u_{int(bbox[0])}_{int(bbox[1])}"
+            active_doors.append({
+                "id": box_id,
+                "type": "added",
+                "bbox_xyxy": bbox,
+                "confidence": 1.0,
+                "is_user_added": True
+            })
+
+        if fstate["viewer_mode"] == "Add Door":
+            st.write("Draw a rectangle for the missed door.")
+            canvas_result = st_canvas(
+                fill_color="rgba(0, 255, 255, 0.3)",
+                stroke_width=2,
+                stroke_color="#00ffff",
+                background_image=image,
+                update_streamlit=True,
+                height=int(image.height * (1000 / image.width)) if image.width > 1000 else image.height,
+                width=1000 if image.width > 1000 else image.width,
+                drawing_mode="rect",
+                key=f"canvas_{file_id}",
+            )
             
-            # Filters & Controls
-            st.sidebar.title("Navigation & Filters")
-            
-            if detections:
-                # Ensure door_idx is valid if we have detections
-                if st.session_state.door_idx < 0:
-                    st.session_state.door_idx = 0
-                
-                st.session_state.door_idx = st.sidebar.number_input(
-                    "Door Index", 0, len(detections)-1, st.session_state.door_idx
-                )
-                
-                col_nav1, col_nav2 = st.sidebar.columns(2)
-                if col_nav1.button("⬅️ Previous"):
-                    st.session_state.door_idx = max(0, st.session_state.door_idx - 1)
+            if st.button("Save Added Door"):
+                if canvas_result.json_data is not None:
+                    objects = canvas_result.json_data["objects"]
+                    scale_x = image.width / (1000 if image.width > 1000 else image.width)
+                    scale_y = image.height / (int(image.height * (1000 / image.width)) if image.width > 1000 else image.height)
+                    
+                    for obj in objects:
+                        if obj["type"] == "rect":
+                            x0 = obj["left"] * scale_x
+                            y0 = obj["top"] * scale_y
+                            x1 = (obj["left"] + obj["width"]) * scale_x
+                            y1 = (obj["top"] + obj["height"]) * scale_y
+                            fstate["added_boxes"].append({"bbox_xyxy": [x0, y0, x1, y1]})
+                    
+                    save_current_labels(file_id, file_dir)
+                    fstate["viewer_mode"] = "Highlight All"
                     st.rerun()
-                if col_nav2.button("Next ➡️"):
-                    st.session_state.door_idx = min(len(detections) - 1, st.session_state.door_idx + 1)
-                    st.rerun()
-
-            st.sidebar.divider()
-            viewer_mode = st.sidebar.radio("Viewer Mode", ["Review Overlay", "Model Overlay", "Original Image", "Add Missed Doors"])
+        else:
+            # Normal viewing with click capture
+            display_img = image.copy()
+            draw = ImageDraw.Draw(display_img)
             
-            # Main View
-            col_view, col_info = st.columns([3, 1])
+            if fstate["viewer_mode"] != "Off":
+                for d in active_doors:
+                    is_selected = d["id"] == fstate["selected_door_id"]
+                    if fstate["viewer_mode"] == "Highlight Selected" and not is_selected:
+                        continue
+                        
+                    bbox = d["bbox_xyxy"]
+                    color = (0, 255, 0) if d["id"] in fstate["accepted"] else (255, 165, 0)
+                    if d.get("is_user_added"):
+                        color = (0, 255, 255)
+                    
+                    width = 4
+                    if is_selected:
+                        color = (255, 255, 255)
+                        width = 8
+                    
+                    draw.rectangle(bbox, outline=color, width=width)
+
+            # Use canvas just to capture clicks
+            canvas_click = st_canvas(
+                background_image=display_img,
+                update_streamlit=True,
+                height=int(image.height * (1000 / image.width)) if image.width > 1000 else image.height,
+                width=1000 if image.width > 1000 else image.width,
+                drawing_mode="point",
+                display_toolbar=False,
+                key=f"viewer_{file_id}",
+            )
             
-            with col_view:
-                if viewer_mode == "Add Missed Doors":
-                    st.write("Draw rectangles to mark missed doors. Double-click to remove a box.")
-                    # Canvas for drawing boxes
-                    canvas_result = st_canvas(
-                        fill_color="rgba(0, 255, 0, 0.3)",
-                        stroke_width=3,
-                        stroke_color="#00ff00",
-                        background_image=image,
-                        update_streamlit=True,
-                        height=int(image.height * (800 / image.width)) if image.width > 800 else image.height,
-                        width=800 if image.width > 800 else image.width,
-                        drawing_mode="rect",
-                        key="canvas",
-                    )
+            if canvas_click.json_data and canvas_click.json_data["objects"]:
+                last_point = canvas_click.json_data["objects"][-1]
+                if last_point["type"] == "circle":
+                    scale_x = image.width / (1000 if image.width > 1000 else image.width)
+                    scale_y = image.height / (int(image.height * (1000 / image.width)) if image.width > 1000 else image.height)
+                    click_x = last_point["left"] * scale_x
+                    click_y = last_point["top"] * scale_y
                     
-                    if canvas_result.json_data is not None:
-                        objects = canvas_result.json_data["objects"]
-                        if st.button("Save Added Boxes"):
-                            new_boxes = []
-                            # Scale coordinates back to original image size
-                            scale_x = image.width / 800 if image.width > 800 else 1.0
-                            scale_y = image.height / (image.height * (800 / image.width)) if image.width > 800 else 1.0
-                            
-                            for obj in objects:
-                                if obj["type"] == "rect":
-                                    x0_raw = obj["left"] * scale_x
-                                    y0_raw = obj["top"] * scale_y
-                                    x1_raw = (obj["left"] + obj["width"]) * scale_x
-                                    y1_raw = (obj["top"] + obj["height"]) * scale_y
-                                    
-                                    # Normalize coordinates to ensure x0 <= x1 and y0 <= y1
-                                    x0 = min(x0_raw, x1_raw)
-                                    x1 = max(x0_raw, x1_raw)
-                                    y0 = min(y0_raw, y1_raw)
-                                    y1 = max(y0_raw, y1_raw)
-                                    
-                                    new_boxes.append({"bbox_xyxy": [x0, y0, x1, y1], "note": "Added via UI"})
-                            
-                            st.session_state.added_boxes = new_boxes
-                            st.success(f"Captured {len(new_boxes)} boxes.")
-                
-                else:
-                    # Rendering Logic
-                    display_img = image.copy()
-                    draw = ImageDraw.Draw(display_img)
+                    # Find clicked door
+                    clicked_id = None
+                    for d in active_doors:
+                        b = d["bbox_xyxy"]
+                        if b[0] <= click_x <= b[2] and b[1] <= click_y <= b[3]:
+                            clicked_id = d["id"]
+                            break
                     
-                    if viewer_mode == "Review Overlay":
-                        for i, d in enumerate(detections):
-                            did = d.get("id", f"d_{i:06d}")
-                            bbox = d["bbox_xyxy"]
-                            
-                            # Normalize for PIL
-                            x0 = min(bbox[0], bbox[2])
-                            y0 = min(bbox[1], bbox[3])
-                            x1 = max(bbox[0], bbox[2])
-                            y1 = max(bbox[1], bbox[3])
-                            norm_bbox = [x0, y0, x1, y1]
-                            
-                            if did in st.session_state.accepted:
-                                color = (0, 255, 0) # Green
-                                width = 3
-                            elif did in st.session_state.rejected:
-                                color = (255, 0, 0) # Red
-                                width = 3
-                            else:
-                                color = (255, 165, 0) # Orange
-                                width = 3
-                            
-                            # Emphasize current door
-                            if i == st.session_state.door_idx:
-                                color = (255, 255, 255)
-                                width = 8
-                            
-                            draw.rectangle(norm_bbox, outline=color, width=width)
-                        
-                        for box in st.session_state.added_boxes:
-                            bbox = box["bbox_xyxy"]
-                            norm_bbox = [min(bbox[0], bbox[2]), min(bbox[1], bbox[3]), max(bbox[0], bbox[2]), max(bbox[1], bbox[3])]
-                            draw.rectangle(norm_bbox, outline=(0, 255, 255), width=5) # Cyan for additions
+                    if clicked_id:
+                        fstate["selected_door_id"] = clicked_id
+                        st.rerun()
 
-                    elif viewer_mode == "Model Overlay":
-                        # Load from doors_overlay.png if it exists, otherwise draw
-                        overlay_path = selected_dir / "doors_overlay.png"
-                        if overlay_path.exists():
-                            display_img = Image.open(overlay_path)
-                        else:
-                            for d in detections:
-                                draw.rectangle(d["bbox_xyxy"], outline=(0, 255, 0), width=3)
+    else:
+        st.info("Run analysis to see results.")
 
-                    st.image(display_img, use_container_width=True)
-
-            with col_info:
-                st.subheader("Details")
-                if st.session_state.door_idx >= 0 and st.session_state.door_idx < len(detections):
-                    door = detections[st.session_state.door_idx]
-                    did = door.get("id", f"d_{st.session_state.door_idx:06d}")
-                    st.write(f"**ID:** {did}")
-                    st.write(f"**Type:** {door.get('type')}")
-                    st.write(f"**Confidence:** {door.get('confidence'):.3f}")
-                    
-                    c1, c2 = st.columns(2)
-                    if c1.button("✅ Accept", key=f"acc_{did}"):
-                        st.session_state.accepted.add(did)
-                        st.session_state.rejected.discard(did)
-                    if c2.button("❌ Reject", key=f"rej_{did}"):
-                        st.session_state.rejected.add(did)
-                        st.session_state.accepted.discard(did)
-                        
-                    with st.expander("Geometric Features"):
-                        st.json(door.get("features", {}))
-                        
-                    # Zoomed crop
-                    bbox = door["bbox_xyxy"]
-                    # Ensure bbox is [x0, y0, x1, y1] with x0 <= x1 and y0 <= y1
-                    x0 = min(bbox[0], bbox[2])
-                    x1 = max(bbox[0], bbox[2])
-                    y0 = min(bbox[1], bbox[3])
-                    y1 = max(bbox[1], bbox[3])
-                    
-                    pad = 100
-                    left = max(0, x0 - pad)
-                    top = max(0, y0 - pad)
-                    right = min(image.width, x1 + pad)
-                    bottom = min(image.height, y1 + pad)
-                    
-                    # Check if the detection is entirely outside the image
-                    is_off_screen = (x1 < 0 or x0 > image.width or y1 < 0 or y0 > image.height)
-                    
-                    if not is_off_screen and right > left and bottom > top:
-                        crop_box = (left, top, right, bottom)
-                        st.image(image.crop(crop_box), caption="Zoomed View")
-                    elif is_off_screen:
-                        st.warning(f"Detection is outside the rendered page area (Image: {image.width}x{image.height}, BBox: [{x0:.1f}, {y0:.1f}, {x1:.1f}, {y1:.1f}])")
-                    else:
-                        st.warning("Could not generate valid zoom view for this detection.")
-                
-                st.divider()
-                st.write(f"**Accepted:** {len(st.session_state.accepted)}")
-                st.write(f"**Rejected:** {len(st.session_state.rejected)}")
-                st.write(f"**Added:** {len(st.session_state.added_boxes)}")
-                
-                st.session_state.notes = st.text_area("Notes", value=st.session_state.notes)
-                
-                if st.button("💾 Save Labels", type="primary"):
-                    labels_to_save = {
-                        "schema_version": 1,
-                        "page_id": meta_data.get("id", selected_dir.name),
-                        "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "accepted_ids": list(st.session_state.accepted),
-                        "rejected_ids": list(st.session_state.rejected),
-                        "added_boxes": st.session_state.added_boxes,
-                        "notes": st.session_state.notes
-                    }
-                    save_labels(selected_dir, labels_to_save)
-                    st.success("Labels saved!")
-
-# --- Tab 3: Learn ---
-
-with tab_learn:
-    st.header("Train Door Reweighter")
-    st.write("Improve detection accuracy by training a logistic regression model on your reviewed labels.")
+def right_panel_review(item: Dict):
+    file_id = item["id"]
+    file_dir = Path(item["path"])
+    image, doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
     
-    artifacts_root = st.text_input("Artifacts Root", value="artifacts")
-    model_out = st.text_input("Model Output Path", value="models/reweighter_v1.json")
+    if file_id not in st.session_state.files:
+        return # Not initialized yet
+        
+    fstate = st.session_state.files[file_id]
+    detections = doors_data.get("doors", [])
     
-    if st.button("🔥 Fit Reweighter"):
-        with st.spinner("Training..."):
-            try:
-                fit_reweighter(Path(artifacts_root), Path(model_out))
-                
-                if Path(model_out).exists():
-                    st.success(f"Model saved to {model_out}")
-                    with open(model_out) as f:
-                        model_data = json.load(f)
-                    
-                    st.subheader("Learned Weights")
-                    weights_df = {
-                        "Feature": model_data["feature_order"],
-                        "Weight": model_data["weights"]
-                    }
-                    st.table(weights_df)
-                    st.write(f"**Bias:** {model_data['bias']:.4f}")
-                    
-                    st.info(f"""
-                    To use this model, update your `{config_path}`:
-                    ```json
-                    {{
-                      "reweighter_path": "{model_out}",
-                      ...
-                    }}
-                    ```
-                    """)
-                else:
-                    st.error("No labels found to train on. Review some doors first!")
-            except Exception as e:
-                st.error(f"Training failed: {e}")
+    # Filter and sort
+    all_visible = []
+    for d in detections:
+        if d["id"] not in fstate["rejected"]:
+            all_visible.append(d)
+    for box in fstate["added_boxes"]:
+        bbox = box["bbox_xyxy"]
+        box_id = f"u_{int(bbox[0])}_{int(bbox[1])}"
+        all_visible.append({
+            "id": box_id,
+            "type": "added",
+            "bbox_xyxy": bbox,
+            "confidence": 1.0,
+            "is_user_added": True
+        })
+    
+    all_visible.sort(key=lambda x: x["confidence"], reverse=True)
+    
+    st.subheader(f"Doors ({len(all_visible)})")
+    
+    if not all_visible:
+        st.write("No doors detected.")
+        return
+
+    # Selection sync
+    selected_idx = -1
+    if fstate["selected_door_id"]:
+        for i, d in enumerate(all_visible):
+            if d["id"] == fstate["selected_door_id"]:
+                selected_idx = i
+                break
+    
+    if selected_idx == -1 and all_visible:
+        selected_idx = 0
+        fstate["selected_door_id"] = all_visible[0]["id"]
+
+    # Prev/Next
+    col_p, col_idx, col_n = st.columns([1, 2, 1])
+    if col_p.button("Prev", disabled=selected_idx <= 0):
+        fstate["selected_door_id"] = all_visible[selected_idx - 1]["id"]
+        st.rerun()
+    col_idx.write(f"{selected_idx + 1} / {len(all_visible)}")
+    if col_n.button("Next", disabled=selected_idx >= len(all_visible) - 1):
+        fstate["selected_door_id"] = all_visible[selected_idx + 1]["id"]
+        st.rerun()
+
+    st.divider()
+    
+    # Details of selected
+    selected_door = all_visible[selected_idx]
+    did = selected_door["id"]
+    
+    st.write(f"**ID:** `{did}`")
+    st.write(f"**Type:** {selected_door['type']}")
+    st.write(f"**Confidence:** {selected_door['confidence']:.3f}")
+    
+    # Zoom
+    if image:
+        bbox = selected_door["bbox_xyxy"]
+        pad = 100
+        crop_box = (
+            max(0, bbox[0] - pad),
+            max(0, bbox[1] - pad),
+            min(image.width, bbox[2] + pad),
+            min(image.height, bbox[3] + pad)
+        )
+        st.image(image.crop(crop_box), use_container_width=True)
+
+    # Actions
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Accept", use_container_width=True):
+        fstate["accepted"].add(did)
+        fstate["rejected"].discard(did)
+        save_current_labels(file_id, file_dir)
+        st.rerun()
+    if c2.button("Reject", use_container_width=True):
+        if selected_door.get("is_user_added"):
+            # If it's user added, "Reject" means remove it entirely
+            # Find by ID
+            fstate["added_boxes"] = [b for b in fstate["added_boxes"] if f"u_{int(b['bbox_xyxy'][0])}_{int(b['bbox_xyxy'][1])}" != did]
+        else:
+            fstate["rejected"].add(did)
+            fstate["accepted"].discard(did)
+        save_current_labels(file_id, file_dir)
+        fstate["selected_door_id"] = None # Move to next
+        st.rerun()
+    if c3.button("Skip", use_container_width=True):
+        if selected_idx < len(all_visible) - 1:
+            fstate["selected_door_id"] = all_visible[selected_idx + 1]["id"]
+            st.rerun()
+
+    st.divider()
+    st.write(f"**Stats:** {len(fstate['accepted'])} Accepted, {len(fstate['rejected'])} Rejected, {len(fstate['added_boxes'])} Added")
+    
+    # Train badge
+    total_overrides = len(fstate["accepted"]) + len(fstate["rejected"]) + len(fstate["added_boxes"])
+    if total_overrides >= 5:
+        st.success("Ready to retrain!")
+        if st.button("Train Reweighter"):
+            with st.spinner("Training..."):
+                fit_reweighter(Path("artifacts"), Path("models/reweighter_v1.json"))
+                st.success("Model updated!")
+                st.cache_data.clear()
+                st.rerun()
+
+def run_pipeline(file_id: str, file_dir: Path, config_path: str):
+    lib.update_status(file_id, "processing")
+    try:
+        pdf_path = file_dir / "source.pdf"
+        process_pdf(pdf_path, file_dir, dpi=400, page_index=0)
+        run_step2(file_dir, Path(config_path))
+        lib.update_status(file_id, "done")
+        st.cache_data.clear()
+    except Exception as e:
+        lib.update_status(file_id, "error", str(e))
+
+def save_current_labels(file_id: str, file_dir: Path):
+    fstate = st.session_state.files[file_id]
+    labels_to_save = {
+        "schema_version": 1,
+        "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "accepted_ids": list(fstate["accepted"]),
+        "rejected_ids": list(fstate["rejected"]),
+        "added_boxes": fstate["added_boxes"],
+        "notes": fstate["notes"]
+    }
+    save_labels(file_dir, labels_to_save)
+
+# --- Layout ---
+
+sidebar_library()
+
+if "selected_file_id" in st.session_state and st.session_state.selected_file_id:
+    items = lib.get_items()
+    selected_item = next((i for i in items if i["id"] == st.session_state.selected_file_id), None)
+    
+    if selected_item:
+        col_main, col_review = st.columns([2, 1])
+        
+        with col_main:
+            main_viewer(selected_item)
+            
+        with col_review:
+            right_panel_review(selected_item)
+else:
+    st.info("Select a file from the library to begin.")

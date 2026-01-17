@@ -18,10 +18,13 @@ def fit_reweighter(artifacts_root: Path, output_model: Path) -> None:
     # We'll use these features in this order
     feature_names = ["rmse", "radius", "angle_span", "hinge_dist", "len_ratio"]
     
+    # We'll look into artifacts/library as well
     label_files = list(artifacts_root.glob("**/labels.json"))
     if not label_files:
         print("No labels.json files found. Go review some detections first!")
         return
+
+    from door_detector.door_features import compute_iou
 
     for label_path in label_files:
         dir_path = label_path.parent
@@ -37,14 +40,37 @@ def fit_reweighter(artifacts_root: Path, output_model: Path) -> None:
             
         accepted = set(labels_data.get("accepted_ids", []))
         rejected = set(labels_data.get("rejected_ids", []))
+        added_boxes = labels_data.get("added_boxes", [])
         
-        for door in doors_data.get("doors", []):
+        all_candidates = doors_data.get("doors", [])
+        
+        # 1a. Process accepted/rejected from doors.json
+        for door in all_candidates:
             did = door["id"]
             if did in accepted or did in rejected:
-                # Extract features
                 feats = [door["features"].get(n, 0.0) for n in feature_names]
                 features_list.append(feats)
                 labels_list.append(1 if did in accepted else 0)
+
+        # 1b. Process added boxes: try to match them to a candidate that was NOT in the final list
+        # (or even one that was, but wasn't explicitly accepted/rejected yet)
+        for box in added_boxes:
+            best_iou = 0
+            best_cand = None
+            for cand in all_candidates:
+                iou = compute_iou(box["bbox_xyxy"], cand["bbox_xyxy"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_cand = cand
+            
+            if best_iou > 0.5: # If we matched a candidate
+                # Check if we already added this candidate via 'accepted'
+                if best_cand["id"] in accepted:
+                    continue # Already added
+                
+                feats = [best_cand["features"].get(n, 0.0) for n in feature_names]
+                features_list.append(feats)
+                labels_list.append(1) # It was an added box, so it's a positive
 
     if not features_list:
         print("No reviewed detections found in labels.json files.")

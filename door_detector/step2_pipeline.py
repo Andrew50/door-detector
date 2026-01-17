@@ -1,6 +1,7 @@
 """Step 2 pipeline: Artifacts → Door detections."""
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -21,9 +22,21 @@ def run_step2(
     if output_dir is None:
         output_dir = artifacts_dir
 
-    # 1. Load config
-    with open(config_path) as f:
-        config = json.load(f)
+    # 1. Load config and compute signature
+    with open(config_path, "rb") as f:
+        config_bytes = f.read()
+    
+    config = json.loads(config_bytes)
+    
+    # Compute signature based on config and model (if reweighter_path exists)
+    sig_content = config_bytes
+    if "reweighter_path" in config:
+        re_path = Path(config["reweighter_path"])
+        if re_path.exists():
+            with open(re_path, "rb") as f:
+                sig_content += b"|" + f.read()
+    
+    analysis_signature = hashlib.sha256(sig_content).hexdigest()
 
     # 2. Load artifacts
     primitives_path = artifacts_dir / "primitives.json"
@@ -52,6 +65,7 @@ def run_step2(
         "page_id": meta["id"],
         "source_artifacts_dir": str(artifacts_dir),
         "config_path": str(config_path),
+        "analysis_signature": analysis_signature,
         "mode": meta["mode"],
         "detect_ms": detect_ms,
         "doors": doors
