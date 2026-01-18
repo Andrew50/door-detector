@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 
 from door_detector.signatures import compute_analysis_signature
-from door_detector.reweight_fit import fit_reweighter
 
 from door_detector.ui.labels import (
     cancel_edit_mode as _cancel_edit_mode,
@@ -812,18 +811,4 @@ def right_panel_review(
     if is_editing:
         st.divider()
         st.subheader("Edit Doors")
-
-    # Train badge
-    total_overrides = (
-        len(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
-        + len(flatten_rejected_ids(working.get("rejected_by_type", {})))
-        + len(working.get("deleted_ids", set()))
-    )
-    if (not is_editing) and total_overrides >= 5:
-        if st.button("Train Model", use_container_width=True):
-            with st.spinner("Training..."):
-                fit_reweighter(Path("artifacts"), Path("models"))
-                st.success("Model updated!")
-                st.cache_data.clear()
-                st.rerun()
 

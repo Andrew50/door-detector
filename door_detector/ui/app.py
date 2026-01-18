@@ -406,36 +406,10 @@ def _process_draw_event_if_any(
                 except Exception:
                     pass
 
-        # If nothing overlaps, still offer nearby candidates by center distance.
-        if not suggestions:
-            near: List[Tuple[float, Dict[str, Any]]] = []
-            for cand in candidates:
-                cid = cand.get("id")
-                cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
-                if cid is None or cb is None:
-                    continue
-                ccx = 0.5 * (cb[0] + cb[2])
-                ccy = 0.5 * (cb[1] + cb[3])
-                dist = float(((ccx - bcx) ** 2 + (ccy - bcy) ** 2) ** 0.5)
-                near.append((dist, cand))
-            near.sort(key=lambda x: x[0])
-            for dist, cand in near[:25]:
-                cid = str(cand.get("id") or "")
-                if not cid or cid in seen:
-                    continue
-                seen.add(cid)
-                conf = float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)
-                suggestions.append(
-                    {
-                        "id": cid,
-                        "type": str(cand.get("type") or ""),
-                        "iou": 0.0,
-                        "inter": 0.0,
-                        "confidence": float(conf),
-                        "source": "nearest",
-                        "dist_px": float(dist),
-                    }
-                )
+        # If nothing overlaps, do NOT auto-include nearby candidates.
+        # (Users found this confusing because it shows candidates that don't intersect
+        # the selection at all. If desired, we can add an explicit "Show nearby" toggle
+        # later, but default should be overlap-only.)
 
         fstate["_last_draw_suggestions"] = {
             "event_id": str(event_id),

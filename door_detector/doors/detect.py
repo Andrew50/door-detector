@@ -307,6 +307,10 @@ def _extract_polyline_arcs_from_lines(
     min_segments = int(poly_conf.get("min_segments", 4) or 4)
     max_segments = int(poly_conf.get("max_segments", 36) or 36)
     max_seg_len = float(poly_conf.get("max_segment_length_px", 85.0) or 85.0)
+    allow_branches = bool(poly_conf.get("allow_branches", True))
+    max_paths_per_component = int(poly_conf.get("max_paths_per_component", 200) or 200)
+    allow_branches = bool(poly_conf.get("allow_branches", True))
+    max_paths_per_component = int(poly_conf.get("max_paths_per_component", 200) or 200)
     # Fit tolerance: reuse arc's circle fit constraint if present, else a mild default.
     max_circle_fit_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
 
@@ -500,6 +504,8 @@ def _debug_polyline_arcs_from_lines_subset(
     min_segments = int(poly_conf.get("min_segments", 4) or 4)
     max_segments = int(poly_conf.get("max_segments", 36) or 36)
     max_seg_len = float(poly_conf.get("max_segment_length_px", 85.0) or 85.0)
+    allow_branches = bool(poly_conf.get("allow_branches", True))
+    max_paths_per_component = int(poly_conf.get("max_paths_per_component", 200) or 200)
 
     # Fit/arc thresholds (same as swing.arc).
     max_circle_fit_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
@@ -604,6 +610,8 @@ def _debug_polyline_arcs_from_lines_subset(
 
         # Node degrees within this component.
         node_deg: Dict[Tuple[int, int], int] = {}
+        # Also store the component edges so we can explore paths in branched components.
+        comp_edges: List[Tuple[int, Tuple[int, int], Tuple[int, int]]] = []
         for li in comp:
             try:
                 _, _, b0, b1 = ends[li]
@@ -611,36 +619,149 @@ def _debug_polyline_arcs_from_lines_subset(
                 continue
             node_deg[b0] = node_deg.get(b0, 0) + 1
             node_deg[b1] = node_deg.get(b1, 0) + 1
+            comp_edges.append((int(li), b0, b1))
 
         end_nodes = [n for n, d in node_deg.items() if d == 1]
         if len(end_nodes) != 2:
-            _reject(comp=comp, reason="component.topology", detail={"end_nodes": int(len(end_nodes))})
-            continue  # ignore loops/branches
+            # Many door arcs get "branched" where a wall/leaf line touches the arc polyline,
+            # producing 3+ endpoints. In that case, try to recover a simple path that still
+            # fits a plausible arc. Keep loops (end_nodes==0) rejected to avoid label bubbles.
+            if not allow_branches or len(end_nodes) < 2:
+                _reject(comp=comp, reason="component.topology", detail={"end_nodes": int(len(end_nodes))})
+                continue  # ignore loops/branches unless enabled
 
-        # Walk the chain in order from one endpoint.
-        start_node = end_nodes[0]
-        ordered: List[int] = []
-        used_lines: set[int] = set()
-        current_node = start_node
-        prev_line: Optional[int] = None
+            # Build node -> incident component lines map.
+            node_to_lines: Dict[Tuple[int, int], List[int]] = {}
+            for li, b0, b1 in comp_edges:
+                node_to_lines.setdefault(b0, []).append(li)
+                node_to_lines.setdefault(b1, []).append(li)
 
-        for _ in range(len(comp)):
-            candidates = [li for li in end_to_lines.get(current_node, []) if li in comp and li not in used_lines]
-            if not candidates:
-                break
-            nxt = candidates[0]
-            if prev_line is not None and len(candidates) > 1:
-                for cand in candidates:
-                    if cand != prev_line:
-                        nxt = cand
+            # Helper: given (node, line) return the other node.
+            other_node: Dict[int, Tuple[Tuple[int, int], Tuple[int, int]]] = {li: (b0, b1) for li, b0, b1 in comp_edges}
+
+            best_path: Optional[List[int]] = None
+            best_start: Optional[Tuple[int, int]] = None
+            best_score = -1e18
+            paths_tried = 0
+
+            def _score_path(path_lines: List[int], start_node: Tuple[int, int]) -> Optional[Tuple[float, List[Tuple[float, float]]]]:
+                # Build ordered point chain for this path and compute circle fit.
+                pts: List[Tuple[float, float]] = []
+                cur_node = start_node
+                for li in path_lines:
+                    try:
+                        p0, p1, b0, b1 = ends[li]
+                    except Exception:
+                        return None
+                    if cur_node == b0:
+                        a, b = p0, p1
+                        cur_node = b1
+                    else:
+                        a, b = p1, p0
+                        cur_node = b0
+                    if not pts:
+                        pts.append((float(a[0]), float(a[1])))
+                    if pts[-1] != (float(b[0]), float(b[1])):
+                        pts.append((float(b[0]), float(b[1])))
+                if len(pts) < 3:
+                    return None
+                try:
+                    center, radius, rmse = fit_circle(pts)
+                    angle_span = float(get_arc_angle_span(pts, center))
+                except Exception:
+                    return None
+                radius = float(radius)
+                rmse = float(rmse)
+                # Apply the same arc thresholds used for normal components.
+                if not (min_radius_px <= radius <= max_radius_px):
+                    return None
+                if rmse > max_circle_fit_rmse:
+                    return None
+                if not (min_angle_deg <= angle_span <= max_angle_deg):
+                    return None
+                # Score: prefer larger angle spans and better fits; mild preference for longer paths.
+                fit_score = max(0.0, 1.0 - (rmse / max(1e-6, max_circle_fit_rmse)))
+                score = float(angle_span) * 1.0 + float(fit_score) * 50.0 + float(len(path_lines)) * 0.5
+                return score, pts
+
+            def _dfs(cur_node: Tuple[int, int], target: Tuple[int, int], used: set[int], path: List[int]) -> None:
+                nonlocal best_path, best_start, best_score, paths_tried
+                if paths_tried >= max_paths_per_component:
+                    return
+                if len(path) > max_segments:
+                    return
+                if cur_node == target:
+                    paths_tried += 1
+                    if len(path) < min_segments:
+                        return
+                    res = _score_path(path, start_node=path_start)
+                    if res is None:
+                        return
+                    score, _pts = res
+                    if score > best_score:
+                        best_score = score
+                        best_path = list(path)
+                        best_start = path_start
+                    return
+                for li in node_to_lines.get(cur_node, []):
+                    if li in used:
+                        continue
+                    used.add(li)
+                    path.append(li)
+                    b0, b1 = other_node[li]
+                    nxt_node = b1 if cur_node == b0 else b0
+                    _dfs(nxt_node, target, used, path)
+                    path.pop()
+                    used.remove(li)
+
+            # Enumerate simple paths between endpoint pairs, keep the best arc-like one.
+            for i in range(len(end_nodes)):
+                for j in range(i + 1, len(end_nodes)):
+                    path_start = end_nodes[i]
+                    target = end_nodes[j]
+                    _dfs(path_start, target, set(), [])
+                    if paths_tried >= max_paths_per_component:
                         break
-            ordered.append(nxt)
-            used_lines.add(nxt)
-            p0, p1, b0, b1 = ends[nxt]
-            current_node = b1 if current_node == b0 else b0
-            prev_line = nxt
+                if paths_tried >= max_paths_per_component:
+                    break
 
-        if len(ordered) != len(comp):
+            if best_path is None or best_start is None:
+                _reject(
+                    comp=comp,
+                    reason="component.topology",
+                    detail={"end_nodes": int(len(end_nodes)), "paths_tried": int(paths_tried)},
+                )
+                continue
+
+            # Use the recovered simple path as the ordered chain.
+            ordered = best_path
+            start_node = best_start
+        else:
+            # Walk the chain in order from one endpoint.
+            start_node = end_nodes[0]
+            ordered = []
+            used_lines: set[int] = set()
+            current_node = start_node
+            prev_line: Optional[int] = None
+
+            for _ in range(len(comp)):
+                candidates = [li for li in end_to_lines.get(current_node, []) if li in comp and li not in used_lines]
+                if not candidates:
+                    break
+                nxt = candidates[0]
+                if prev_line is not None and len(candidates) > 1:
+                    for cand in candidates:
+                        if cand != prev_line:
+                            nxt = cand
+                            break
+                ordered.append(nxt)
+                used_lines.add(nxt)
+                p0, p1, b0, b1 = ends[nxt]
+                current_node = b1 if current_node == b0 else b0
+                prev_line = nxt
+
+        # For non-branched components, ensure we walked everything.
+        if len(end_nodes) == 2 and len(ordered) != len(comp):
             _reject(comp=comp, reason="component.walk_failed", detail={"walked": int(len(ordered)), "expected": int(len(comp))})
             continue
 

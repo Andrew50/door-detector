@@ -10,8 +10,10 @@ type BBox = [number, number, number, number];
 
 function dbg(label: string, payload?: any) {
   try {
+    // Only log when explicitly enabled in the console:
+    // `window.__door_detectorPdfjsDebug = true`
     const enabled = (window as any).__door_detectorPdfjsDebug;
-    if (enabled === false) return;
+    if (enabled !== true) return;
     // eslint-disable-next-line no-console
     console.log(label, payload ?? {});
   } catch {
