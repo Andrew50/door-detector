@@ -281,7 +281,8 @@ export function PdfJsViewer(props: ComponentProps) {
 
     const s = clamp(Math.min(cwPad / ps.w, chPad / ps.h), 0.05, 20);
     const tx = (cw - ps.w * s) / 2;
-    const ty = (ch - ps.h * s) / 2;
+    // Top-justify instead of vertically centering (avoids a huge blank band above the page).
+    const ty = pad;
 
     scaleRef.current = s;
     txRef.current = tx;
@@ -687,11 +688,12 @@ export function PdfJsViewer(props: ComponentProps) {
       // (>= MIN_SNAP_IOU), else fall back to max intersection area, else coverage.
       const MIN_SNAP_IOU = 0.02;
       const MIN_CAND_COVERAGE = 0.2;
+      const MIN_IOU_INTER_FRAC_OF_MAX_INTER = 0.72;
       const norm = normalizeBBox(drawnPdf);
       const overlap: Array<{ id: string; bbox: BBox; iou: number; inter: number; coverage: number }> = [];
 
       let bestIou = -1;
-      let bestByIou: { id: string; bbox: BBox; iou: number } | null = null;
+      let bestByIou: { id: string; bbox: BBox; iou: number; inter: number } | null = null;
       let bestInter = -1;
       let bestByInter: { id: string; bbox: BBox; iou: number; inter: number } | null = null;
       let bestCoverage = -1;
@@ -709,7 +711,7 @@ export function PdfJsViewer(props: ComponentProps) {
           overlap.push({ id: did, bbox: cand, iou, inter, coverage });
           if (iou > bestIou) {
             bestIou = iou;
-            bestByIou = { id: did, bbox: cand, iou };
+            bestByIou = { id: did, bbox: cand, iou, inter };
           }
           if (inter > bestInter) {
             bestInter = inter;
@@ -728,7 +730,7 @@ export function PdfJsViewer(props: ComponentProps) {
         drawn: norm,
         candidates: candidatePool.length,
         overlapCandidates: overlap.length,
-        thresholds: { MIN_SNAP_IOU, MIN_CAND_COVERAGE },
+        thresholds: { MIN_SNAP_IOU, MIN_CAND_COVERAGE, MIN_IOU_INTER_FRAC_OF_MAX_INTER },
         bestByIoU: bestByIou ? { id: bestByIou.id, iou: bestByIou.iou } : null,
         bestByInter: bestByInter ? { id: bestByInter.id, inter: bestByInter.inter, iou: bestByInter.iou } : null,
         bestByCoverage: bestByCoverage
@@ -743,6 +745,18 @@ export function PdfJsViewer(props: ComponentProps) {
         return null;
       }
       if (bestByIou && bestByIou.iou >= MIN_SNAP_IOU) {
+        if (bestByInter && bestByInter.inter > 0 && bestByIou.inter < bestByInter.inter * MIN_IOU_INTER_FRAC_OF_MAX_INTER) {
+          // If the IoU-best candidate overlaps *far* less than the max-overlap candidate,
+          // prefer max intersection. This avoids snapping to small nearby shapes that happen
+          // to have a slightly higher IoU.
+          // eslint-disable-next-line no-console
+          console.log("[door_detector] snapCandidateForDrawPdf chosen", {
+            reason: "max_intersection_overrides_iou",
+            iouPick: { id: bestByIou.id, iou: bestByIou.iou, inter: bestByIou.inter },
+            interPick: { id: bestByInter.id, inter: bestByInter.inter, iou: bestByInter.iou },
+          });
+          return bestByInter;
+        }
         // eslint-disable-next-line no-console
         console.log("[door_detector] snapCandidateForDrawPdf chosen", { reason: "iou", id: bestByIou.id, iou: bestByIou.iou });
         return bestByIou;

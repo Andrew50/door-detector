@@ -1851,7 +1851,8 @@ def main_viewer_canvas(
     pdf_path = file_dir / "source.pdf"
     if not pdf_path.exists():
         # Still run the sidebar auto-open logic even when the viewer isn't mounted.
-        components.html(sidebar_autopen_component_html(), height=0, scrolling=False)
+        # NOTE: Streamlit treats height=0 as "default" in some builds; use 1px.
+        components.html(sidebar_autopen_component_html(), height=1, scrolling=False)
         st.error("Missing source.pdf; cannot render PDF viewer.")
         return None, []
 

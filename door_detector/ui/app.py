@@ -103,6 +103,7 @@ def _snap_to_candidate(
     # Only consider candidates that overlap the selection box (IoU>0).
     best_iou = -1.0
     best_by_iou: Optional[Dict[str, Any]] = None
+    best_iou_inter = -1.0
     best_inter = -1.0
     best_by_inter: Optional[Dict[str, Any]] = None
     any_overlap = False
@@ -121,6 +122,7 @@ def _snap_to_candidate(
         if iou > best_iou:
             best_iou = iou
             best_by_iou = cand
+            best_iou_inter = inter
         # Track maximum intersection area as fallback.
         inter_x0 = max(drawn[0], cbox[0])
         inter_y0 = max(drawn[1], cbox[1])
@@ -139,6 +141,19 @@ def _snap_to_candidate(
     # Primary: max IoU.
     MIN_SNAP_IOU = 0.02
     if best_by_iou is not None and best_iou >= MIN_SNAP_IOU:
+        # Heuristic: if the IoU-best candidate overlaps *far* less than another overlapping
+        # candidate, prefer maximum intersection. This avoids snapping to small nearby
+        # shapes (e.g. circles) when the user drew a larger box around a door.
+        MIN_IOU_INTER_FRAC_OF_MAX_INTER = 0.72
+        if (
+            best_by_inter is not None
+            and best_inter > 0.0
+            and best_iou_inter > 0.0
+            and best_iou_inter < (best_inter * MIN_IOU_INTER_FRAC_OF_MAX_INTER)
+        ):
+            cb = _normalize_bbox_xyxy(best_by_inter.get("bbox_xyxy"))
+            if cb is not None:
+                return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
         return best_by_iou, max(0.0, float(best_iou))
 
     # Fallback: max intersection area among overlapping candidates.
@@ -270,21 +285,62 @@ def _process_draw_event_if_any(
     drawn_full = _clamp_bbox_xyxy([float(v) for v in drawn_full], w=full_w, h=full_h)
 
     candidates = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
-    best = None
-    iou = 0.0
+    # Server-side snap is the source of truth (uses full candidate list).
+    best_server, iou_server = _snap_to_candidate(drawn_full, candidates=candidates)
 
+    # Client-proposed snap (from the viewer's candidatePool) is only a hint.
+    # The pool is intentionally downsampled for performance, so accepting it blindly
+    # can produce incorrect snaps (e.g. snapping to a nearby false-positive circle).
+    best_client = None
+    iou_client = 0.0
     if snapped_candidate_id:
         sid = str(snapped_candidate_id)
-        best = next((c for c in candidates if str(c.get("id") or "") == sid), None)
-        if best is not None:
-            cb = _normalize_bbox_xyxy(best.get("bbox_xyxy"))
+        best_client = next((c for c in candidates if str(c.get("id") or "") == sid), None)
+        if best_client is not None:
+            cb = _normalize_bbox_xyxy(best_client.get("bbox_xyxy"))
             if cb is not None:
-                iou = float(compute_iou(drawn_full, [cb[0], cb[1], cb[2], cb[3]]))
-                # Reject client-proposed snaps that don't actually overlap the selection.
-                if iou <= 0.0:
-                    best = None
-    if best is None:
-        best, iou = _snap_to_candidate(drawn_full, candidates=candidates)
+                iou_client = float(compute_iou(drawn_full, [cb[0], cb[1], cb[2], cb[3]]))
+                # Treat non-overlapping client snaps as invalid.
+                if iou_client <= 0.0:
+                    best_client = None
+                    iou_client = 0.0
+
+    best = best_server
+    iou = float(iou_server or 0.0)
+    if best is None and best_client is not None:
+        best = best_client
+        iou = float(iou_client or 0.0)
+    elif best is not None and best_client is not None:
+        # If the client suggestion is strictly better than the server pick, allow it.
+        # (In practice this should be rare; mostly useful when both overlap and the
+        # server fallback picked a different candidate with a lower IoU.)
+        if float(iou_client) > float(iou_server) + 1e-9:
+            best = best_client
+            iou = float(iou_client)
+
+    # Emit a lightweight debug message to the browser console when the client and
+    # server disagree (useful while debugging snap behavior).
+    try:
+        sid = str(snapped_candidate_id) if snapped_candidate_id not in (None, "") else ""
+        server_id = str(best_server.get("id")) if isinstance(best_server, dict) and best_server.get("id") is not None else ""
+        client_id = str(best_client.get("id")) if isinstance(best_client, dict) and best_client.get("id") is not None else ""
+        if sid and server_id and client_id and server_id != client_id:
+            fstate["_last_unmatched_debug"] = json.dumps(
+                {
+                    "kind": "snap_mismatch_debug_v1",
+                    "event_id": str(event_id),
+                    "client_snapped_candidate_id": client_id,
+                    "client_iou": float(iou_client),
+                    "server_snapped_candidate_id": server_id,
+                    "server_iou": float(iou_server),
+                },
+                separators=(",", ":"),
+            )
+        else:
+            # Clear any prior mismatch/unmatched debug so future changes re-trigger logs.
+            fstate["_last_unmatched_debug"] = None
+    except Exception:
+        pass
 
     if best is not None and best.get("id") is not None:
         cid = str(best["id"])
@@ -453,7 +509,8 @@ def main() -> None:
                 col_main, col_review = st.columns([2, 1])
                 with col_main:
                     # Always keep the sidebar auto-open logic mounted.
-                    components.html(assets.sidebar_autopen_component_html(), height=0, scrolling=False)
+                    # NOTE: Streamlit treats height=0 as "default" in some builds; use 1px.
+                    components.html(assets.sidebar_autopen_component_html(), height=1, scrolling=False)
                     viewer_slot = st.empty()
                 with col_review:
                     review_slot = st.empty()
@@ -645,10 +702,10 @@ def main() -> None:
                         st.session_state.door_detector_pipeline_task = None
                     st.rerun()
             else:
-                components.html(assets.sidebar_autopen_component_html(), height=0, scrolling=False)
+                components.html(assets.sidebar_autopen_component_html(), height=1, scrolling=False)
                 st.info("Select a file from the library to begin.")
         else:
-            components.html(assets.sidebar_autopen_component_html(), height=0, scrolling=False)
+            components.html(assets.sidebar_autopen_component_html(), height=1, scrolling=False)
             st.info("Select a file from the library to begin.")
 
 
