@@ -69,6 +69,12 @@ st.markdown("""
 <style>
     /* Hide Streamlit chrome (cosmetic only; not a security boundary).
        We keep the sidebar always visible and remove the top toolbar entirely. */
+    /* Streamlit 1.53 reserves space for the header via CSS variables; force it to 0. */
+    :root {
+        --header-height: 0px !important;
+        --st-header-height: 0px !important;
+    }
+
     header,
     [data-testid="stHeader"],
     [data-testid="stToolbar"] {
@@ -121,19 +127,36 @@ st.markdown("""
     html body section.stMain {
         padding-bottom: 0rem !important;
         margin-bottom: 0rem !important;
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
     }
     html body section.stMain > div {
         padding-bottom: 0rem !important;
         margin-bottom: 0rem !important;
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
     }
     html body section.stMain .block-container {
         padding-bottom: 0rem !important;
         margin-bottom: 0rem !important;
+        padding-top: 0rem !important;
     }
     /* Some Streamlit versions include an empty bottom container */
     [data-testid="stBottomBlockContainer"] { display: none !important; }
 
     /* Pull main content to the top (align with sidebar header) */
+    [data-testid="stAppViewContainer"] {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
+    [data-testid="stAppViewContainer"] .main {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
+    [data-testid="stAppViewContainer"] .main > div:first-child {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
     [data-testid="stAppViewContainer"] .main .block-container {
         padding-top: 0rem !important;
         padding-left: 1rem !important;
@@ -151,10 +174,45 @@ st.markdown("""
         padding-bottom: 0rem !important;
         margin-top: 0rem !important;
     }
+    /* Streamlit 1.53 adds extra top padding on the first inner wrapper inside the
+       main block container; remove it so the PDF title sits closer to the top. */
+    [data-testid="stMainBlockContainer"] > div,
+    [data-testid="stMainBlockContainer"] > div:first-child {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
     [data-testid="stAppViewContainer"] .main h1, 
     [data-testid="stAppViewContainer"] .main h3 {
         margin-top: 0 !important;
-        padding-top: 0.5rem !important;
+        padding-top: 0rem !important;
+    }
+
+    /* Sidebar: remove the reserved top padding that Streamlit adds for the header. */
+    [data-testid="stSidebar"] {
+        padding-top: 0 !important;
+        margin-top: 0 !important;
+    }
+    [data-testid="stSidebarContent"],
+    [data-testid="stSidebar"] > div:first-child {
+        padding-top: 0 !important;
+        margin-top: 0 !important;
+    }
+
+    /* Streamlit 1.53: this header block sits above the sidebar content and
+       contains the collapse button + logo spacer. Remove it so "Library" can
+       sit at the top. */
+    [data-testid="stSidebarHeader"],
+    [data-testid="stLogoSpacer"],
+    [data-testid="stSidebarCollapseButton"] {
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        overflow: hidden !important;
+    }
+    [data-testid="stSidebarHeader"] button[data-testid="stBaseButton-headerNoPadding"] {
+        display: none !important;
     }
 
     /* Styling for the file list rows */
@@ -311,7 +369,8 @@ st.markdown("""
     
     [data-testid="stSidebar"] h1 {
         padding-top: 0 !important;
-        margin-top: -20px !important;
+        margin-top: 16px !important;
+        margin-bottom: 14px !important; /* more space before Search/Upload row */
     }
 
     /* Make the X button align better with the search input */
@@ -334,11 +393,11 @@ st.markdown("""
         --door_detector-title-line-height: 1.55rem;
 
         /* Match existing heading spacing, but keep total height stable */
-        padding-top: 0.5rem;
+        padding-top: 0rem;
         margin: 0 0 0.75rem 0;
 
-        /* Always reserve exactly two lines (plus the fixed top padding) */
-        height: calc(0.5rem + (2 * var(--door_detector-title-line-height)));
+        /* Always reserve exactly two lines */
+        height: calc(2 * var(--door_detector-title-line-height));
         overflow: hidden;
     }
 
