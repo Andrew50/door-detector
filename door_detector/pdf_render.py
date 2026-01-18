@@ -11,6 +11,8 @@ from PIL import Image
 # Increase PIL pixel limit for large floor plans
 Image.MAX_IMAGE_PIXELS = None
 
+from door_detector.transforms import get_render_matrix
+
 
 def render_page(
     page: fitz.Page, dpi: int = 400, output_path: Path | None = None
@@ -28,11 +30,8 @@ def render_page(
     """
     start_time = time.time()
 
-    # Calculate scale factor (PDF uses 72 DPI)
-    scale = dpi / 72.0
-
-    # Create transformation matrix accounting for page rotation
-    matrix = fitz.Matrix(scale, scale).prerotate(page.rotation)
+    # Render matrix must match `compute_transform()`.
+    matrix = get_render_matrix(page, dpi)
 
     # Render to pixmap
     pixmap = page.get_pixmap(matrix=matrix, alpha=False)

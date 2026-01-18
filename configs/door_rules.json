@@ -23,39 +23,12 @@
     "leaf": {
       "min_length_ratio": 0.45,
       "max_length_ratio": 1.25,
-      "max_hinge_dist_ratio": 0.25,
-      "max_endpoint_dist_ratio": 0.30,
-      "stroke_width_ratio_tol": 0.6
+      "max_hinge_dist_ratio": 0.25
     },
     "scoring": {
       "w_fit": 0.45,
       "w_angle": 0.25,
       "w_proximity": 0.30
     }
-  },
-  "double": {
-    "enabled": true,
-    "merge_from_swing": true,
-    "max_hinge_separation_px": 30,
-    "max_angle_diff_deg": 25
-  },
-  "pocket": {
-    "enabled": true,
-    "require_dashes": true,
-    "min_dashed_length_px": 25,
-    "max_dashed_length_px": 300,
-    "max_line_thickness": 6.0
-  },
-  "bifold": {
-    "enabled": true,
-    "zigzag": {
-      "min_segments": 3,
-      "max_segments": 7,
-      "min_total_length_px": 25,
-      "max_total_length_px": 250,
-      "max_endpoint_gap_px": 6
-    }
   }
 }
-
-

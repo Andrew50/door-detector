@@ -18,33 +18,17 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
         - lines: List of line segments
         - beziers: List of cubic Bezier curves
         - rects: List of rectangles
-        - paths_raw: Raw path data for debugging
     """
     start_time = time.time()
 
     lines = []
     beziers = []
     rects = []
-    paths_raw = []
 
     # Get all drawings from the page
     drawings = page.get_drawings()
 
     for drawing in drawings:
-        # Store raw path for debugging
-        raw_path = {
-            "type": drawing.get("type", "unknown"),
-            "rect": list(drawing.get("rect", [])) if drawing.get("rect") else None,
-            "items": len(drawing.get("items", [])),
-        }
-        paths_raw.append(raw_path)
-
-        # Extract style information
-        stroke_width = drawing.get("width", 1.0)
-        stroke_color = drawing.get("color", [0, 0, 0])
-        fill_color = drawing.get("fill", None)
-        dashes = drawing.get("dashes", None)
-
         # Process items in the drawing
         items = drawing.get("items", [])
         for item in items:
@@ -57,9 +41,6 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
                     {
                         "p0": p0,
                         "p1": p1,
-                        "stroke_width": stroke_width,
-                        "color": stroke_color,
-                        "dashes": dashes,
                     }
                 )
 
@@ -74,9 +55,6 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
                         "p1": p1,
                         "p2": p2,
                         "p3": p3,
-                        "stroke_width": stroke_width,
-                        "color": stroke_color,
-                        "dashes": dashes,
                     }
                 )
 
@@ -96,10 +74,6 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
                             "x1": x1,
                             "y1": y1,
                         },
-                        "stroke_width": stroke_width,
-                        "color": stroke_color,
-                        "fill": fill_color,
-                        "dashes": dashes,
                     }
                 )
 
@@ -109,7 +83,6 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
         "lines": lines,
         "beziers": beziers,
         "rects": rects,
-        "paths_raw": paths_raw,
         "stats": {
             "num_lines": len(lines),
             "num_beziers": len(beziers),
@@ -137,7 +110,6 @@ def apply_transform_to_primitives(
         "lines": [],
         "beziers": [],
         "rects": [],
-        "paths_raw": primitives["paths_raw"],  # Keep raw paths unchanged
     }
 
     # Transform lines

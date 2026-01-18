@@ -6,6 +6,17 @@ from typing import Any, Callable, Dict, Tuple
 import fitz  # PyMuPDF
 
 
+def get_render_matrix(page: fitz.Page, dpi: int) -> fitz.Matrix:
+    """Return the exact matrix used to rasterize the page at `dpi`.
+
+    This must match `door_detector.pdf_render.render_page()` so that vector primitives
+    transformed via `compute_transform()` align with `page.png`.
+    """
+    scale = dpi / 72.0
+    rotation_deg = int(page.rotation) % 360
+    return fitz.Matrix(scale, scale).prerotate(rotation_deg)
+
+
 def compute_transform(
     page: fitz.Page, dpi: int = 400, pix_width: int | None = None, pix_height: int | None = None
 ) -> Tuple[Dict[str, Any], Callable, Callable]:
@@ -23,46 +34,32 @@ def compute_transform(
     """
     scale = dpi / 72.0
     rotation_deg = int(page.rotation) % 360
-    # PyMuPDF exposes multiple relevant rectangles / coordinate spaces:
-    # - `page.cropbox` / `page.mediabox`: *unrotated* page space (where `page.get_drawings()`
-    #   coordinates land for rotated pages).
-    # - `page.rect`: rotated / display space.
+
+    # PyMuPDF rasterizes using a render matrix (scale + optional rotation). To
+    # align vector coordinates from `page.get_drawings()` with the rendered
+    # pixmap, apply the same render matrix and then translate so the transformed
+    # page bbox starts at (0, 0). This avoids off-screen (negative) coordinates
+    # on rotated pages.
     cropbox = page.cropbox
     mediabox = page.mediabox
     page_rect = page.rect
 
-    # IMPORTANT: Rendering uses `fitz.Matrix(scale, scale).prerotate(page.rotation)`,
-    # which rotates around the origin. We derive the coordinate transform from the exact
-    # same matrix and then shift into the pixmap's (0,0)-based coordinate system.
-    base = fitz.Matrix(scale, scale).prerotate(rotation_deg)
+    # Same matrix used in `render_page(...)`.
+    base = get_render_matrix(page, dpi)
 
-    # Transform the page rect to find the pixel-space bounding box (may include negatives
-    # depending on rotation), then translate so the bbox starts at (0, 0).
-    bbox = page_rect * base
-    shift_x = -bbox.x0
-    shift_y = -bbox.y0
+    # `page.get_drawings()` coordinates are in the unrotated page space (cropbox).
+    # Compute the transformed bbox of that space and shift into a 0-based pixmap.
+    bbox = cropbox * base
+    shift_x = -float(bbox.x0)
+    shift_y = -float(bbox.y0)
 
-    # `page.get_drawings()` coordinates for rotated PDFs are in *unrotated* space (cropbox).
-    # To align vectors with the rendered pixmap, we need:
-    #   (unrotated coords) --[page.rotation_matrix]--> (page.rect / rotated coords)
-    #                     --[base + shift]-----------> (pixmap coords)
-    #
-    # We pre-compose these two affine transforms into a single 2D affine:
-    # M = rotation_matrix ∘ (base+shift)  (applied in that order to points).
-    rot = page.rotation_matrix  # unrotated -> rotated/page.rect coords
-
-    r_a, r_b, r_c, r_d, r_e, r_f = float(rot.a), float(rot.b), float(rot.c), float(rot.d), float(rot.e), float(rot.f)
-    b_a, b_b, b_c, b_d = float(base.a), float(base.b), float(base.c), float(base.d)
-    b_e, b_f = float(base.e + shift_x), float(base.f + shift_y)
-
-    # Compose M = R then B  (i.e., p -> p*R -> (p*R)*B).
     pdf_to_pix_affine = [
-        b_a * r_a + b_c * r_b,               # a
-        b_b * r_a + b_d * r_b,               # b
-        b_a * r_c + b_c * r_d,               # c
-        b_b * r_c + b_d * r_d,               # d
-        b_a * r_e + b_c * r_f + b_e,         # e
-        b_b * r_e + b_d * r_f + b_f,         # f
+        float(base.a),
+        float(base.b),
+        float(base.c),
+        float(base.d),
+        float(base.e) + shift_x,
+        float(base.f) + shift_y,
     ]
 
     computed_pix_width = int(round(bbox.width))
@@ -71,6 +68,17 @@ def compute_transform(
     if pix_width is None or pix_height is None:
         pix_width = computed_pix_width
         pix_height = computed_pix_height
+    else:
+        # Guardrail: ensure our computed bbox agrees with the raster size.
+        # Off-by-one can happen due to float math + rounding, so allow a small tolerance.
+        tol = 2
+        if abs(int(pix_width) - computed_pix_width) > tol or abs(int(pix_height) - computed_pix_height) > tol:
+            raise ValueError(
+                "Transform/pixmap size mismatch: "
+                f"computed={computed_pix_width}x{computed_pix_height} "
+                f"actual={int(pix_width)}x{int(pix_height)} "
+                f"(rotation_deg={rotation_deg}, dpi={dpi})"
+            )
 
     # Pixel to PDF transformation (inverse)
     a, b, c, d, e, f = pdf_to_pix_affine
@@ -83,8 +91,8 @@ def compute_transform(
         -b / det,
         -c / det,
         a / det,
-        (b * f - d * e) / det,
-        (c * e - a * f) / det,
+        (c * f - d * e) / det,
+        (b * e - a * f) / det,
     ]
 
     transform_dict = {
@@ -93,7 +101,6 @@ def compute_transform(
         "page_rect": {"x0": float(page_rect.x0), "y0": float(page_rect.y0), "x1": float(page_rect.x1), "y1": float(page_rect.y1)},
         "cropbox": {"x0": float(cropbox.x0), "y0": float(cropbox.y0), "x1": float(cropbox.x1), "y1": float(cropbox.y1)},
         "mediabox": {"x0": float(mediabox.x0), "y0": float(mediabox.y0), "x1": float(mediabox.x1), "y1": float(mediabox.y1)},
-        "rotation_matrix": [r_a, r_b, r_c, r_d, r_e, r_f],
         "rotation_deg": rotation_deg,
         "pdf_to_pix_affine": pdf_to_pix_affine,
         "pix_to_pdf_affine": pix_to_pdf_affine,

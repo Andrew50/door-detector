@@ -1,17 +1,18 @@
 import hashlib
+import html
 import json
+import logging
 import math
 import os
 import shutil
 import time
 import base64
-import io
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
-from PIL import Image, ImageDraw
+from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
 def _patch_streamlit_drawable_canvas_image_to_url() -> None:
@@ -51,6 +52,9 @@ from door_detector.library import Library
 from door_detector.step1_pipeline import process_pdf
 from door_detector.step2_pipeline import run_step2
 from door_detector.reweight_fit import fit_reweighter
+
+# Log to Streamlit's server console for debugging.
+logger = logging.getLogger("door_detector.review_app")
 
 # Increase PIL pixel limit
 Image.MAX_IMAGE_PIXELS = None
@@ -278,6 +282,49 @@ st.markdown("""
         height: 38px !important;
         width: 100% !important;
     }
+
+    /* Main viewer: keep PDF title area a fixed two lines tall */
+    .door_detector-pdf-title {
+        --door_detector-title-font-size: 1.35rem;
+        --door_detector-title-line-height: 1.55rem;
+
+        /* Match existing heading spacing, but keep total height stable */
+        padding-top: 0.5rem;
+        margin: 0 0 0.75rem 0;
+
+        /* Always reserve exactly two lines (plus the fixed top padding) */
+        height: calc(0.5rem + (2 * var(--door_detector-title-line-height)));
+        overflow: hidden;
+    }
+
+    .door_detector-pdf-title > h3 {
+        font-size: var(--door_detector-title-font-size) !important;
+        line-height: var(--door_detector-title-line-height) !important;
+
+        margin: 0 !important;
+        padding: 0 !important; /* override global .main h3 padding-top */
+
+        /* Clamp to two lines; container keeps the reserved space either way */
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        word-break: break-word;
+    }
+
+    /* Hide internal "door click sink" widgets (used for box click selection) */
+    div[data-testid="stTextInput"]:has(input[aria-label^="door_click_sink_"]) {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"] input[aria-label^="door_click_sink_"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -293,13 +340,110 @@ if "search_visible" not in st.session_state:
 if "search_query" not in st.session_state:
     st.session_state.search_query = ""
 
-if "viewer_height" not in st.session_state:
-    # Larger default to better fill tall viewports (reduces "blank footer" area).
-    st.session_state.viewer_height = 1000
+if "debug_perf" not in st.session_state:
+    st.session_state.debug_perf = False
+
+VIEWER_TARGET_WIDTH_PX = 1200
+VIEWER_ASPECT_RATIO_HW = 0.75  # height/width
 
 lib = st.session_state.library
 
 # --- Session State Helpers ---
+def _affine_apply(aff: Any, x: float, y: float) -> Tuple[float, float]:
+    a, b, c, d, e, f = [float(v) for v in aff]
+    px = a * x + c * y + e
+    py = b * x + d * y + f
+    return px, py
+
+
+def _invert_affine(aff: Any) -> Optional[List[float]]:
+    """Invert [a,b,c,d,e,f] where x' = a*x + c*y + e; y' = b*x + d*y + f."""
+    try:
+        a, b, c, d, e, f = [float(v) for v in aff]
+    except Exception:
+        return None
+    det = a * d - b * c
+    if abs(det) < 1e-12:
+        return None
+    return [
+        d / det,
+        -b / det,
+        -c / det,
+        a / det,
+        (c * f - d * e) / det,
+        (b * e - a * f) / det,
+    ]
+
+
+def _infer_bbox_origin_shift_from_transform(
+    meta_data: Dict[str, Any], transform_data: Dict[str, Any]
+) -> Optional[Tuple[float, float]]:
+    """
+    Infer a (dx, dy) shift that makes the transformed page bbox start at (0, 0).
+
+    This repairs older/buggy transforms where rotation+scale are correct but the
+    translation is off (common on rotated PDFs), yielding negative bboxes.
+    """
+    try:
+        full_w = float(meta_data.get("pix_width", 0))
+        full_h = float(meta_data.get("pix_height", 0))
+        if full_w <= 0 or full_h <= 0:
+            return None
+    except Exception:
+        return None
+
+    page_rect = meta_data.get("page_rect") or transform_data.get("page_rect")
+    aff = transform_data.get("pdf_to_pix_affine")
+    if not isinstance(page_rect, dict) or not isinstance(aff, list) or len(aff) != 6:
+        return None
+
+    try:
+        x0 = float(page_rect["x0"])
+        y0 = float(page_rect["y0"])
+        x1 = float(page_rect["x1"])
+        y1 = float(page_rect["y1"])
+    except Exception:
+        return None
+
+    corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+    pts = [_affine_apply(aff, x, y) for x, y in corners]
+    min_x = min(p[0] for p in pts)
+    min_y = min(p[1] for p in pts)
+    max_x = max(p[0] for p in pts)
+    max_y = max(p[1] for p in pts)
+    w = max_x - min_x
+    h = max_y - min_y
+
+    # If the transformed page bbox doesn't match the raster dimensions, don't guess.
+    tol = 8.0  # pixels (float math + rounding tolerance)
+    if abs(w - full_w) > tol or abs(h - full_h) > tol:
+        return None
+
+    dx = -min_x
+    dy = -min_y
+    if abs(dx) < 1e-6:
+        dx = 0.0
+    if abs(dy) < 1e-6:
+        dy = 0.0
+
+    return (dx, dy)
+
+
+def _count_offscreen_doors(doors: List[Dict[str, Any]], *, w: float, h: float) -> int:
+    off = 0
+    for d in doors:
+        bbox = d.get("bbox_xyxy")
+        try:
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+        except Exception:
+            continue
+        x0, x1 = (x0, x1) if x0 <= x1 else (x1, x0)
+        y0, y1 = (y0, y1) if y0 <= y1 else (y1, y0)
+        if x1 < 0 or y1 < 0 or x0 > w or y0 > h:
+            off += 1
+    return off
+
+
 def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
     if "files" not in st.session_state:
         st.session_state.files = {}
@@ -318,12 +462,10 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
 @st.cache_data
 def load_file_artifacts(file_dir_str: str):
     file_dir = Path(file_dir_str)
-    image_path = file_dir / "page.png"
     doors_path = file_dir / "doors.json"
     labels_path = file_dir / "labels.json"
     meta_path = file_dir / "meta.json"
-
-    image = Image.open(image_path) if image_path.exists() else None
+    transform_path = file_dir / "transform.json"
     
     doors_data = {}
     if doors_path.exists():
@@ -345,7 +487,177 @@ def load_file_artifacts(file_dir_str: str):
         with open(meta_path) as f:
             meta_data = json.load(f)
 
-    return image, doors_data, labels_data, meta_data
+    transform_data = {}
+    if transform_path.exists():
+        try:
+            with open(transform_path) as f:
+                transform_data = json.load(f)
+        except Exception:
+            transform_data = {}
+
+    # Repair common transform issues so bboxes align to (0,0)-(pix_width,pix_height).
+    #
+    # Background:
+    # - Older artifacts stored bboxes in a pixel space that effectively applied a rotated
+    #   PDF→pix affine. In our pipeline, vector primitives from PyMuPDF are in cropbox
+    #   coordinates, so the "correct" pixel space for visualization is simply:
+    #     pix = pdf * scale  (no extra rotation terms).
+    # - For those older artifacts, we can reproject:
+    #     old_pix -> pdf (via inverse affine) -> correct_pix (via scale).
+    try:
+        if isinstance(doors_data.get("doors"), list) and transform_data:
+            doors_list = doors_data["doors"]
+            full_w = float(meta_data.get("pix_width", 0) or 0)
+            full_h = float(meta_data.get("pix_height", 0) or 0)
+
+            aff = transform_data.get("pdf_to_pix_affine")
+            inv = _invert_affine(aff) if aff is not None else None
+            scale = float(transform_data.get("scale", 1.0) or 1.0)
+
+            did_reproject = False
+            if isinstance(aff, list) and len(aff) == 6 and inv and scale > 0:
+                # If the affine includes rotation/shear terms, it's a strong signal of a legacy
+                # (misaligned) artifact. Reproject to the canonical cropbox-pixel space.
+                a, b, c, d, e, f = [float(v) for v in aff]
+                needs_reproject = (abs(b) > 1e-6) or (abs(c) > 1e-6)
+                if needs_reproject:
+                    for door in doors_list:
+                        bbox = door.get("bbox_xyxy")
+                        try:
+                            x0, y0, x1, y1 = [float(v) for v in bbox]
+                        except Exception:
+                            continue
+
+                        # Transform both corners back to PDF(cropbox) coords, then rescale.
+                        px0, py0 = _affine_apply(inv, x0, y0)
+                        px1, py1 = _affine_apply(inv, x1, y1)
+                        door["bbox_xyxy"] = [px0 * scale, py0 * scale, px1 * scale, py1 * scale]
+
+                    did_reproject = True
+
+            # If we didn't reproject, fall back to a pure origin shift if it looks like just
+            # a translation issue.
+            if not did_reproject and full_w > 0 and full_h > 0:
+                dx_dy = _infer_bbox_origin_shift_from_transform(meta_data, transform_data)
+                if dx_dy:
+                    dx, dy = dx_dy
+                    if dx != 0.0 or dy != 0.0:
+                        for door in doors_list:
+                            bbox = door.get("bbox_xyxy")
+                            try:
+                                x0, y0, x1, y1 = [float(v) for v in bbox]
+                            except Exception:
+                                continue
+                            door["bbox_xyxy"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
+
+            pre_off = _count_offscreen_doors(doors_list, w=full_w, h=full_h) if (full_w > 0 and full_h > 0) else 0
+            if did_reproject:
+                doors_data["_bbox_transform_fix"] = {"mode": "reproject_inv_affine_rescale"}
+                logger.info("Reprojected door bboxes for %s (remaining offscreen=%d)", file_dir_str, pre_off)
+    except Exception as e:
+        logger.info("BBox origin shift repair skipped for %s (%s)", file_dir_str, e)
+
+    return doors_data, labels_data, meta_data
+
+
+def _get_full_page_dims(meta_data: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """Return (width, height) for the full-resolution page (page.png), if known."""
+    try:
+        w = int(meta_data.get("pix_width"))
+        h = int(meta_data.get("pix_height"))
+        if w > 0 and h > 0:
+            return (w, h)
+    except Exception:
+        return None
+    return None
+
+
+def _get_preview_path(file_dir: Path) -> Path:
+    # Stable filename so existing artifacts benefit after first view.
+    return file_dir / "page_view.jpg"
+
+
+@st.cache_resource
+def get_or_create_page_preview(
+    file_dir_str: str,
+    *,
+    full_width: Optional[int],
+    full_height: Optional[int],
+    page_png_mtime_ns: int,
+    preview_max_width: int = 2400,
+) -> Optional[Dict[str, Any]]:
+    """Return a lightweight preview image spec for UI rendering.
+
+    Creates `page_view.jpg` on disk if missing by downscaling `page.png` once.
+    Returns:
+      { path, url, width, height, scale }
+    Where `scale` maps full-res pixel coords -> preview coords.
+    """
+    file_dir = Path(file_dir_str)
+    page_png_path = file_dir / "page.png"
+    if not page_png_path.exists():
+        return None
+
+    preview_path = _get_preview_path(file_dir)
+
+    # Create preview lazily (once) to avoid re-decoding huge PNG on every rerun.
+    preview_is_stale = False
+    if preview_path.exists():
+        try:
+            preview_is_stale = preview_path.stat().st_mtime_ns < int(page_png_mtime_ns)
+        except Exception:
+            preview_is_stale = False
+
+    if (not preview_path.exists()) or preview_is_stale:
+        src = Image.open(page_png_path)
+        try:
+            src_w, src_h = src.size
+            # If meta is missing, fall back to the source image dimensions.
+            if not full_width or not full_height:
+                full_width, full_height = src_w, src_h
+
+            scale_create = min(1.0, float(preview_max_width) / float(src_w)) if src_w else 1.0
+            if scale_create < 1.0:
+                out_w = max(1, int(round(src_w * scale_create)))
+                out_h = max(1, int(round(src_h * scale_create)))
+                prev = src.resize((out_w, out_h), Image.LANCZOS)
+            else:
+                # Still write a JPEG so the UI never has to decode the huge PNG.
+                prev = src
+
+            if prev.mode != "RGB":
+                prev = prev.convert("RGB")
+
+            preview_path.parent.mkdir(parents=True, exist_ok=True)
+            prev.save(preview_path, "JPEG", quality=88, optimize=True, progressive=True)
+        finally:
+            try:
+                src.close()
+            except Exception:
+                pass
+
+    prev_img = Image.open(preview_path)
+    try:
+        prev_w, prev_h = prev_img.size
+    finally:
+        try:
+            prev_img.close()
+        except Exception:
+            pass
+
+    # Compute a stable scale factor from full-res → preview coords.
+    if full_width and full_width > 0:
+        scale = float(prev_w) / float(full_width)
+    else:
+        # Last-resort: treat preview as full-res (should be rare).
+        scale = 1.0
+
+    return {
+        "path": str(preview_path),
+        "width": int(prev_w),
+        "height": int(prev_h),
+        "scale": float(scale),
+    }
 
 def save_labels(dir_path: Path, labels_data: Dict[str, Any]):
     labels_path = dir_path / "labels.json"
@@ -369,12 +681,6 @@ def get_current_signature(config_path: str):
 
 # --- UI Components ---
 
-def _pil_image_to_data_url(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
-
 def _normalize_bbox_xyxy(bbox: Any) -> Optional[Tuple[float, float, float, float]]:
     """Return (x0, y0, x1, y1) with x0<=x1 and y0<=y1, or None if invalid."""
     try:
@@ -385,15 +691,129 @@ def _normalize_bbox_xyxy(bbox: Any) -> Optional[Tuple[float, float, float, float
         return None
     return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
 
-def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
-    data_url = _pil_image_to_data_url(img)
+def _image_path_to_streamlit_url(image_path: str) -> str:
+    """Return a URL (or small data URL fallback) for an on-disk image."""
+    p = Path(image_path)
+    try:
+        img = Image.open(p)
+        try:
+            from streamlit.elements.lib.image_utils import image_to_url
+            from streamlit.elements.lib.layout_utils import LayoutConfig
+
+            st_image_id = f"img|{p}|{p.stat().st_mtime_ns}"
+            url = image_to_url(
+                image=img,
+                layout_config=LayoutConfig(width=None),
+                clamp=False,
+                channels="RGB",
+                output_format="JPEG",
+                image_id=st_image_id,
+            )
+            if url:
+                return url
+        finally:
+            try:
+                img.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Fallback: embed the preview (should be small).
+    try:
+        with open(p, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception:
+        return ""
+
+def _rects_to_svg(
+    *,
+    active_doors: List[Dict[str, Any]],
+    fstate: Dict[str, Any],
+    scale: float,
+    img_width: int,
+    img_height: int,
+) -> str:
+    if fstate.get("viewer_mode") == "Off":
+        return ""
+
+    parts: List[str] = []
+    highlight_selected = fstate.get("viewer_mode") == "Highlight Selected"
+    selected_id = fstate.get("selected_door_id")
+
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
+    for d in active_doors:
+        did = d.get("id")
+        is_selected = did == selected_id
+        if highlight_selected and not is_selected:
+            continue
+
+        nb = _normalize_bbox_xyxy(d.get("bbox_xyxy"))
+        if nb is None:
+            continue
+        x0, y0, x1, y1 = nb
+
+        # Map full-res pixels → preview pixels.
+        x0p = x0 * scale
+        y0p = y0 * scale
+        x1p = x1 * scale
+        y1p = y1 * scale
+
+        x0p = _clamp(x0p, 0.0, float(img_width))
+        y0p = _clamp(y0p, 0.0, float(img_height))
+        x1p = _clamp(x1p, 0.0, float(img_width))
+        y1p = _clamp(y1p, 0.0, float(img_height))
+
+        w = max(0.0, x1p - x0p)
+        h = max(0.0, y1p - y0p)
+        if w <= 0.0 or h <= 0.0:
+            continue
+
+        # Match existing color semantics.
+        stroke = "#ffa500"  # undecided (orange)
+        if did in fstate.get("accepted", set()):
+            stroke = "#00ff00"
+        if d.get("is_user_added"):
+            stroke = "#00ffff"
+        if is_selected:
+            stroke = "#ff4b4b"  # selected (red)
+
+        stroke_width = 2 if not is_selected else 3
+        did_attr = html.escape(str(did), quote=True)
+        parts.append(
+            f'<rect x="{x0p:.2f}" y="{y0p:.2f}" width="{w:.2f}" height="{h:.2f}" '
+            f'fill="none" stroke="{stroke}" stroke-width="{stroke_width}" '
+            f'vector-effect="non-scaling-stroke" '
+            f'data-door-id="{did_attr}" style="pointer-events: all; cursor: pointer;" />'
+        )
+
+    return "\n".join(parts)
+
+def _panzoom_image_viewer(
+    *,
+    img_src: str,
+    img_width: int,
+    img_height: int,
+    rects_svg: str,
+    height: int,
+    key: str,
+    click_sink_aria_label: str,
+) -> None:
     # This viewer provides:
     # - scrollwheel zoom (centered at cursor)
     # - click+drag pan
     # - initial fit-to-container with letterboxing
-    html = f"""
+    click_sink_aria_label_esc = html.escape(click_sink_aria_label, quote=True)
+    viewer_html = f"""
 <div id="pz_root_{key}" style="width: 100%; height: {height}px; overflow: hidden; background: #0e1117; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);">
   <style>
+    html, body {{
+      margin: 0;
+      padding: 0;
+    }}
     /* Scoped to this component instance */
     #pz_root_{key} .pz-reset {{
       position: absolute;
@@ -432,11 +852,25 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
   </style>
   <div id="pz_stage_{key}" style="width: 100%; height: 100%; position: relative; user-select: none; cursor: grab; touch-action: none;">
     <button id="pz_reset_{key}" class="pz-reset" type="button" aria-label="Reset zoom" aria-hidden="true" tabindex="-1">Reset</button>
-    <img
-      id="pz_img_{key}"
-      src="{data_url}"
-      style="position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; pointer-events: none;"
-    />
+    <div id="pz_content_{key}" style="position: absolute; left: 0; top: 0; width: {int(img_width)}px; height: {int(img_height)}px; transform-origin: 0 0; will-change: transform;">
+      <img
+        id="pz_img_{key}"
+        src="{img_src}"
+        width="{int(img_width)}"
+        height="{int(img_height)}"
+        style="position: absolute; left: 0; top: 0; pointer-events: none;"
+      />
+      <svg
+        id="pz_svg_{key}"
+        width="{int(img_width)}"
+        height="{int(img_height)}"
+        viewBox="0 0 {int(img_width)} {int(img_height)}"
+        style="position: absolute; left: 0; top: 0; pointer-events: auto;"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        {rects_svg}
+      </svg>
+    </div>
   </div>
 </div>
 
@@ -444,9 +878,11 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
 (function() {{
   const root = document.getElementById("pz_root_{key}");
   const stage = document.getElementById("pz_stage_{key}");
+  const content = document.getElementById("pz_content_{key}");
   const img = document.getElementById("pz_img_{key}");
+  const svg = document.getElementById("pz_svg_{key}");
   const resetBtn = document.getElementById("pz_reset_{key}");
-  if (!root || !stage || !img) return;
+  if (!root || !stage || !content || !img) return;
 
   let scale = 1;
   let tx = 0;
@@ -468,7 +904,7 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
   }}
 
   function applyTransform() {{
-    img.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`;
+    content.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`;
     updateResetVisibility();
   }}
 
@@ -497,8 +933,10 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
   function fitToContainer() {{
     const cw = root.clientWidth;
     const ch = root.clientHeight;
-    const iw = img.naturalWidth || img.width;
-    const ih = img.naturalHeight || img.height;
+    // Use the known image pixel dimensions passed from Python.
+    // Relying on `img.width` can be wrong if CSS/layout clamps the image.
+    const iw = {int(img_width)};
+    const ih = {int(img_height)};
     if (!cw || !ch || !iw || !ih) return;
 
     // Initial zoom should be the MAX zoom that keeps the entire image visible:
@@ -594,10 +1032,48 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
   root.addEventListener("pointerup", endDrag);
   root.addEventListener("pointercancel", endDrag);
   root.addEventListener("pointerleave", endDrag);
+
+  function setSelectedDoorId(doorId) {{
+    if (!doorId) return;
+    let input = null;
+    try {{
+      input = window.parent?.document?.querySelector('input[aria-label="{click_sink_aria_label_esc}"]');
+    }} catch (_) {{
+      input = null;
+    }}
+    if (!input) return;
+    try {{
+      input.value = String(doorId);
+      // React/Streamlit listens for "input" events.
+      input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+      input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+    }} catch (_) {{}}
+  }}
+
+  if (svg) {{
+    // If a door bbox is clicked, select it (and don't start a pan drag).
+    svg.addEventListener("pointerdown", (e) => {{
+      const t = e.target;
+      if (t && t.getAttribute && t.getAttribute("data-door-id")) {{
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    }}, true);
+
+    svg.addEventListener("click", (e) => {{
+      const t = e.target;
+      if (!t || !t.getAttribute) return;
+      const did = t.getAttribute("data-door-id");
+      if (!did) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setSelectedDoorId(did);
+    }});
+  }}
 }})();
 </script>
 """
-    components.html(html, height=height, scrolling=False)
+    components.html(viewer_html, height=height, scrolling=False)
 
 def sidebar_library():
     st.sidebar.title("Library")
@@ -656,11 +1132,21 @@ def sidebar_library():
                 st.session_state.selected_file_id = item["id"]
                 st.rerun()
 
-def main_viewer_canvas(item: Dict, image: Image.Image, doors_data: Dict, fstate: Dict):
+    with st.sidebar.expander("Debug", expanded=False):
+        st.checkbox("Show perf timings", key="debug_perf")
+
+def main_viewer_canvas(
+    item: Dict,
+    *,
+    preview_spec: Optional[Dict[str, Any]],
+    full_dims: Optional[Tuple[int, int]],
+    doors_data: Dict,
+    fstate: Dict,
+):
     file_id = item["id"]
     file_dir = Path(item["path"])
     
-    if image:
+    if preview_spec:
         detections = doors_data.get("doors", [])
 
         # Filter detections: keep undecided and accepted, exclude rejected
@@ -678,19 +1164,49 @@ def main_viewer_canvas(item: Dict, image: Image.Image, doors_data: Dict, fstate:
                 "is_user_added": True
             })
 
-        viewer_height = int(st.session_state.get("viewer_height", 1000))
-        viewer_width_hint = 1200  # used only for Add Door canvas sizing
+        # Door click sink: JS writes the clicked door id into this hidden widget,
+        # which triggers a rerun; on rerun we sync it into the "Jump to door" control.
+        click_sink_label = f"door_click_sink_{file_id}"
+        click_sink_key = click_sink_label
+        st.text_input(click_sink_label, key=click_sink_key, label_visibility="collapsed")
+        clicked_id = st.session_state.get(click_sink_key)
+        active_ids = {d.get("id") for d in active_doors}
+        if clicked_id:
+            if clicked_id in active_ids and clicked_id != fstate.get("_last_clicked_door_id"):
+                fstate["_last_clicked_door_id"] = clicked_id
+                fstate["selected_door_id"] = clicked_id
+                st.session_state[f"jump_{file_id}"] = clicked_id
+
+        # Keep the main viewer highlight in sync with the "Jump to door" selector.
+        # Otherwise, the right panel can advance selection in the same run (Prev/Next),
+        # but the main viewer would still render using the previous fstate selection.
+        jump_key = f"jump_{file_id}"
+        jump_id = st.session_state.get(jump_key)
+        if jump_id in active_ids and jump_id != fstate.get("selected_door_id"):
+            fstate["selected_door_id"] = jump_id
+
+        viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
+        viewer_width_hint = max(600, min(2000, viewer_width_hint))
+        aspect = float(VIEWER_ASPECT_RATIO_HW)
+        aspect = max(0.35, min(1.25, aspect))
+
+        # Viewer height derived from width and a fixed aspect ratio.
+        viewer_height = int(round(viewer_width_hint * aspect))
+        viewer_height = max(450, min(1400, viewer_height))
 
         # NOTE: Don't wrap this in `st.container(height=...)` because Streamlit makes that
         # container scrollable (adds a scrollbar) which steals scroll/drag interactions.
         if fstate["viewer_mode"] == "Add Door":
+            # Use the (smaller) preview for interactive drawing to keep the UI snappy.
+            bg_img = Image.open(preview_spec["path"])
+
             # Fit-to-container (approx) for first render.
-            fit_scale = min(1.0, min(viewer_width_hint / image.width, viewer_height / image.height))
-            display_width = max(400, int(image.width * fit_scale))
-            display_height = max(400, int(image.height * fit_scale))
+            fit_scale = min(1.0, min(viewer_width_hint / bg_img.width, viewer_height / bg_img.height))
+            display_width = max(400, int(bg_img.width * fit_scale))
+            display_height = max(400, int(bg_img.height * fit_scale))
 
             # Resize background for performance.
-            bg_img = image.resize((display_width, display_height), Image.LANCZOS)
+            bg_img = bg_img.resize((display_width, display_height), Image.LANCZOS)
 
             canvas_result = st_canvas(
                 fill_color="rgba(0, 255, 255, 0.3)",
@@ -705,46 +1221,37 @@ def main_viewer_canvas(item: Dict, image: Image.Image, doors_data: Dict, fstate:
             )
             return canvas_result, active_doors
 
-        # Normal viewing: pan+zoom image viewer (scrollwheel + click-drag).
-        # Downscale large pages for faster rendering, while keeping the right panel
-        # crop coming from the full-resolution image.
-        max_viewer_width = 2000
-        viewer_scale = min(1.0, max_viewer_width / image.width)
-        v_w = max(1, int(image.width * viewer_scale))
-        v_h = max(1, int(image.height * viewer_scale))
-        viewer_img = image.resize((v_w, v_h), Image.LANCZOS)
+        rects_svg = _rects_to_svg(
+            active_doors=active_doors,
+            fstate=fstate,
+            scale=float(preview_spec.get("scale", 1.0)),
+            img_width=int(preview_spec.get("width", 1)),
+            img_height=int(preview_spec.get("height", 1)),
+        )
 
-        draw = ImageDraw.Draw(viewer_img)
-        if fstate["viewer_mode"] != "Off":
-            for d in active_doors:
-                is_selected = d["id"] == fstate["selected_door_id"]
-                if fstate["viewer_mode"] == "Highlight Selected" and not is_selected:
-                    continue
-
-                bbox = d["bbox_xyxy"]
-                nb = _normalize_bbox_xyxy(bbox)
-                if nb is None:
-                    continue
-                bbox_s = [int(round(x * viewer_scale)) for x in nb]
-
-                color = (0, 255, 0) if d["id"] in fstate["accepted"] else (255, 165, 0)
-                if d.get("is_user_added"):
-                    color = (0, 255, 255)
-
-                width = max(1, int(round(4 * viewer_scale)))
-                if is_selected:
-                    color = (255, 255, 255)
-                    width = max(2, int(round(8 * viewer_scale)))
-
-                draw.rectangle(bbox_s, outline=color, width=width)
-
-        _panzoom_image_viewer(viewer_img, height=viewer_height, key=str(file_id))
+        img_src = _image_path_to_streamlit_url(str(preview_spec.get("path", "")))
+        _panzoom_image_viewer(
+            img_src=img_src,
+            img_width=int(preview_spec.get("width", 1)),
+            img_height=int(preview_spec.get("height", 1)),
+            rects_svg=rects_svg,
+            height=viewer_height,
+            key=str(file_id),
+            click_sink_aria_label=click_sink_label,
+        )
         return None, active_doors
     else:
         st.info("Run analysis to see results.")
         return None, []
 
-def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstate: Dict, canvas_result: Any):
+def main_viewer_controls(
+    item: Dict,
+    *,
+    full_dims: Optional[Tuple[int, int]],
+    doors_data: Dict,
+    fstate: Dict,
+    canvas_result: Any,
+):
     file_id = item["id"]
     file_dir = Path(item["path"])
     
@@ -786,15 +1293,6 @@ def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstat
             label_visibility="collapsed"
         )
 
-    with st.expander("Layout", expanded=False):
-        st.session_state.viewer_height = st.slider(
-            "Viewer height (px)",
-            min_value=600,
-            max_value=1600,
-            value=int(st.session_state.get("viewer_height", 1000)),
-            step=50,
-        )
-
     c3, c4 = st.columns(2)
     with c3:
         if fstate["viewer_mode"] == "Add Door":
@@ -805,9 +1303,6 @@ def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstat
             if st.button("Add Door", use_container_width=True):
                 fstate["viewer_mode"] = "Add Door"
                 st.rerun()
-    with c4:
-        if fstate["viewer_mode"] != "Add Door":
-            pass
 
     if fstate["viewer_mode"] == "Add Door":
         st.info("Draw rectangles on the PDF.")
@@ -816,8 +1311,13 @@ def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstat
                 objects = canvas_result.json_data["objects"]
                 display_width = canvas_result.image_data.shape[1] if canvas_result.image_data is not None else 1
                 display_height = canvas_result.image_data.shape[0] if canvas_result.image_data is not None else 1
-                scale_x = image.width / display_width if display_width else 1.0
-                scale_y = image.height / display_height if display_height else 1.0
+                if full_dims:
+                    full_w, full_h = full_dims
+                else:
+                    full_w, full_h = display_width, display_height
+
+                scale_x = full_w / display_width if display_width else 1.0
+                scale_y = full_h / display_height if display_height else 1.0
                 
                 added_count = 0
                 for obj in objects:
@@ -836,7 +1336,14 @@ def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstat
                 else:
                     st.warning("No rectangles drawn.")
 
-def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate: Dict, active_doors: List):
+def right_panel_review(
+    item: Dict,
+    *,
+    preview_spec: Optional[Dict[str, Any]],
+    doors_data: Dict,
+    fstate: Dict,
+    active_doors: List,
+):
     file_id = item["id"]
     file_dir = Path(item["path"])
     
@@ -849,29 +1356,44 @@ def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate:
     if not all_visible:
         return
 
-    # Selection sync
-    selected_idx = -1
-    if fstate["selected_door_id"]:
-        for i, d in enumerate(all_visible):
-            if d["id"] == fstate["selected_door_id"]:
-                selected_idx = i
-                break
-    
-    if selected_idx == -1 and all_visible:
-        selected_idx = 0
-        fstate["selected_door_id"] = all_visible[0]["id"]
-
     # Jump-to selector (replaces click-to-select in the main viewer)
     door_ids = [d["id"] for d in all_visible]
     id_to_label = {
         d["id"]: f"{i+1}/{len(all_visible)}  {d['type']}  {d['confidence']:.3f}  {d['id']}"
         for i, d in enumerate(all_visible)
     }
+
     # Streamlit selectbox keeps its own state keyed by `key=...`.
-    # Keep that state in sync with our fstate selection so Prev/Next works.
+    # Treat that as canonical, but keep it in sync with our per-file fstate.
     jump_key = f"jump_{file_id}"
-    if jump_key not in st.session_state or st.session_state.get(jump_key) not in door_ids:
-        st.session_state[jump_key] = fstate["selected_door_id"]
+
+    current_id = None
+    if st.session_state.get(jump_key) in door_ids:
+        current_id = st.session_state[jump_key]
+    elif fstate.get("selected_door_id") in door_ids:
+        current_id = fstate["selected_door_id"]
+    else:
+        current_id = door_ids[0]
+
+    # Prev/Next (wrap-around).
+    #
+    # Avoid callbacks: Streamlit may run callbacks after widget instantiation,
+    # which can trigger "cannot be modified..." if we touch `st.session_state[jump_key]`.
+    col_p, col_idx, col_n = st.columns([1, 2, 1])
+    prev_clicked = col_p.button("Prev", use_container_width=True, key=f"{jump_key}__prev")
+    next_clicked = col_n.button("Next", use_container_width=True, key=f"{jump_key}__next")
+
+    if prev_clicked or next_clicked:
+        delta = -1 if prev_clicked else 1
+        idx = door_ids.index(current_id)
+        current_id = door_ids[(idx + delta) % len(door_ids)]
+
+    # Must happen before the selectbox is instantiated.
+    if st.session_state.get(jump_key) != current_id:
+        st.session_state[jump_key] = current_id
+    fstate["selected_door_id"] = current_id
+    selected_idx = door_ids.index(current_id)
+
     picked = st.selectbox(
         "Jump to door",
         door_ids,
@@ -883,21 +1405,7 @@ def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate:
     fstate["selected_door_id"] = picked
     selected_idx = door_ids.index(picked) if picked in door_ids else selected_idx
 
-    # Prev/Next
-    col_p, col_idx, col_n = st.columns([1, 2, 1])
-    if col_p.button("Prev", disabled=False, use_container_width=True):
-        new_idx = (selected_idx - 1) % len(all_visible)
-        new_id = all_visible[new_idx]["id"]
-        st.session_state[jump_key] = new_id
-        fstate["selected_door_id"] = new_id
-        st.rerun()
     col_idx.write(f"<div style='text-align: center; line-height: 38px;'>{selected_idx + 1} / {len(all_visible)}</div>", unsafe_allow_html=True)
-    if col_n.button("Next", disabled=False, use_container_width=True):
-        new_idx = (selected_idx + 1) % len(all_visible)
-        new_id = all_visible[new_idx]["id"]
-        st.session_state[jump_key] = new_id
-        fstate["selected_door_id"] = new_id
-        st.rerun()
 
     st.divider()
     
@@ -908,20 +1416,40 @@ def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate:
     st.write(f"**ID:** `{did}` | **Type:** {selected_door['type']} | **Conf:** {selected_door['confidence']:.3f}")
     
     # Zoom
-    if image:
+    if preview_spec:
+        image = Image.open(preview_spec["path"])
         bbox = selected_door["bbox_xyxy"]
         nb = _normalize_bbox_xyxy(bbox)
         if nb is None:
             st.warning("Selected door has an invalid bbox; preview unavailable.")
             return
         x0, y0, x1, y1 = nb
-        pad = 100
-        left = max(0, int(math.floor(x0 - pad)))
-        upper = max(0, int(math.floor(y0 - pad)))
-        right = min(image.width, int(math.ceil(x1 + pad)))
-        lower = min(image.height, int(math.ceil(y1 + pad)))
+        scale = float(preview_spec.get("scale", 1.0))
+        pad_full = 100.0
+        pad = pad_full * scale
+
+        left = max(0, int(math.floor(x0 * scale - pad)))
+        upper = max(0, int(math.floor(y0 * scale - pad)))
+        right = min(image.width, int(math.ceil(x1 * scale + pad)))
+        lower = min(image.height, int(math.ceil(y1 * scale + pad)))
         if right <= left or lower <= upper:
             st.warning("Selected door bbox is degenerate after clamping; preview unavailable.")
+            logger.info(
+                "Degenerate preview crop file_id=%s door_id=%s bbox=%s nb=%s scale=%.6f pad_full=%.1f crop=(%d,%d,%d,%d) preview=%dx%d shift=%s",
+                file_id,
+                did,
+                bbox,
+                nb,
+                scale,
+                pad_full,
+                left,
+                upper,
+                right,
+                lower,
+                image.width,
+                image.height,
+                doors_data.get("_bbox_transform_fix") or doors_data.get("_bbox_origin_shift"),
+            )
         else:
             st.image(image.crop((left, upper, right, lower)), use_container_width=True)
 
@@ -1002,20 +1530,67 @@ if "selected_file_id" in st.session_state and st.session_state.selected_file_id:
     if selected_item:
         file_id = selected_item["id"]
         file_dir = Path(selected_item["path"])
-        image, doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+        perf: Dict[str, float] = {}
+
+        t0 = time.perf_counter()
+        doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+        perf["load_file_artifacts_ms"] = (time.perf_counter() - t0) * 1000.0
         init_file_state(file_id, doors_data, labels_data)
         fstate = st.session_state.files[file_id]
 
-        st.markdown(f"### {selected_item['original_name']}")
+        full_dims = _get_full_page_dims(meta_data)
+        t1 = time.perf_counter()
+        page_png_path = file_dir / "page.png"
+        try:
+            page_png_mtime_ns = page_png_path.stat().st_mtime_ns
+        except Exception:
+            page_png_mtime_ns = 0
+        preview_spec = get_or_create_page_preview(
+            str(file_dir),
+            full_width=full_dims[0] if full_dims else None,
+            full_height=full_dims[1] if full_dims else None,
+            page_png_mtime_ns=page_png_mtime_ns,
+        )
+        perf["get_or_create_page_preview_ms"] = (time.perf_counter() - t1) * 1000.0
+
+        title = html.escape(str(selected_item.get("original_name", "")))
+        st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
         
         col_main, col_review = st.columns([2, 1])
         
         with col_main:
-            canvas_result, active_doors = main_viewer_canvas(selected_item, image, doors_data, fstate)
+            t2 = time.perf_counter()
+            canvas_result, active_doors = main_viewer_canvas(
+                selected_item,
+                preview_spec=preview_spec,
+                full_dims=full_dims,
+                doors_data=doors_data,
+                fstate=fstate,
+            )
+            perf["render_main_panel_ms"] = (time.perf_counter() - t2) * 1000.0
             
         with col_review:
-            main_viewer_controls(selected_item, image, doors_data, fstate, canvas_result)
+            t3 = time.perf_counter()
+            main_viewer_controls(
+                selected_item,
+                full_dims=full_dims,
+                doors_data=doors_data,
+                fstate=fstate,
+                canvas_result=canvas_result,
+            )
             st.divider()
-            right_panel_review(selected_item, image, doors_data, fstate, active_doors)
+            right_panel_review(
+                selected_item,
+                preview_spec=preview_spec,
+                doors_data=doors_data,
+                fstate=fstate,
+                active_doors=active_doors,
+            )
+            perf["render_right_panel_ms"] = (time.perf_counter() - t3) * 1000.0
+
+        if st.session_state.get("debug_perf"):
+            with st.sidebar.expander("Perf timings (server)", expanded=True):
+                for k, v in perf.items():
+                    st.write(f"**{k}**: {v:.1f} ms")
 else:
     st.info("Select a file from the library to begin.")

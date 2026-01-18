@@ -29,9 +29,6 @@ def create_door_overlay(
     # Define colors for different types
     colors = {
         "swing": (0, 255, 0),    # Green
-        "double": (0, 255, 255), # Cyan
-        "pocket": (255, 165, 0), # Orange
-        "bifold": (255, 0, 255), # Magenta
     }
     default_color = (255, 0, 0) # Red
 
