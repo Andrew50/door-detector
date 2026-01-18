@@ -1,5 +1,7 @@
 """PDF↔pixel coordinate transformations."""
 
+from __future__ import annotations
+
 import math
 from typing import Any, Callable, Dict, Tuple
 
@@ -9,7 +11,7 @@ import fitz  # PyMuPDF
 def get_render_matrix(page: fitz.Page, dpi: int) -> fitz.Matrix:
     """Return the exact matrix used to rasterize the page at `dpi`.
 
-    This must match `door_detector.pdf_render.render_page()` so that vector primitives
+    This must match `door_detector.pdf.render.render_page()` so that vector primitives
     transformed via `compute_transform()` align with `page.png`.
     """
     scale = dpi / 72.0
@@ -116,7 +118,6 @@ def compute_transform(
         "pix_height": int(round(pix_height)),
     }
 
-    # Create transformation functions
     def pdf_to_pix(x: float, y: float) -> Tuple[float, float]:
         """Convert PDF coordinates to pixel coordinates."""
         a, b, c, d, e, f = pdf_to_pix_affine
@@ -137,58 +138,37 @@ def compute_transform(
 def validate_transform(
     pdf_to_pix: Callable, pix_to_pdf: Callable, primitives: Dict[str, Any], num_samples: int = 20
 ) -> Tuple[bool, float]:
-    """
-    Validate transform by checking round-trip accuracy.
-
-    Args:
-        pdf_to_pix: PDF to pixel transformation function
-        pix_to_pdf: Pixel to PDF transformation function
-        primitives: Dictionary of extracted primitives
-        num_samples: Number of random points to test
-
-    Returns:
-        Tuple of (is_valid, max_error)
-    """
+    """Validate transform by checking round-trip accuracy."""
     import random
 
     # Collect sample points from primitives
     sample_points = []
 
-    # Sample from lines
     for line in primitives.get("lines", [])[:num_samples]:
         sample_points.append((line["p0"]["x"], line["p0"]["y"]))
         sample_points.append((line["p1"]["x"], line["p1"]["y"]))
 
-    # Sample from beziers
     for bezier in primitives.get("beziers", [])[:num_samples]:
         sample_points.append((bezier["p0"]["x"], bezier["p0"]["y"]))
 
-    # Sample from rects
     for rect in primitives.get("rects", [])[:num_samples]:
         r = rect["rect"]
         sample_points.append((r["x0"], r["y0"]))
         sample_points.append((r["x1"], r["y1"]))
 
     if len(sample_points) == 0:
-        # No primitives to validate against
         return True, 0.0
 
-    # Randomly sample up to num_samples points
     random.shuffle(sample_points)
     sample_points = sample_points[:num_samples]
 
     max_error = 0.0
     for pdf_x, pdf_y in sample_points:
-        # Round trip: PDF → pixel → PDF
         pix_x, pix_y = pdf_to_pix(pdf_x, pdf_y)
         pdf_x2, pdf_y2 = pix_to_pdf(pix_x, pix_y)
-
-        # Compute error
         error = math.sqrt((pdf_x - pdf_x2) ** 2 + (pdf_y - pdf_y2) ** 2)
         max_error = max(max_error, error)
 
-    # Check if error is acceptable (< 1e-3 in PDF units)
     is_valid = max_error < 1e-3
-
     return is_valid, max_error
 

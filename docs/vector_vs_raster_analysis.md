@@ -10,7 +10,7 @@
 
 ### Method used
 
-The repo already includes a scan/vector/hybrid classifier: `door_detector.scan_classifier.classify_page_mode`.
+The repo already includes a scan/vector/hybrid classifier: `door_detector.pdf.classify.classify_page_mode`.
 
 To quickly classify **without rendering** (fast, avoids transform/rotation validation noise), you can run:
 
@@ -20,8 +20,8 @@ source venv/bin/activate
 python - <<'PY'
 from pathlib import Path
 import fitz
-from door_detector.pdf_vectors import extract_primitives
-from door_detector.scan_classifier import classify_page_mode
+from door_detector.pdf.vectors import extract_primitives
+from door_detector.pdf.classify import classify_page_mode
 
 for pdf in sorted(Path("tests/door_drawings").glob("*.pdf")):
     doc = fitz.open(pdf)
@@ -91,7 +91,7 @@ Raster *detection* (training an object detector on pixels) can be treated as:
 
 ## Concrete “rule of thumb” thresholds (as implemented)
 
-From `door_detector.scan_classifier.classify_page_mode`:
+From `door_detector.pdf.classify.classify_page_mode`:
 - **Scan** if `image_coverage >= 0.60` and `num_segments <= low_segment_threshold` (default 50)
 - **Vector** if `num_segments >= high_segment_threshold` (default 200) and `image_coverage <= 0.20`
 - **Hybrid** otherwise

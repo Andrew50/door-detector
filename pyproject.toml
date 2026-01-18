@@ -7,7 +7,7 @@ name = "door_detector"
 version = "0.1.0"
 description = "Door detection in floor plans"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "pymupdf>=1.23.0",
     "pillow>=10.0.0",
@@ -21,8 +21,9 @@ door-detector-step1 = "door_detector.step1_pipeline:main"
 door-detector-step2 = "door_detector.step2_pipeline:main"
 door-detector-reweight = "door_detector.reweight_fit:main"
 
-[tool.setuptools]
-packages = ["door_detector"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["door_detector*"]
 
 
 

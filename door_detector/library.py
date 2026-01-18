@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 import time
 from pathlib import Path
@@ -79,81 +78,3 @@ class Library:
     def get_items(self) -> List[Dict[str, Any]]:
         """Return all items in the library, sorted by creation date."""
         return sorted(self.items.values(), key=lambda x: x["created_at"], reverse=True)
-
-    def discover_existing(self):
-        """Discover existing artifacts in the root directory and add them to the library if not already present."""
-        # This is a bit complex because existing artifacts are in different structures.
-        # We'll look for meta.json files.
-        for meta_path in self.root_dir.glob("**/meta.json"):
-            if "library" in meta_path.parts:
-                continue
-                
-            try:
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                
-                source_pdf = meta.get("source_pdf")
-                if not source_pdf:
-                    continue
-                
-                original_name = Path(source_pdf).name
-                # Check if already in library by comparing source_pdf or folder name
-                already_exists = False
-                for item in self.items.values():
-                    if item["original_name"] == original_name:
-                        already_exists = True
-                        break
-                
-                if not already_exists:
-                    # Create a new entry and copy artifacts
-                    file_id = f"m_{int(time.time() * 1000)}_{meta['id'][:8]}"
-                    file_dir = self.library_dir / file_id
-                    file_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Copy everything from meta_path.parent to file_dir
-                    src_dir = meta_path.parent
-                    for item in src_dir.iterdir():
-                        if item.is_file():
-                            shutil.copy2(item, file_dir)
-                        elif item.is_dir():
-                            shutil.copytree(item, file_dir / item.name)
-                    
-                    # Try to find the source PDF and copy it as source.pdf
-                    # It might be in the artifacts dir or at the absolute path stored in meta
-                    found_pdf = False
-                    pdf_path = Path(source_pdf)
-                    if pdf_path.exists():
-                        shutil.copy2(pdf_path, file_dir / "source.pdf")
-                        found_pdf = True
-                    else:
-                        # Try to find it in the artifacts root (common for _uploads)
-                        alt_pdf = self.root_dir / "_uploads" / pdf_path.name
-                        if alt_pdf.exists():
-                            shutil.copy2(alt_pdf, file_dir / "source.pdf")
-                            found_pdf = True
-                    
-                    if not found_pdf:
-                        # Create a dummy or just skip if we really need the PDF for rerun
-                        print(f"Warning: Could not find source PDF for {meta_path}")
-
-                    # Set status based on what we found
-                    status = "not_processed"
-                    if (file_dir / "meta.json").exists() and (file_dir / "page.png").exists():
-                        # We have at least Step 1 artifacts. Only mark "done" if doors exist.
-                        # IMPORTANT: "processing" is used by the UI to mean "job currently running",
-                        # and the app does not run jobs in the background; using it here can
-                        # permanently disable the Run button.
-                        status = "done" if (file_dir / "doors.json").exists() else "not_processed"
-
-                    self.items[file_id] = {
-                        "id": file_id,
-                        "original_name": original_name,
-                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "status": status,
-                        "path": str(file_dir),
-                        "error": None
-                    }
-            except Exception as e:
-                print(f"Error discovering {meta_path}: {e}")
-        
-        self._save_index()

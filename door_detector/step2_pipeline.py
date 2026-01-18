@@ -7,9 +7,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from door_detector.analysis_signature import compute_analysis_signature
-from door_detector.door_detection import detect_doors
-from door_detector.door_overlay import create_door_overlay
+from door_detector.signatures import compute_analysis_signature
+from door_detector.doors.detect import detect_doors
+from door_detector.doors.overlay import create_door_overlay
 
 
 def run_step2(

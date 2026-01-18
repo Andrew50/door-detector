@@ -27,7 +27,7 @@ Step 2 writes both fields here:
 
 All door detection happens in:
 
-- `door_detector/door_detection.py` (`detect_doors`)
+- `door_detector/doors/detect.py` (`detect_doors`)
 
 ### 1) Propose candidates (geometry constraints)
 
@@ -84,7 +84,7 @@ The reweighter replaces each candidate’s `confidence` with a logistic-regressi
 
 This is implemented in:
 
-- `door_detector/door_detection.py` (`apply_reweighter`)
+- `door_detector/doors/detect.py` (`apply_reweighter`)
 
 ---
 
@@ -99,7 +99,7 @@ These determine **which candidates exist at all**.
   - `swing.leaf.*` (len ratio, hinge distance, radial/tip constraints)
   - `output.min_confidence`, `output.nms_iou`, `output.max_doors`
 
-- **Hardcoded pool looseness**: `door_detector/door_detection.py`
+- **Hardcoded pool looseness**: `door_detector/doors/detect.py`
   - “pool_*” thresholds expand the set of candidates exported in `doors.json["candidates"]`
   - these do **not** change what becomes a final “door” unless the rest of the pipeline uses the pool to make final decisions
 
@@ -114,7 +114,8 @@ It does not change geometry or create new candidates.
 
 The Streamlit UI is implemented in:
 
-- `door_detector/review_app.py`
+- `door_detector/review_app.py` (thin Streamlit entrypoint wrapper)
+- `door_detector/ui/app.py` and `door_detector/ui/*` (actual UI implementation)
 
 ### What the user does
 
@@ -197,6 +198,6 @@ Model:
 ## Known limitations / tuning notes
 
 - **Candidate ids stability**: ids are currently derived from primitive indices (Bezier index + line index). If the primitive ordering changes, ids can drift across reruns.
-- **Pool thresholds are hardcoded**: the “looser pool” constraints live in `door_detector/door_detection.py` today. If you need them tunable per deployment, move them into config.
+- **Pool thresholds are hardcoded**: the “looser pool” constraints live in `door_detector/doors/detect.py` today. If you need them tunable per deployment, move them into config.
 - **Reweighter scope**: it can only rescore candidates that exist (and only uses a small feature set unless expanded).
 

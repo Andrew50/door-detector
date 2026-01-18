@@ -18,9 +18,9 @@
    python3 -m pip install -e .
    ```
    
-   **Note:** Make sure you have Python 3.8 or higher:
+   **Note:** Make sure you have Python 3.10 or higher:
    ```bash
-   python3 --version  # Should show 3.8 or higher
+   python3 --version  # Should show 3.10 or higher
    ```
 
 2. **Get test data:**

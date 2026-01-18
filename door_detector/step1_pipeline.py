@@ -5,11 +5,11 @@ import sys
 from pathlib import Path
 
 from door_detector.artifacts import write_artifacts
-from door_detector.pdf_render import load_pdf_page, render_page
-from door_detector.pdf_vectors import apply_transform_to_primitives, extract_primitives
-from door_detector.scan_classifier import classify_page_mode
-from door_detector.step1_signature import compute_step1_signature
-from door_detector.transforms import compute_transform, validate_transform
+from door_detector.pdf.render import load_pdf_page, render_page
+from door_detector.pdf.vectors import apply_transform_to_primitives, extract_primitives
+from door_detector.pdf.classify import classify_page_mode
+from door_detector.signatures import compute_step1_signature
+from door_detector.pdf.transforms import compute_transform, validate_transform
 
 
 def process_pdf(

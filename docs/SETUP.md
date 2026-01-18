@@ -2,7 +2,7 @@
 
 ## System Requirements
 
-- Python 3.8 or higher
+- Python 3.10 or higher
 - pip (Python package installer)
 
 ## Step-by-Step Setup
@@ -15,7 +15,7 @@ First, verify Python is installed:
 python3 --version
 ```
 
-You should see something like `Python 3.8.x` or higher. If not, install Python 3.8+ from [python.org](https://www.python.org/downloads/).
+You should see something like `Python 3.10.x` or higher. If not, install Python 3.10+ from [python.org](https://www.python.org/downloads/).
 
 ### 2. Create Virtual Environment
 
@@ -102,7 +102,7 @@ pip3 install -e .
 
 - On some systems, use `python` instead of `python3`
 - Check what's available: `which python` or `which python3`
-- You may need to install Python 3.8+ from your system package manager
+- You may need to install Python 3.10+ from your system package manager
 
 ### "venv: command not found" or "No module named venv"
 
@@ -129,7 +129,7 @@ virtualenv venv
 
 **Check Python version:**
 ```bash
-python3 --version  # Must be 3.8 or higher
+python3 --version  # Must be 3.10 or higher
 ```
 
 ### Browser console warnings (Permissions-Policy / iframe sandbox)

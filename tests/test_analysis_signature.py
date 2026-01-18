@@ -6,7 +6,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from door_detector.analysis_signature import compute_analysis_signature
+from door_detector.signatures import compute_analysis_signature
 
 
 def main() -> int:

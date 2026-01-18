@@ -1,7 +1,8 @@
-"""Compute a fast signature for Step 1 artifacts.
+"""Signatures for detecting stale artifacts and configs.
 
-Used to decide whether Step 1 needs to be re-run for a given `source.pdf` and
-Step 1 parameters.
+This module centralizes signature logic used by:
+- Step 1 artifacts (fast, stat-based signature for smart skipping in the UI)
+- Step 2 / UI analysis config (content hash including referenced model bytes)
 """
 
 from __future__ import annotations
@@ -10,6 +11,30 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict
+
+# ---- Step 2 / analysis config signature ----
+
+
+def compute_analysis_signature(config_path: Path) -> str:
+    """Compute a SHA-256 signature for `config_path` and referenced model bytes.
+
+    This is used to detect when an existing `doors.json` is out of date.
+    """
+    config_bytes = config_path.read_bytes()
+    config = json.loads(config_bytes)
+
+    sig_content = bytearray(config_bytes)
+    reweighter_path = config.get("reweighter_path")
+    if isinstance(reweighter_path, str) and reweighter_path:
+        re_path = Path(reweighter_path)
+        if re_path.exists():
+            sig_content.extend(b"|")
+            sig_content.extend(re_path.read_bytes())
+
+    return hashlib.sha256(bytes(sig_content)).hexdigest()
+
+
+# ---- Step 1 artifacts signature ----
 
 # Bump this when Step 1 artifact generation semantics change (e.g. transforms).
 STEP1_SIGNATURE_VERSION = 1
@@ -27,7 +52,7 @@ def compute_step1_signature(*, pdf_path: Path, dpi: int, page_index: int) -> Dic
     """
     st = pdf_path.stat()
 
-    payload = {
+    payload: Dict[str, Any] = {
         "signature_version": STEP1_SIGNATURE_VERSION,
         "logic_version": STEP1_LOGIC_VERSION,
         "pdf": {

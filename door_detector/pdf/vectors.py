@@ -1,35 +1,24 @@
 """Extract and normalize vector primitives from PDF pages."""
 
+from __future__ import annotations
+
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import fitz  # PyMuPDF
 
 
 def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
-    """
-    Extract vector primitives from a PDF page and normalize them.
-
-    Args:
-        page: PyMuPDF page object
-
-    Returns:
-        Dictionary with normalized primitives:
-        - lines: List of line segments
-        - beziers: List of cubic Bezier curves
-        - rects: List of rectangles
-    """
+    """Extract vector primitives from a PDF page and normalize them."""
     start_time = time.time()
 
     lines = []
     beziers = []
     rects = []
 
-    # Get all drawings from the page
     drawings = page.get_drawings()
 
     for drawing in drawings:
-        # Process items in the drawing
         items = drawing.get("items", [])
         for item in items:
             item_type = item[0]
@@ -37,45 +26,23 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
             if item_type == "l":  # Line segment
                 p0 = {"x": item[1][0], "y": item[1][1]}
                 p1 = {"x": item[2][0], "y": item[2][1]}
-                lines.append(
-                    {
-                        "p0": p0,
-                        "p1": p1,
-                    }
-                )
+                lines.append({"p0": p0, "p1": p1})
 
             elif item_type == "c":  # Cubic Bezier curve
                 p0 = {"x": item[1][0], "y": item[1][1]}
                 p1 = {"x": item[2][0], "y": item[2][1]}
                 p2 = {"x": item[3][0], "y": item[3][1]}
                 p3 = {"x": item[4][0], "y": item[4][1]}
-                beziers.append(
-                    {
-                        "p0": p0,
-                        "p1": p1,
-                        "p2": p2,
-                        "p3": p3,
-                    }
-                )
+                beziers.append({"p0": p0, "p1": p1, "p2": p2, "p3": p3})
 
             elif item_type == "re":  # Rectangle
                 rect_coords = item[1]
-                # Re-normalize just in case fitz returns non-standard coords
                 x0 = min(rect_coords[0], rect_coords[2])
                 y0 = min(rect_coords[1], rect_coords[3])
                 x1 = max(rect_coords[0], rect_coords[2])
                 y1 = max(rect_coords[1], rect_coords[3])
-                
-                rects.append(
-                    {
-                        "rect": {
-                            "x0": x0,
-                            "y0": y0,
-                            "x1": x1,
-                            "y1": y1,
-                        },
-                    }
-                )
+
+                rects.append({"rect": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}})
 
     extract_time_ms = (time.time() - start_time) * 1000
 
@@ -93,38 +60,15 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
     }
 
 
-def apply_transform_to_primitives(
-    primitives: Dict[str, Any], transform_func
-) -> Dict[str, Any]:
-    """
-    Apply a coordinate transformation to all primitive points.
+def apply_transform_to_primitives(primitives: Dict[str, Any], transform_func) -> Dict[str, Any]:
+    """Apply a coordinate transformation to all primitive points."""
+    transformed = {"lines": [], "beziers": [], "rects": []}
 
-    Args:
-        primitives: Dictionary of primitives from extract_primitives
-        transform_func: Function that takes (x, y) and returns transformed (x, y)
-
-    Returns:
-        New dictionary with transformed primitives
-    """
-    transformed = {
-        "lines": [],
-        "beziers": [],
-        "rects": [],
-    }
-
-    # Transform lines
     for line in primitives["lines"]:
         p0_x, p0_y = transform_func(line["p0"]["x"], line["p0"]["y"])
         p1_x, p1_y = transform_func(line["p1"]["x"], line["p1"]["y"])
-        transformed["lines"].append(
-            {
-                **line,
-                "p0": {"x": p0_x, "y": p0_y},
-                "p1": {"x": p1_x, "y": p1_y},
-            }
-        )
+        transformed["lines"].append({**line, "p0": {"x": p0_x, "y": p0_y}, "p1": {"x": p1_x, "y": p1_y}})
 
-    # Transform Bezier curves
     for bezier in primitives["beziers"]:
         p0_x, p0_y = transform_func(bezier["p0"]["x"], bezier["p0"]["y"])
         p1_x, p1_y = transform_func(bezier["p1"]["x"], bezier["p1"]["y"])
@@ -140,29 +84,18 @@ def apply_transform_to_primitives(
             }
         )
 
-    # Transform rectangles
     for rect in primitives["rects"]:
         r = rect["rect"]
         tx0, ty0 = transform_func(r["x0"], r["y0"])
         tx1, ty1 = transform_func(r["x1"], r["y1"])
-        
-        # Re-normalize to ensure x0 <= x1 and y0 <= y1 after transformation
+
         x0 = min(tx0, tx1)
         x1 = max(tx0, tx1)
         y0 = min(ty0, ty1)
         y1 = max(ty0, ty1)
-        
-        transformed["rects"].append(
-            {
-                **rect,
-                "rect": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
-            }
-        )
 
-    # Copy stats
+        transformed["rects"].append({**rect, "rect": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}})
+
     transformed["stats"] = primitives["stats"]
-
     return transformed
-
-
 

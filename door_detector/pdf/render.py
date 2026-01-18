@@ -1,5 +1,7 @@
 """PDF rendering to raster images."""
 
+from __future__ import annotations
+
 import io
 import time
 from pathlib import Path
@@ -8,26 +10,14 @@ from typing import Tuple
 import fitz  # PyMuPDF
 from PIL import Image
 
+from door_detector.pdf.transforms import get_render_matrix
+
 # Increase PIL pixel limit for large floor plans
 Image.MAX_IMAGE_PIXELS = None
 
-from door_detector.transforms import get_render_matrix
 
-
-def render_page(
-    page: fitz.Page, dpi: int = 400, output_path: Path | None = None
-) -> Tuple[Image.Image, float]:
-    """
-    Render a PDF page to a PNG image at the specified DPI.
-
-    Args:
-        page: PyMuPDF page object
-        dpi: Target DPI for rendering (default 400)
-        output_path: Optional path to save the PNG
-
-    Returns:
-        Tuple of (PIL Image, render_time_ms)
-    """
+def render_page(page: fitz.Page, dpi: int = 400, output_path: Path | None = None) -> Tuple[Image.Image, float]:
+    """Render a PDF page to a PNG image at the specified DPI."""
     start_time = time.time()
 
     # Render matrix must match `compute_transform()`.
@@ -42,7 +32,6 @@ def render_page(
 
     render_time_ms = (time.time() - start_time) * 1000
 
-    # Save if output path provided
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         img.save(output_path, "PNG")
@@ -51,19 +40,7 @@ def render_page(
 
 
 def load_pdf_page(pdf_path: Path, page_index: int = 0) -> Tuple[fitz.Document, fitz.Page]:
-    """
-    Load a PDF and return the specified page.
-
-    Args:
-        pdf_path: Path to PDF file
-        page_index: Page index (default 0)
-
-    Returns:
-        Tuple of (document, page)
-
-    Raises:
-        ValueError: If PDF is invalid or page doesn't exist
-    """
+    """Load a PDF and return the specified page."""
     doc = fitz.open(pdf_path)
 
     if doc.page_count == 0:
@@ -72,13 +49,10 @@ def load_pdf_page(pdf_path: Path, page_index: int = 0) -> Tuple[fitz.Document, f
 
     if page_index >= doc.page_count:
         doc.close()
-        raise ValueError(
-            f"Page index {page_index} out of range (PDF has {doc.page_count} pages)"
-        )
+        raise ValueError(f"Page index {page_index} out of range (PDF has {doc.page_count} pages)")
 
     page = doc[page_index]
 
-    # Validate page has non-zero size
     rect = page.rect
     if rect.width <= 0 or rect.height <= 0:
         doc.close()
