@@ -14,16 +14,25 @@
     "enabled": true,
     "bezier_sampling_points": 17,
     "arc": {
-      "min_angle_deg": 55,
+      "min_angle_deg": 20,
       "max_angle_deg": 125,
       "max_circle_fit_rmse": 2.5,
       "min_radius_px": 8,
-      "max_radius_px": 220
+      "max_radius_px": 220,
+      "suppress_circle_clusters": true,
+      "circle_cluster_center_bin_px": 4.0,
+      "circle_cluster_radius_bin_px": 4.0,
+      "circle_cluster_min_arcs": 3,
+      "circle_cluster_min_total_angle_deg": 250
     },
     "leaf": {
       "min_length_ratio": 0.45,
       "max_length_ratio": 1.25,
-      "max_hinge_dist_ratio": 0.25
+      "max_hinge_dist_ratio": 0.25,
+      "require_endpoint_near_center": true,
+      "max_center_dist_ratio": 0.25,
+      "max_radial_angle_deg": 25,
+      "max_tip_to_arc_ratio": 0.35
     },
     "scoring": {
       "w_fit": 0.45,

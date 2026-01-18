@@ -52,6 +52,7 @@ _patch_streamlit_drawable_canvas_image_to_url()
 
 from door_detector.library import Library
 from door_detector.step1_pipeline import process_pdf
+from door_detector.step1_signature import compute_step1_signature
 from door_detector.step2_pipeline import run_step2
 from door_detector.reweight_fit import fit_reweighter
 
@@ -66,13 +67,88 @@ st.set_page_config(page_title="Door Detector: Door Detection & Review", layout="
 # --- UI Styling ---
 st.markdown("""
 <style>
-    /* Hide Streamlit chrome (cosmetic only; not a security boundary) */
-    header { display: none !important; }
-    [data-testid="stHeader"] { display: none !important; }
-    [data-testid="stToolbar"] { display: none !important; }
+    /* Hide Streamlit chrome (cosmetic only; not a security boundary)
+       NOTE: Do NOT fully hide the header: Streamlit renders the sidebar
+       re-expand control there when the sidebar is collapsed. Instead, collapse
+       the header visuals and keep only the collapsed control visible. */
+    /* IMPORTANT:
+       - Never `display:none` the header; that removes the sidebar re-expand control.
+       - Also avoid `visibility:hidden` on the header: in Streamlit 1.53.x the
+         sidebar toggle may not match our override selectors and can get hidden. */
+    header {
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stHeader"] {
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+    /* Don't hide the whole toolbar: Streamlit may render the sidebar re-expand
+       control inside it. Hide only the noisy bits. */
+    [data-testid="stToolbar"] {
+        background: transparent !important;
+        box-shadow: none !important;
+        overflow: visible !important;
+    }
+    [data-testid="stStatusWidget"] { display: none !important; }
     #MainMenu { display: none !important; }
+    [data-testid="stMainMenu"] { display: none !important; }
     footer { display: none !important; }
     [data-testid="stDeployButton"] { display: none !important; }
+
+    /* "Custom" (restyled) sidebar collapsed control.
+       Keep it visible/clickable even though the rest of the header is hidden. */
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapsedControl"] {
+        display: flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        position: fixed !important;
+        top: 10px !important;
+        left: 10px !important;
+        z-index: 2147483647 !important;
+        pointer-events: auto !important;
+    }
+
+    [data-testid="collapsedControl"] button,
+    [data-testid="stSidebarCollapsedControl"] button,
+    button[aria-label="Open sidebar"],
+    button[aria-label="Close sidebar"] {
+        /* Ensure it survives "hide buttons" rules */
+        display: inline-flex !important;
+        visibility: visible !important;
+        opacity: 0.92 !important;
+        pointer-events: auto !important;
+
+        width: 36px !important;
+        height: 36px !important;
+        padding: 0 !important;
+        align-items: center !important;
+        justify-content: center !important;
+
+        border-radius: 8px !important;
+        border: 1px solid rgba(255, 255, 255, 0.18) !important;
+        background: rgba(17, 25, 40, 0.72) !important;
+        color: rgba(255, 255, 255, 0.92) !important;
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35) !important;
+        backdrop-filter: blur(6px) !important;
+        -webkit-backdrop-filter: blur(6px) !important;
+        transition: opacity 120ms ease, transform 120ms ease, border-color 120ms ease, background 120ms ease !important;
+    }
+    [data-testid="collapsedControl"] button:hover,
+    [data-testid="stSidebarCollapsedControl"] button:hover,
+    button[aria-label="Open sidebar"]:hover,
+    button[aria-label="Close sidebar"]:hover {
+        opacity: 1 !important;
+        background: rgba(17, 25, 40, 0.86) !important;
+        border-color: rgba(255, 255, 255, 0.26) !important;
+    }
+    [data-testid="collapsedControl"] button:active,
+    [data-testid="stSidebarCollapsedControl"] button:active,
+    button[aria-label="Open sidebar"]:active,
+    button[aria-label="Close sidebar"]:active {
+        transform: scale(0.98) !important;
+    }
 
     /* Remove Streamlit's default huge bottom spacing in main area */
     html body section.stMain {
@@ -314,7 +390,7 @@ st.markdown("""
         word-break: break-word;
     }
 
-    /* Hide internal "door click sink" widgets (used for box click selection) */
+    /* Hide internal "sink" widgets (used for box click selection + JS sync) */
     div[data-testid="stTextInput"]:has(input[aria-label^="door_click_sink_"]) {
         display: none !important;
         height: 0 !important;
@@ -326,6 +402,40 @@ st.markdown("""
         height: 0 !important;
         margin: 0 !important;
         padding: 0 !important;
+    }
+    div[data-testid="stTextInput"]:has(input[aria-label^="selected_door_sink_"]) {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"] input[aria-label^="selected_door_sink_"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"]:has(input[aria-label^="focus_seq_sink_"]) {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"] input[aria-label^="focus_seq_sink_"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    /* Prevent Delete/Confirm/Cancel labels from wrapping (even in narrow columns)
+       NOTE: keys must be valid HTML ids; we generate safe hashed keys. */
+    button[id^="delete_btn_"] div[data-testid="stMarkdownContainer"] p,
+    button[id^="delete_confirm_btn_"] div[data-testid="stMarkdownContainer"] p,
+    button[id^="delete_cancel_btn_"] div[data-testid="stMarkdownContainer"] p {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
     }
 
     /* Selected door details */
@@ -356,14 +466,60 @@ st.markdown("""
         font-weight: 800;
         letter-spacing: 0.2px;
     }
+
+    /* Viewer loading state (replaces the PDF viewer during analysis/re-analysis) */
+    .door_detector-viewer-loading {
+        width: 100%;
+        background: #0e1117;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+    }
+    .door_detector-viewer-loading-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        padding: 24px 18px;
+        text-align: center;
+        max-width: 520px;
+    }
+    .door_detector-spinner {
+        width: 72px;
+        height: 72px;
+        border-radius: 50%;
+        border: 7px solid rgba(255, 255, 255, 0.12);
+        border-top-color: rgba(255, 75, 75, 0.98);
+        animation: door_detectorSpin 0.95s linear infinite;
+        box-shadow: 0 16px 34px rgba(0, 0, 0, 0.35);
+    }
+    .door_detector-viewer-loading-title {
+        font-size: 18px;
+        font-weight: 750;
+        letter-spacing: 0.2px;
+        color: rgba(255, 255, 255, 0.92);
+    }
+    .door_detector-viewer-loading-sub {
+        font-size: 13px;
+        line-height: 1.4;
+        color: rgba(255, 255, 255, 0.70);
+    }
+    @keyframes door_detectorSpin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # --- Initialize Library ---
 if "library" not in st.session_state:
     st.session_state.library = Library(Path("artifacts"))
-    # One-time discovery of existing artifacts
-    st.session_state.library.discover_existing()
+    # NOTE: We no longer auto-import every existing `artifacts/**/meta.json` on startup,
+    # because that can flood the Library with hundreds of historical runs.
 
 if "search_visible" not in st.session_state:
     st.session_state.search_visible = False
@@ -371,13 +527,108 @@ if "search_visible" not in st.session_state:
 if "search_query" not in st.session_state:
     st.session_state.search_query = ""
 
-if "debug_perf" not in st.session_state:
-    st.session_state.debug_perf = False
+# File uploader widgets retain their value across reruns. If we `st.rerun()` after
+# handling an upload without resetting the widget, we'll keep re-processing the
+# same uploaded file and rerunning before the library list renders.
+if "upload_widget_seq" not in st.session_state:
+    st.session_state.upload_widget_seq = 0
+
+# Pipeline run state (used to show an "Analyzing..." indicator during synchronous work)
+if "door_detector_pipeline_task" not in st.session_state:
+    # { file_id, file_dir, config_path, label, _started }
+    st.session_state.door_detector_pipeline_task = None
 
 VIEWER_TARGET_WIDTH_PX = 1200
 VIEWER_ASPECT_RATIO_HW = 0.75  # height/width
 
 lib = st.session_state.library
+
+def _get_viewer_height_px() -> int:
+    viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
+    viewer_width_hint = max(600, min(2000, viewer_width_hint))
+    aspect = float(VIEWER_ASPECT_RATIO_HW)
+    aspect = max(0.35, min(1.25, aspect))
+    viewer_height = int(round(viewer_width_hint * aspect))
+    return max(450, min(1400, viewer_height))
+
+def _render_viewer_loading(*, height_px: int, title: str, subtitle: str) -> None:
+    safe_title = html.escape(str(title or "Analyzing…"))
+    safe_sub = html.escape(str(subtitle or "Running analysis…"))
+    st.markdown(
+        f"""
+<div class="door_detector-viewer-loading" style="height: {int(height_px)}px;">
+  <div class="door_detector-viewer-loading-inner" role="status" aria-live="polite">
+    <div class="door_detector-spinner" aria-hidden="true"></div>
+    <div class="door_detector-viewer-loading-title">{safe_title}</div>
+    <div class="door_detector-viewer-loading-sub">{safe_sub}</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+def _queue_pipeline_run(file_id: str, file_dir_str: str, config_path: str, label: str) -> None:
+    # Queue work; it will execute on the next run so the viewer can paint a loader first.
+    st.session_state.door_detector_pipeline_task = {
+        "file_id": str(file_id),
+        "file_dir": str(file_dir_str),
+        "config_path": str(config_path),
+        "label": str(label),
+        "_started": False,
+    }
+
+def _debug_log(msg: str, *args: Any) -> None:
+    """Debug logging gated by the sidebar perf checkbox."""
+    try:
+        if st.session_state.get("debug_perf"):
+            logger.info(msg, *args)
+    except Exception:
+        return
+
+def _delete_library_item_and_reset_ui(file_id: str) -> None:
+    lib.delete_item(file_id)
+    # Clear selection + per-file UI state to avoid dangling widget keys.
+    try:
+        st.session_state.files.pop(file_id, None)
+    except Exception:
+        pass
+    for k in [
+        f"auto_focus_{file_id}",
+        f"jump_{file_id}",
+        f"door_click_sink_{file_id}",
+        f"confirm_delete_{file_id}",
+    ]:
+        try:
+            st.session_state.pop(k, None)
+        except Exception:
+            pass
+    st.session_state.selected_file_id = None
+
+    st.cache_data.clear()
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+def _clear_library_and_reset_ui() -> None:
+    lib.clear()
+    try:
+        st.session_state.files = {}
+    except Exception:
+        pass
+    st.session_state.selected_file_id = None
+
+    # Reset uploader widget so the UI doesn't immediately re-add a previously-selected file.
+    try:
+        st.session_state.upload_widget_seq = int(st.session_state.get("upload_widget_seq") or 0) + 1
+    except Exception:
+        st.session_state.upload_widget_seq = 1
+
+    st.cache_data.clear()
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
 
 # --- Session State Helpers ---
 def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
@@ -392,10 +643,14 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
             "notes": labels_data.get("notes", ""),
             "selected_door_id": None,
             "viewer_mode": "Highlight All",
+            "auto_focus": True,
+            "_focus_seq": 0,
+            "_focus_last_id": None,
+            "_last_clicked_door_id": None,
         }
 
 # --- Data Loading ---
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_file_artifacts(file_dir_str: str):
     file_dir = Path(file_dir_str)
     doors_path = file_dir / "doors.json"
@@ -442,7 +697,7 @@ def _get_preview_path(file_dir: Path) -> Path:
     return file_dir / "page_view.jpg"
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_or_create_page_preview(
     file_dir_str: str,
     *,
@@ -628,22 +883,23 @@ def _rects_to_svg(
         if w <= 0.0 or h <= 0.0:
             continue
 
-        # Match existing color semantics.
+        # Match existing color semantics (selection highlight handled client-side to
+        # avoid reloading the viewer iframe on Next/Prev).
         stroke = "#ffa500"  # undecided (orange)
         if did in fstate.get("accepted", set()):
             stroke = "#00ff00"
         if d.get("is_user_added"):
             stroke = "#00ffff"
-        if is_selected:
-            stroke = "#ff4b4b"  # selected (red)
 
-        stroke_width = 2 if not is_selected else 3
+        stroke_width = 2
         did_attr = html.escape(str(did), quote=True)
         parts.append(
             f'<rect x="{x0p:.2f}" y="{y0p:.2f}" width="{w:.2f}" height="{h:.2f}" '
             f'fill="none" stroke="{stroke}" stroke-width="{stroke_width}" '
             f'vector-effect="non-scaling-stroke" '
-            f'data-door-id="{did_attr}" style="pointer-events: all; cursor: pointer;" />'
+            f'data-door-id="{did_attr}" '
+            f'data-x="{x0p:.2f}" data-y="{y0p:.2f}" data-w="{w:.2f}" data-h="{h:.2f}" '
+            f'style="pointer-events: all; cursor: pointer;" />'
         )
 
     return "\n".join(parts)
@@ -657,12 +913,17 @@ def _panzoom_image_viewer(
     height: int,
     key: str,
     click_sink_aria_label: str,
+    selected_sink_aria_label: str,
+    focus_seq_sink_aria_label: str,
+    auto_focus: bool,
 ) -> None:
     # This viewer provides:
     # - scrollwheel zoom (centered at cursor)
     # - click+drag pan
     # - initial fit-to-container with letterboxing
     click_sink_aria_label_esc = html.escape(click_sink_aria_label, quote=True)
+    selected_sink_aria_label_esc = html.escape(selected_sink_aria_label, quote=True)
+    focus_seq_sink_aria_label_esc = html.escape(focus_seq_sink_aria_label, quote=True)
     viewer_html = f"""
 <div id="pz_root_{key}" style="width: 100%; height: {height}px; overflow: hidden; background: #0e1117; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);">
   <style>
@@ -740,6 +1001,23 @@ def _panzoom_image_viewer(
   const resetBtn = document.getElementById("pz_reset_{key}");
   if (!root || !stage || !content || !img) return;
 
+  const persistKey = "door_detector_pz_state_{html.escape(str(key), quote=True)}";
+  const autoFocus = {json.dumps(bool(auto_focus))};
+  const clickSinkLabel = "{click_sink_aria_label_esc}";
+  const selectedSinkLabel = "{selected_sink_aria_label_esc}";
+  const focusSeqSinkLabel = "{focus_seq_sink_aria_label_esc}";
+  try {{
+    console.log("[door_detector] pz init", {{
+      key: {json.dumps(str(key))},
+      autoFocus,
+      persistKey,
+      clickSinkLabel,
+      selectedSinkLabel,
+      focusSeqSinkLabel,
+      ts: Date.now(),
+    }});
+  }} catch (_) {{}}
+
   let scale = 1;
   let tx = 0;
   let ty = 0;
@@ -762,6 +1040,7 @@ def _panzoom_image_viewer(
   function applyTransform() {{
     content.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`;
     updateResetVisibility();
+    scheduleSaveState();
   }}
 
   function isAtBase() {{
@@ -811,6 +1090,167 @@ def _panzoom_image_viewer(
     applyTransform();
   }}
 
+  function loadState() {{
+    try {{
+      const raw = sessionStorage.getItem(persistKey);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj) return null;
+      if (!Number.isFinite(obj.tx) || !Number.isFinite(obj.ty) || !Number.isFinite(obj.scale)) return null;
+      return obj;
+    }} catch (_) {{
+      return null;
+    }}
+  }}
+
+  function readParentInputValue(label) {{
+    try {{
+      const input = window.parent?.document?.querySelector(`input[aria-label="${{label}}"]`);
+      return input ? String(input.value || "") : "";
+    }} catch (_) {{
+      return "";
+    }}
+  }}
+
+  function getSelectedId() {{
+    const v = readParentInputValue(selectedSinkLabel);
+    return v ? v : null;
+  }}
+
+  function getFocusSeq() {{
+    const raw = readParentInputValue(focusSeqSinkLabel);
+    const n = parseInt(raw || "0", 10);
+    return Number.isFinite(n) ? n : 0;
+  }}
+
+  function findRectByDoorId(doorId) {{
+    if (!svg || !doorId) return null;
+    const rects = svg.querySelectorAll("rect[data-door-id]");
+    for (const r of rects) {{
+      if (r && r.getAttribute && r.getAttribute("data-door-id") === doorId) return r;
+    }}
+    return null;
+  }}
+
+  let selectedRect = null;
+  function setSelectedRect(doorId) {{
+    if (!svg) return;
+
+    // Clear previous selection.
+    if (selectedRect) {{
+      const baseStroke = selectedRect.getAttribute("data-base-stroke");
+      const baseStrokeWidth = selectedRect.getAttribute("data-base-stroke-width");
+      if (baseStroke) selectedRect.setAttribute("stroke", baseStroke);
+      if (baseStrokeWidth) selectedRect.setAttribute("stroke-width", baseStrokeWidth);
+    }}
+
+    const r = findRectByDoorId(doorId);
+    if (!r) {{
+      selectedRect = null;
+      return;
+    }}
+
+    // Cache base styles once.
+    if (!r.getAttribute("data-base-stroke")) {{
+      r.setAttribute("data-base-stroke", r.getAttribute("stroke") || "#ffa500");
+    }}
+    if (!r.getAttribute("data-base-stroke-width")) {{
+      r.setAttribute("data-base-stroke-width", r.getAttribute("stroke-width") || "2");
+    }}
+
+    // Apply selected style.
+    r.setAttribute("stroke", "#ff4b4b");
+    r.setAttribute("stroke-width", "3");
+    try {{ svg.appendChild(r); }} catch (_) {{}}
+    selectedRect = r;
+  }}
+
+  let saveTimer = null;
+  function scheduleSaveState() {{
+    try {{
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {{
+        saveTimer = null;
+        try {{
+          sessionStorage.setItem(
+            persistKey,
+            JSON.stringify({{ tx: tx, ty: ty, scale: scale, focusSeq: focusSeq }})
+          );
+        }} catch (_) {{}}
+      }}, 100);
+    }} catch (_) {{}}
+  }}
+
+  function easeInOut(t) {{
+    return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+  }}
+
+  function animateTo(targetTx, targetTy, targetScale, durationMs) {{
+    const start = performance.now();
+    const sTx = tx, sTy = ty, sScale = scale;
+    const dTx = targetTx - sTx;
+    const dTy = targetTy - sTy;
+    const dScale = targetScale - sScale;
+
+    function step(now) {{
+      const t = clamp((now - start) / durationMs, 0, 1);
+      const e = easeInOut(t);
+      tx = sTx + dTx * e;
+      ty = sTy + dTy * e;
+      scale = sScale + dScale * e;
+      applyTransform();
+      if (t < 1) requestAnimationFrame(step);
+    }}
+
+    requestAnimationFrame(step);
+  }}
+
+  function focusToBBox(bbox) {{
+    if (!bbox || !Array.isArray(bbox) || bbox.length !== 4) return;
+    const cw = root.clientWidth;
+    const ch = root.clientHeight;
+    if (!cw || !ch) return;
+
+    const x0 = bbox[0], y0 = bbox[1], x1 = bbox[2], y1 = bbox[3];
+    const bx0 = Math.min(x0, x1);
+    const by0 = Math.min(y0, y1);
+    const bx1 = Math.max(x0, x1);
+    const by1 = Math.max(y0, y1);
+
+    const bw = Math.max(1, bx1 - bx0);
+    const bh = Math.max(1, by1 - by0);
+    const cx = (bx0 + bx1) / 2;
+    const cy = (by0 + by1) / 2;
+
+    // Show some context around the selected door (larger = less zoomed-in).
+    const padFactor = 3.0;
+    const targetScale = clamp(Math.min(cw / (bw * padFactor), ch / (bh * padFactor)), baseScale, baseScale * 6);
+    const targetTx = (cw / 2) - targetScale * cx;
+    const targetTy = (ch / 2) - targetScale * cy;
+
+    try {{
+      console.log("[door_detector] pz focusToBBox", {{
+        key: {json.dumps(str(key))},
+        focusSeq,
+        bbox,
+        target: {{ tx: targetTx, ty: targetTy, scale: targetScale }},
+        ts: Date.now(),
+      }});
+    }} catch (_) {{}}
+    animateTo(targetTx, targetTy, targetScale, 260);
+  }}
+
+  function focusToDoorId(doorId) {{
+    const r = findRectByDoorId(doorId);
+    if (!r) return;
+    const x = parseFloat(r.getAttribute("data-x") || r.getAttribute("x") || "0");
+    const y = parseFloat(r.getAttribute("data-y") || r.getAttribute("y") || "0");
+    const w = parseFloat(r.getAttribute("data-w") || r.getAttribute("width") || "0");
+    const h = parseFloat(r.getAttribute("data-h") || r.getAttribute("height") || "0");
+    if (!(w > 0) || !(h > 0)) return;
+    focusToBBox([x, y, x + w, y + h]);
+  }}
+
   function zoomAt(clientX, clientY, zoomFactor) {{
     const rect = root.getBoundingClientRect();
     const px = clientX - rect.left;
@@ -829,8 +1269,48 @@ def _panzoom_image_viewer(
   }}
 
   // Fit once image is ready.
-  if (img.complete) fitToContainer();
-  else img.addEventListener("load", fitToContainer, {{ once: true }});
+  function applyInitialView() {{
+    // Always establish base fit first.
+    fitToContainer();
+
+    // Restore last view first so focus can animate from the current pan/zoom.
+    const saved = loadState();
+    if (saved) {{
+      try {{
+        console.log("[door_detector] pz restoreState", {{
+          key: {json.dumps(str(key))},
+          saved,
+          ts: Date.now(),
+        }});
+      }} catch (_) {{}}
+      scale = clamp(saved.scale, 0.05, 20);
+      tx = saved.tx;
+      ty = saved.ty;
+      applyTransform();
+    }}
+
+    // Sync highlight and optional focus based on parent state.
+    const doorId = getSelectedId();
+    const seq = getFocusSeq();
+    if (doorId) {{
+      setSelectedRect(doorId);
+      if (autoFocus && (!saved || saved.focusSeq !== seq)) {{
+        try {{
+          console.log("[door_detector] pz autoFocus", {{
+            key: {json.dumps(str(key))},
+            fromSaved: !!saved,
+            savedFocusSeq: saved ? saved.focusSeq : null,
+            focusSeq: seq,
+            ts: Date.now(),
+          }});
+        }} catch (_) {{}}
+        focusToDoorId(doorId);
+      }}
+    }}
+  }}
+
+  if (img.complete) applyInitialView();
+  else img.addEventListener("load", applyInitialView, {{ once: true }});
 
   // Keep the "original state" in sync on resize, but only if user hasn't deviated.
   try {{
@@ -906,6 +1386,27 @@ def _panzoom_image_viewer(
     }} catch (_) {{}}
   }}
 
+  // Watch selection changes coming from Streamlit (right panel).
+  let lastSelectedId = null;
+  let lastFocusSeq = null;
+  function pollSelection() {{
+    const did = getSelectedId();
+    const seq = getFocusSeq();
+    if (did && did !== lastSelectedId) {{
+      lastSelectedId = did;
+      setSelectedRect(did);
+    }}
+    if (autoFocus && did) {{
+      if (lastFocusSeq === null) {{
+        lastFocusSeq = seq;
+      }} else if (seq !== lastFocusSeq) {{
+        lastFocusSeq = seq;
+        focusToDoorId(did);
+      }}
+    }}
+  }}
+  try {{ setInterval(pollSelection, 120); }} catch (_) {{}}
+
   if (svg) {{
     // If a door bbox is clicked, select it (and don't start a pan drag).
     svg.addEventListener("pointerdown", (e) => {{
@@ -923,16 +1424,67 @@ def _panzoom_image_viewer(
       if (!did) return;
       e.preventDefault();
       e.stopPropagation();
+      // Immediate UX: highlight/focus locally without waiting for the rerun.
+      setSelectedRect(did);
+      if (autoFocus) focusToDoorId(did);
       setSelectedDoorId(did);
     }});
   }}
 }})();
 </script>
 """
+    try:
+        viewer_hash = hashlib.sha256(viewer_html.encode("utf-8")).hexdigest()[:12]
+        _debug_log("viewer key=%s html_hash=%s", str(key), viewer_hash)
+    except Exception:
+        pass
     components.html(viewer_html, height=height, scrolling=False)
 
 def sidebar_library():
     st.sidebar.title("Library")
+
+    with st.sidebar.expander("Manage", expanded=False):
+        if st.button(
+            "Import existing artifacts",
+            key="import_existing_artifacts_btn",
+            help="Scan artifacts/**/meta.json and add them to the Library (may be a lot).",
+            use_container_width=True,
+        ):
+            lib.discover_existing()
+            st.rerun()
+
+        clear_key = "confirm_clear_library"
+        if clear_key not in st.session_state:
+            st.session_state[clear_key] = False
+
+        if not st.session_state[clear_key]:
+            if st.button(
+                "Clear library…",
+                key="clear_library_btn",
+                help="Remove ALL items from the Library (deletes artifacts/library/*).",
+                use_container_width=True,
+                type="secondary",
+            ):
+                st.session_state[clear_key] = True
+                st.rerun()
+        else:
+            if st.button(
+                "Confirm clear",
+                key="clear_library_confirm_btn",
+                use_container_width=True,
+                type="primary",
+            ):
+                _clear_library_and_reset_ui()
+                st.session_state[clear_key] = False
+                st.rerun()
+            if st.button(
+                "Cancel",
+                key="clear_library_cancel_btn",
+                use_container_width=True,
+                type="secondary",
+            ):
+                st.session_state[clear_key] = False
+                st.rerun()
 
     # Search and Add Area
     if not st.session_state.search_visible:
@@ -942,18 +1494,28 @@ def sidebar_library():
                 st.session_state.search_visible = True
                 st.rerun()
         with col_add:
-            uploaded_file = st.file_uploader("Upload", type=["pdf"], label_visibility="collapsed")
+            upload_key = f"upload_pdf_{int(st.session_state.get('upload_widget_seq') or 0)}"
+            uploaded_file = st.file_uploader(
+                "Upload",
+                type=["pdf"],
+                label_visibility="collapsed",
+                key=upload_key,
+            )
             if uploaded_file:
                 file_id = lib.add_file(uploaded_file.name, uploaded_file.getvalue())
+                # Auto-select the newly added file, and reset the uploader so we
+                # don't re-add it on the next rerun.
+                st.session_state.selected_file_id = file_id
+                st.session_state.upload_widget_seq = int(st.session_state.get("upload_widget_seq") or 0) + 1
                 st.rerun()
     else:
         col_input, col_close = st.sidebar.columns([5, 1])
         with col_input:
             search_val = st.text_input(
-                "Search", 
+                "Search",
                 value=st.session_state.search_query,
                 label_visibility="collapsed",
-                key="search_input_widget"
+                key="search_input_widget",
             )
             if search_val != st.session_state.search_query:
                 st.session_state.search_query = search_val
@@ -965,19 +1527,18 @@ def sidebar_library():
                 st.rerun()
 
     st.sidebar.divider()
-    
+
     items = lib.get_items()
     if st.session_state.search_query:
         items = [i for i in items if st.session_state.search_query.lower() in i["original_name"].lower()]
-    
+
     if not items:
         st.sidebar.info("No files in library.")
     else:
         for item in items:
             is_selected = (st.session_state.get("selected_file_id") == item["id"])
-            display_name = item["original_name"]
-            label = display_name
-            
+            label = item["original_name"]
+
             if st.sidebar.button(
                 label,
                 key=f"sel_{item['id']}",
@@ -988,9 +1549,6 @@ def sidebar_library():
                 st.session_state.selected_file_id = item["id"]
                 st.rerun()
 
-    with st.sidebar.expander("Debug", expanded=False):
-        st.checkbox("Show perf timings", key="debug_perf")
-
 def main_viewer_canvas(
     item: Dict,
     *,
@@ -998,48 +1556,29 @@ def main_viewer_canvas(
     full_dims: Optional[Tuple[int, int]],
     doors_data: Dict,
     fstate: Dict,
+    active_doors: List[Dict[str, Any]],
+    click_sink_label: str,
 ):
     file_id = item["id"]
     file_dir = Path(item["path"])
     
     if preview_spec:
-        detections = doors_data.get("doors", [])
-
-        # Filter detections: keep undecided and accepted, exclude rejected
-        active_doors = [d for d in detections if d["id"] not in fstate["rejected"]]
-        # Add user added boxes as pseudo-detections
-        for box in fstate["added_boxes"]:
-            bbox = box["bbox_xyxy"]
-            # Stable ID for added box based on coordinates
-            box_id = f"u_{int(bbox[0])}_{int(bbox[1])}"
-            active_doors.append({
-                "id": box_id,
-                "type": "added",
-                "bbox_xyxy": bbox,
-                "confidence": 1.0,
-                "is_user_added": True
-            })
-
         # Door click sink: JS writes the clicked door id into this hidden widget,
         # which triggers a rerun; on rerun we sync it into the "Jump to door" control.
-        click_sink_label = f"door_click_sink_{file_id}"
         click_sink_key = click_sink_label
         st.text_input(click_sink_label, key=click_sink_key, label_visibility="collapsed")
-        clicked_id = st.session_state.get(click_sink_key)
-        active_ids = {d.get("id") for d in active_doors}
-        if clicked_id:
-            if clicked_id in active_ids and clicked_id != fstate.get("_last_clicked_door_id"):
-                fstate["_last_clicked_door_id"] = clicked_id
-                fstate["selected_door_id"] = clicked_id
-                st.session_state[f"jump_{file_id}"] = clicked_id
 
-        # Keep the main viewer highlight in sync with the "Jump to door" selector.
-        # Otherwise, the right panel can advance selection in the same run (Prev/Next),
-        # but the main viewer would still render using the previous fstate selection.
-        jump_key = f"jump_{file_id}"
-        jump_id = st.session_state.get(jump_key)
-        if jump_id in active_ids and jump_id != fstate.get("selected_door_id"):
-            fstate["selected_door_id"] = jump_id
+        # Selection/focus sinks: the viewer polls these so selection changes don't require
+        # changing the viewer HTML (reduces iframe reload flicker).
+        selected_sink_label = f"selected_door_sink_{file_id}"
+        focus_seq_sink_label = f"focus_seq_sink_{file_id}"
+        try:
+            st.session_state[selected_sink_label] = str(fstate.get("selected_door_id") or "")
+            st.session_state[focus_seq_sink_label] = str(int(fstate.get("_focus_seq") or 0))
+        except Exception:
+            pass
+        st.text_input(selected_sink_label, key=selected_sink_label, label_visibility="collapsed")
+        st.text_input(focus_seq_sink_label, key=focus_seq_sink_label, label_visibility="collapsed")
 
         viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
         viewer_width_hint = max(600, min(2000, viewer_width_hint))
@@ -1086,6 +1625,7 @@ def main_viewer_canvas(
         )
 
         img_src = _image_path_to_streamlit_url(str(preview_spec.get("path", "")))
+
         _panzoom_image_viewer(
             img_src=img_src,
             img_width=int(preview_spec.get("width", 1)),
@@ -1094,10 +1634,13 @@ def main_viewer_canvas(
             height=viewer_height,
             key=str(file_id),
             click_sink_aria_label=click_sink_label,
+            selected_sink_aria_label=selected_sink_label,
+            focus_seq_sink_aria_label=focus_seq_sink_label,
+            auto_focus=bool(fstate.get("auto_focus", True)),
         )
         return None, active_doors
     else:
-        st.info("Run analysis to see results.")
+        st.info("Analyze to see results.")
         return None, []
 
 def main_viewer_controls(
@@ -1110,9 +1653,13 @@ def main_viewer_controls(
 ):
     file_id = item["id"]
     file_dir = Path(item["path"])
+    # Some discovered file ids can include characters like '(' which are not valid
+    # HTML element ids; Streamlit may then omit the button id attribute. Use a
+    # safe hashed suffix for widget keys that we want to style via CSS.
+    key_suffix = hashlib.md5(str(file_id).encode("utf-8")).hexdigest()[:12]
     
     # Grid for main controls
-    c1, c2 = st.columns(2)
+    c1, c2, c_del = st.columns([2, 2, 1])
     with c1:
         status = item.get("status", "not_processed")
         if status == "processing":
@@ -1133,13 +1680,22 @@ def main_viewer_controls(
         stored_sig = doors_data.get("analysis_signature")
         is_out_of_date = stored_sig and current_sig and stored_sig != current_sig
         
-        label = "Rerun" if status == "done" else "Run"
+        label = "Re-analyze" if status == "done" else "Analyze"
         if is_out_of_date:
             label = f"{label} (!)"
-        
-        if st.button(label, type="primary" if not status == "done" else "secondary", use_container_width=True):
-            run_pipeline(file_id, file_dir, config_path)
-            st.rerun()
+
+        task = st.session_state.get("door_detector_pipeline_task")
+        is_running_for_file = bool(task and task.get("file_id") == str(file_id))
+        analysis_label = f"Analyzing {item.get('original_name', '')}".strip() or "Analyzing…"
+
+        st.button(
+            label,
+            type="primary" if not status == "done" else "secondary",
+            use_container_width=True,
+            disabled=is_running_for_file,
+            on_click=_queue_pipeline_run,
+            args=(str(file_id), str(file_dir), str(config_path), analysis_label),
+        )
     with c2:
         modes = ["Highlight All", "Highlight Selected", "Off", "Add Door"]
         fstate["viewer_mode"] = st.selectbox(
@@ -1148,6 +1704,39 @@ def main_viewer_controls(
             index=modes.index(fstate["viewer_mode"]) if fstate["viewer_mode"] in modes else 0,
             label_visibility="collapsed"
         )
+    with c_del:
+        confirm_key = f"confirm_delete_{file_id}"
+        if confirm_key not in st.session_state:
+            st.session_state[confirm_key] = False
+
+        if not st.session_state[confirm_key]:
+            if st.button(
+                "Delete",
+                key=f"delete_btn_{key_suffix}",
+                help="Remove this PDF from the library (deletes source.pdf and all artifacts).",
+                use_container_width=True,
+                type="secondary",
+            ):
+                st.session_state[confirm_key] = True
+                st.rerun()
+        else:
+            # Stack buttons vertically to avoid extreme wrapping in narrow layouts.
+            if st.button(
+                "Confirm",
+                key=f"delete_confirm_btn_{key_suffix}",
+                use_container_width=True,
+                type="primary",
+            ):
+                _delete_library_item_and_reset_ui(file_id)
+                st.rerun()
+            if st.button(
+                "Cancel",
+                key=f"delete_cancel_btn_{key_suffix}",
+                use_container_width=True,
+                type="secondary",
+            ):
+                st.session_state[confirm_key] = False
+                st.rerun()
 
     c3, c4 = st.columns(2)
     with c3:
@@ -1159,6 +1748,12 @@ def main_viewer_controls(
             if st.button("Add Door", use_container_width=True):
                 fstate["viewer_mode"] = "Add Door"
                 st.rerun()
+    with c4:
+        auto_focus_key = f"auto_focus_{file_id}"
+        # Keep widget state and per-file fstate in sync.
+        if auto_focus_key not in st.session_state:
+            st.session_state[auto_focus_key] = bool(fstate.get("auto_focus", True))
+        fstate["auto_focus"] = st.checkbox("Auto-focus", key=auto_focus_key)
 
     if fstate["viewer_mode"] == "Add Door":
         st.info("Draw rectangles on the PDF.")
@@ -1192,6 +1787,69 @@ def main_viewer_controls(
                 else:
                     st.warning("No rectangles drawn.")
 
+def _sync_selected_door_for_run(
+    *,
+    file_id: str,
+    fstate: Dict[str, Any],
+    all_visible: List[Dict[str, Any]],
+) -> None:
+    """Sync selected door state BEFORE rendering the main viewer.
+
+    This reduces visible flicker on reruns because the viewer can render early
+    while still reflecting the newest selection (Next/Prev/selectbox/box-click).
+    """
+    if not all_visible:
+        fstate["selected_door_id"] = None
+        return
+
+    door_ids = [d.get("id") for d in all_visible if d.get("id") is not None]
+    if not door_ids:
+        fstate["selected_door_id"] = None
+        return
+
+    jump_key = f"jump_{file_id}"
+    prev_key = f"{jump_key}__prev"
+    next_key = f"{jump_key}__next"
+    click_sink_key = f"door_click_sink_{file_id}"
+
+    # Establish current selection (priority: clicked bbox → jump selector → fstate → first).
+    current_id = None
+    clicked_id = st.session_state.get(click_sink_key)
+    if clicked_id in door_ids and clicked_id != fstate.get("_last_clicked_door_id"):
+        fstate["_last_clicked_door_id"] = clicked_id
+        current_id = clicked_id
+    elif st.session_state.get(jump_key) in door_ids:
+        current_id = st.session_state[jump_key]
+    elif fstate.get("selected_door_id") in door_ids:
+        current_id = fstate["selected_door_id"]
+    else:
+        current_id = door_ids[0]
+
+    # Apply Prev/Next navigation. The button widget values are posted into session_state
+    # before the script runs, even if the widgets are instantiated later in the run.
+    prev_clicked = bool(st.session_state.get(prev_key))
+    next_clicked = bool(st.session_state.get(next_key))
+    if prev_clicked or next_clicked:
+        delta = -1 if prev_clicked else 1
+        try:
+            idx = door_ids.index(current_id)
+        except ValueError:
+            idx = 0
+        current_id = door_ids[(idx + delta) % len(door_ids)]
+
+    # Make selection canonical for the rest of this run.
+    if st.session_state.get(jump_key) != current_id:
+        st.session_state[jump_key] = current_id
+    fstate["selected_door_id"] = current_id
+
+    # Bump focus sequence when selection changes (so the viewer auto-focuses only on changes).
+    if current_id != fstate.get("_focus_last_id"):
+        fstate["_focus_last_id"] = current_id
+        try:
+            fstate["_focus_seq"] = int(fstate.get("_focus_seq") or 0) + 1
+        except Exception:
+            fstate["_focus_seq"] = 1
+
 def right_panel_review(
     item: Dict,
     *,
@@ -1202,6 +1860,13 @@ def right_panel_review(
 ):
     file_id = item["id"]
     file_dir = Path(item["path"])
+
+    # Don't show "Doors (0)" until analysis has been run at least once.
+    status = item.get("status", "not_processed")
+    has_run = (status == "done") or (file_dir / "doors.json").exists()
+    if not has_run:
+        st.info("Analyze to see doors.")
+        return
     
     # Use pre-calculated active_doors (which already includes added_boxes)
     all_visible = active_doors.copy()
@@ -1222,32 +1887,17 @@ def right_panel_review(
     # Streamlit selectbox keeps its own state keyed by `key=...`.
     # Treat that as canonical, but keep it in sync with our per-file fstate.
     jump_key = f"jump_{file_id}"
-
-    current_id = None
-    if st.session_state.get(jump_key) in door_ids:
-        current_id = st.session_state[jump_key]
-    elif fstate.get("selected_door_id") in door_ids:
-        current_id = fstate["selected_door_id"]
-    else:
-        current_id = door_ids[0]
+    current_id = st.session_state.get(jump_key) if st.session_state.get(jump_key) in door_ids else door_ids[0]
 
     # Prev/Next (wrap-around).
     #
     # Avoid callbacks: Streamlit may run callbacks after widget instantiation,
     # which can trigger "cannot be modified..." if we touch `st.session_state[jump_key]`.
     col_p, col_idx, col_n = st.columns([1, 2, 1])
-    prev_clicked = col_p.button("Prev", use_container_width=True, key=f"{jump_key}__prev")
-    next_clicked = col_n.button("Next", use_container_width=True, key=f"{jump_key}__next")
-
-    if prev_clicked or next_clicked:
-        delta = -1 if prev_clicked else 1
-        idx = door_ids.index(current_id)
-        current_id = door_ids[(idx + delta) % len(door_ids)]
-        # Force a rerun so the main viewer (rendered earlier in the script) picks up
-        # the updated selection and highlights the same door as the crop panel.
-        st.session_state[jump_key] = current_id
-        fstate["selected_door_id"] = current_id
-        st.rerun()
+    # NOTE: Navigation behavior is applied at the start of the run by
+    # `_sync_selected_door_for_run(...)` so the main viewer can render first.
+    col_p.button("Prev", use_container_width=True, key=f"{jump_key}__prev")
+    col_n.button("Next", use_container_width=True, key=f"{jump_key}__next")
 
     # Must happen before the selectbox is instantiated.
     if st.session_state.get(jump_key) != current_id:
@@ -1265,6 +1915,8 @@ def right_panel_review(
     )
     fstate["selected_door_id"] = picked
     selected_idx = door_ids.index(picked) if picked in door_ids else selected_idx
+    # NOTE: Focus sequence is bumped in `_sync_selected_door_for_run(...)` earlier in the run,
+    # so the main viewer highlight/focus stays in sync.
 
     col_idx.write(f"<div style='text-align: center; line-height: 38px;'>{selected_idx + 1} / {len(all_visible)}</div>", unsafe_allow_html=True)
 
@@ -1374,10 +2026,6 @@ def right_panel_review(
 def run_pipeline(file_id: str, file_dir: Path, config_path: str):
     lib.update_status(file_id, "processing")
     try:
-        # IMPORTANT:
-        # Step 2 relies on Step 1's coordinate system. If `source.pdf` is present,
-        # always rerun Step 1 to guarantee `page.png` + `primitives.json` match the
-        # current transform logic (especially important after transform fixes).
         primitives_path = file_dir / "primitives.json"
         meta_path = file_dir / "meta.json"
         image_path = file_dir / "page.png"
@@ -1386,8 +2034,31 @@ def run_pipeline(file_id: str, file_dir: Path, config_path: str):
         has_step1_artifacts = primitives_path.exists() and meta_path.exists() and image_path.exists()
         can_run_step1 = pdf_path.exists()
 
+        step1_dpi = 400
+        step1_page_index = 0
+
         if can_run_step1:
-            process_pdf(pdf_path, file_dir, dpi=400, page_index=0)
+            should_run_step1 = True
+            if has_step1_artifacts:
+                try:
+                    stored_meta = json.loads(meta_path.read_text())
+                except Exception:
+                    stored_meta = {}
+
+                stored_sig = (stored_meta.get("step1") or {}).get("signature")
+                try:
+                    current_sig = compute_step1_signature(
+                        pdf_path=pdf_path, dpi=step1_dpi, page_index=step1_page_index
+                    ).get("signature")
+                except Exception:
+                    current_sig = None
+
+                if stored_sig and current_sig and stored_sig == current_sig:
+                    should_run_step1 = False
+                    logger.info("Skipping Step 1 for %s (signature match)", str(file_dir))
+
+            if should_run_step1:
+                process_pdf(pdf_path, file_dir, dpi=step1_dpi, page_index=step1_page_index)
         elif not has_step1_artifacts:
             raise FileNotFoundError(
                 f"Missing Step 1 artifacts in {file_dir} and no source.pdf found; cannot rerun Step 1."
@@ -1419,74 +2090,178 @@ def save_current_labels(file_id: str, file_dir: Path):
 
 sidebar_library()
 
-if "selected_file_id" in st.session_state and st.session_state.selected_file_id:
-    items = lib.get_items()
-    selected_item = next((i for i in items if i["id"] == st.session_state.selected_file_id), None)
-    
-    if selected_item:
-        file_id = selected_item["id"]
-        file_dir = Path(selected_item["path"])
-        perf: Dict[str, float] = {}
+col_app = st.container()
 
-        t0 = time.perf_counter()
-        doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
-        perf["load_file_artifacts_ms"] = (time.perf_counter() - t0) * 1000.0
-        init_file_state(file_id, doors_data, labels_data)
-        fstate = st.session_state.files[file_id]
+with col_app:
+    if "selected_file_id" in st.session_state and st.session_state.selected_file_id:
+        items = lib.get_items()
+        selected_item = next((i for i in items if i["id"] == st.session_state.selected_file_id), None)
 
-        full_dims = _get_full_page_dims(meta_data)
-        t1 = time.perf_counter()
-        page_png_path = file_dir / "page.png"
-        try:
-            page_png_mtime_ns = page_png_path.stat().st_mtime_ns
-        except Exception:
-            page_png_mtime_ns = 0
-        preview_spec = get_or_create_page_preview(
-            str(file_dir),
-            full_width=full_dims[0] if full_dims else None,
-            full_height=full_dims[1] if full_dims else None,
-            page_png_mtime_ns=page_png_mtime_ns,
-        )
-        perf["get_or_create_page_preview_ms"] = (time.perf_counter() - t1) * 1000.0
+        if selected_item:
+            file_id = selected_item["id"]
+            file_dir = Path(selected_item["path"])
+            perf: Dict[str, float] = {}
 
-        title = html.escape(str(selected_item.get("original_name", "")))
-        st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
-        
-        col_main, col_review = st.columns([2, 1])
-        
-        with col_main:
-            t2 = time.perf_counter()
-            canvas_result, active_doors = main_viewer_canvas(
-                selected_item,
-                preview_spec=preview_spec,
-                full_dims=full_dims,
-                doors_data=doors_data,
-                fstate=fstate,
+            # If a pipeline run is queued for this file, replace the viewer with a loader,
+            # then run the pipeline synchronously (so the title stays constant).
+            task = st.session_state.get("door_detector_pipeline_task")
+            if task and task.get("file_id") == str(file_id) and not bool(task.get("_started")):
+                try:
+                    task["_started"] = True
+                    st.session_state.door_detector_pipeline_task = task
+                except Exception:
+                    pass
+                try:
+                    title = html.escape(str(selected_item.get("original_name", "")))
+                    st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
+
+                    col_main, col_review = st.columns([2, 1])
+                    with col_main:
+                        _render_viewer_loading(
+                            height_px=_get_viewer_height_px(),
+                            title="Analyzing…",
+                            subtitle="Updating detections and refreshing results. This can take a moment.",
+                        )
+                    with col_review:
+                        st.info("Analysis is running…")
+
+                    run_pipeline(
+                        str(file_id),
+                        Path(str(task.get("file_dir") or str(file_dir))),
+                        str(task.get("config_path") or "configs/door_rules.json"),
+                    )
+                finally:
+                    st.session_state.door_detector_pipeline_task = None
+                st.rerun()
+
+            t0 = time.perf_counter()
+            doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+            perf["load_file_artifacts_ms"] = (time.perf_counter() - t0) * 1000.0
+            init_file_state(file_id, doors_data, labels_data)
+            fstate = st.session_state.files[file_id]
+
+            full_dims = _get_full_page_dims(meta_data)
+            t1 = time.perf_counter()
+            page_png_path = file_dir / "page.png"
+            try:
+                page_png_mtime_ns = page_png_path.stat().st_mtime_ns
+            except Exception:
+                page_png_mtime_ns = 0
+            preview_spec = get_or_create_page_preview(
+                str(file_dir),
+                full_width=full_dims[0] if full_dims else None,
+                full_height=full_dims[1] if full_dims else None,
+                page_png_mtime_ns=page_png_mtime_ns,
             )
-            perf["render_main_panel_ms"] = (time.perf_counter() - t2) * 1000.0
-            
-        with col_review:
-            t3 = time.perf_counter()
-            main_viewer_controls(
-                selected_item,
-                full_dims=full_dims,
-                doors_data=doors_data,
-                fstate=fstate,
-                canvas_result=canvas_result,
-            )
-            st.divider()
-            right_panel_review(
-                selected_item,
-                preview_spec=preview_spec,
-                doors_data=doors_data,
-                fstate=fstate,
-                active_doors=active_doors,
-            )
-            perf["render_right_panel_ms"] = (time.perf_counter() - t3) * 1000.0
+            perf["get_or_create_page_preview_ms"] = (time.perf_counter() - t1) * 1000.0
 
-        if st.session_state.get("debug_perf"):
-            with st.sidebar.expander("Perf timings (server)", expanded=True):
-                for k, v in perf.items():
-                    st.write(f"**{k}**: {v:.1f} ms")
-else:
-    st.info("Select a file from the library to begin.")
+            title = html.escape(str(selected_item.get("original_name", "")))
+            st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
+
+            col_main, col_review = st.columns([2, 1])
+
+            # Compute active doors once so the main viewer + right panel stay in perfect sync.
+            detections = doors_data.get("doors", [])
+            active_doors: List[Dict[str, Any]] = [d for d in detections if d.get("id") not in fstate["rejected"]]
+            for box in fstate["added_boxes"]:
+                bbox = box.get("bbox_xyxy")
+                if not bbox:
+                    continue
+                # Stable ID for added box based on coordinates
+                try:
+                    box_id = f"u_{int(bbox[0])}_{int(bbox[1])}"
+                except Exception:
+                    continue
+                active_doors.append(
+                    {
+                        "id": box_id,
+                        "type": "added",
+                        "bbox_xyxy": bbox,
+                        "confidence": 1.0,
+                        "is_user_added": True,
+                    }
+                )
+
+            click_sink_label = f"door_click_sink_{file_id}"
+
+            # Per-run debug context (helps diagnose viewer flashing / re-mounting).
+            run_key = "_door_detector_run_seq"
+            try:
+                st.session_state[run_key] = int(st.session_state.get(run_key) or 0) + 1
+            except Exception:
+                st.session_state[run_key] = 1
+            run_seq = int(st.session_state.get(run_key) or 0)
+
+            # Sync selection state before rendering the viewer (reduces 1-run lag and flicker).
+            all_visible = active_doors.copy()
+            all_visible.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+            _debug_log(
+                "run=%d file_id=%s mode=%s pre_sync selected=%s focus_seq=%s prev=%s next=%s",
+                run_seq,
+                file_id,
+                fstate.get("viewer_mode"),
+                fstate.get("selected_door_id"),
+                fstate.get("_focus_seq"),
+                bool(st.session_state.get(f"jump_{file_id}__prev")),
+                bool(st.session_state.get(f"jump_{file_id}__next")),
+            )
+            _sync_selected_door_for_run(file_id=file_id, fstate=fstate, all_visible=all_visible)
+            _debug_log(
+                "run=%d file_id=%s post_sync selected=%s focus_seq=%s auto_focus=%s",
+                run_seq,
+                file_id,
+                fstate.get("selected_door_id"),
+                fstate.get("_focus_seq"),
+                fstate.get("auto_focus"),
+            )
+
+            # Render main viewer first so it appears earlier during reruns (less blank flash).
+            with col_main:
+                t2 = time.perf_counter()
+                _debug_log("run=%d file_id=%s render_main start", run_seq, file_id)
+                canvas_result, _ = main_viewer_canvas(
+                    selected_item,
+                    preview_spec=preview_spec,
+                    full_dims=full_dims,
+                    doors_data=doors_data,
+                    fstate=fstate,
+                    active_doors=active_doors,
+                    click_sink_label=click_sink_label,
+                )
+                perf["render_main_panel_ms"] = (time.perf_counter() - t2) * 1000.0
+                _debug_log(
+                    "run=%d file_id=%s render_main done (%.1f ms)",
+                    run_seq,
+                    file_id,
+                    perf["render_main_panel_ms"],
+                )
+
+            with col_review:
+                t3 = time.perf_counter()
+                _debug_log("run=%d file_id=%s render_right start", run_seq, file_id)
+                main_viewer_controls(
+                    selected_item,
+                    full_dims=full_dims,
+                    doors_data=doors_data,
+                    fstate=fstate,
+                    canvas_result=canvas_result,
+                )
+                st.divider()
+                right_panel_review(
+                    selected_item,
+                    preview_spec=preview_spec,
+                    doors_data=doors_data,
+                    fstate=fstate,
+                    active_doors=active_doors,
+                )
+                perf["render_right_panel_ms"] = (time.perf_counter() - t3) * 1000.0
+                _debug_log(
+                    "run=%d file_id=%s render_right done (%.1f ms)",
+                    run_seq,
+                    file_id,
+                    perf["render_right_panel_ms"],
+                )
+        else:
+            st.info("Select a file from the library to begin.")
+    else:
+        st.info("Select a file from the library to begin.")

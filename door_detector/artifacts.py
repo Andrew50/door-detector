@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from PIL import Image
 
@@ -16,6 +16,7 @@ def write_artifacts(
     transform: Dict[str, Any],
     page_mode: Dict[str, Any],
     timings: Dict[str, float],
+    step1_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Write all artifacts to disk in a deterministic format.
@@ -63,6 +64,8 @@ def write_artifacts(
             **timings,
         },
     }
+    if step1_info:
+        meta["step1"] = step1_info
     meta_path = output_dir / "meta.json"
     meta_serializable = _make_json_serializable(meta)
     with open(meta_path, "w") as f:

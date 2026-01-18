@@ -61,6 +61,14 @@ class Library:
             del self.items[file_id]
             self._save_index()
 
+    def clear(self):
+        """Remove all items from the library (deletes library/* contents)."""
+        if self.library_dir.exists():
+            shutil.rmtree(self.library_dir)
+        self._ensure_dirs()
+        self.items = {}
+        self._save_index()
+
     def update_status(self, file_id: str, status: str, error: Optional[str] = None):
         """Update the processing status of a file."""
         if file_id in self.items:

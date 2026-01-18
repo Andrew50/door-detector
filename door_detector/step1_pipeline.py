@@ -8,6 +8,7 @@ from door_detector.artifacts import write_artifacts
 from door_detector.pdf_render import load_pdf_page, render_page
 from door_detector.pdf_vectors import apply_transform_to_primitives, extract_primitives
 from door_detector.scan_classifier import classify_page_mode
+from door_detector.step1_signature import compute_step1_signature
 from door_detector.transforms import compute_transform, validate_transform
 
 
@@ -72,6 +73,13 @@ def process_pdf(
             "total_ms": (time.time() - total_start) * 1000,
         }
 
+        step1_info = None
+        try:
+            step1_info = compute_step1_signature(pdf_path=pdf_path, dpi=dpi, page_index=page_index)
+        except Exception:
+            # Signature is used for smart skipping in the UI; don't fail Step 1 if it can't be computed.
+            step1_info = None
+
         # Write artifacts
         write_artifacts(
             output_dir=output_dir,
@@ -82,6 +90,7 @@ def process_pdf(
             transform=transform_dict,
             page_mode=page_mode,
             timings=timings,
+            step1_info=step1_info,
         )
 
         # Generate debug overlay if requested
