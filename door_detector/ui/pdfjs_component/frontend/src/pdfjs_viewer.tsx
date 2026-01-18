@@ -200,6 +200,16 @@ export function PdfJsViewer(props: ComponentProps) {
     Streamlit.setComponentValue(evt);
   }, []);
 
+  // Be explicit about readiness. (Some Streamlit frontends can log
+  // "unregistered ComponentInstance" if messages arrive before registration.)
+  useEffect(() => {
+    try {
+      Streamlit.setComponentReady();
+    } catch {
+      // ignore
+    }
+  }, []);
+
   // Mirror legacy iframe behavior: print unmatched debug reports to the browser console.
   useEffect(() => {
     if (!unmatchedDebugRaw) return;
@@ -455,9 +465,12 @@ export function PdfJsViewer(props: ComponentProps) {
 
       const task = page.render({ canvasContext: ctx, viewport });
       await task.promise;
+      // Give the browser a frame to commit the newly-rendered canvas before we
+      // swap visibility. This avoids any transient "blank/grey" composite.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       renderQualityRef.current = quality;
 
-      // Swap active canvas without blanking.
+      // Swap active canvas without blending (no crossfade).
       activeCanvasRef.current = nextCanvasKey;
       setActiveCanvas(nextCanvasKey);
     } finally {
@@ -469,18 +482,33 @@ export function PdfJsViewer(props: ComponentProps) {
     if (!pageSize) return;
     const z = baseScaleRef.current > 0 ? scaleRef.current / baseScaleRef.current : scaleRef.current;
     // More resolution steps at higher zoom; actual cap is enforced in renderCanvasAtQuality.
-    let desired = 1;
-    if (z >= 8.0) desired = 5;
-    else if (z >= 5.5) desired = 4;
-    else if (z >= 3.6) desired = 3;
-    else if (z >= 2.2) desired = 2;
-    if (desired === renderQualityRef.current) return;
+    //
+    // IMPORTANT: Use hysteresis so we don't bounce around thresholds (which can cause
+    // repeated rerenders + visible flashes).
+    const q0 = renderQualityRef.current;
+    let desired = q0;
 
+    // Upgrade thresholds.
+    if (desired < 2 && z >= 2.2) desired = 2;
+    if (desired < 3 && z >= 3.6) desired = 3;
+    if (desired < 4 && z >= 5.5) desired = 4;
+    if (desired < 5 && z >= 8.0) desired = 5;
+
+    // Downgrade thresholds (lower than upgrade to create hysteresis).
+    if (desired === 5 && z < 7.2) desired = 4;
+    if (desired === 4 && z < 5.0) desired = 3;
+    if (desired === 3 && z < 3.2) desired = 2;
+    if (desired === 2 && z < 1.9) desired = 1;
+
+    if (desired === q0) return;
+
+    // Upgrades feel best quickly; downgrades can wait a bit longer to avoid churn.
+    const delayMs = desired > q0 ? 220 : 520;
     if (renderTimerRef.current) window.clearTimeout(renderTimerRef.current);
     renderTimerRef.current = window.setTimeout(() => {
       renderTimerRef.current = null;
       void renderCanvasAtQuality(desired);
-    }, 320);
+    }, delayMs);
   }, [pageSize, renderCanvasAtQuality]);
 
   // ResizeObserver: keep base fit-to-container updated when user hasn't deviated.
@@ -694,10 +722,55 @@ export function PdfJsViewer(props: ComponentProps) {
         }
       }
 
-      if (!overlap.length) return null;
-      if (bestByIou && bestByIou.iou >= MIN_SNAP_IOU) return bestByIou;
-      if (bestByInter) return bestByInter;
-      if (bestByCoverage && bestByCoverage.coverage >= MIN_CAND_COVERAGE) return bestByCoverage;
+      // Debug output: match the legacy viewer's "criteria hit/miss" style.
+      // eslint-disable-next-line no-console
+      console.log("[door_detector] snapCandidateForDrawPdf", {
+        drawn: norm,
+        candidates: candidatePool.length,
+        overlapCandidates: overlap.length,
+        thresholds: { MIN_SNAP_IOU, MIN_CAND_COVERAGE },
+        bestByIoU: bestByIou ? { id: bestByIou.id, iou: bestByIou.iou } : null,
+        bestByInter: bestByInter ? { id: bestByInter.id, inter: bestByInter.inter, iou: bestByInter.iou } : null,
+        bestByCoverage: bestByCoverage
+          ? { id: bestByCoverage.id, coverage: bestByCoverage.coverage, inter: bestByCoverage.inter, iou: bestByCoverage.iou }
+          : null,
+        overlapSample: overlap.slice(0, 3),
+      });
+
+      if (!overlap.length) {
+        // eslint-disable-next-line no-console
+        console.log("[door_detector] snapCandidateForDrawPdf no match (no overlap)");
+        return null;
+      }
+      if (bestByIou && bestByIou.iou >= MIN_SNAP_IOU) {
+        // eslint-disable-next-line no-console
+        console.log("[door_detector] snapCandidateForDrawPdf chosen", { reason: "iou", id: bestByIou.id, iou: bestByIou.iou });
+        return bestByIou;
+      }
+      if (bestByInter) {
+        // eslint-disable-next-line no-console
+        console.log("[door_detector] snapCandidateForDrawPdf chosen", {
+          reason: "max_intersection",
+          id: bestByInter.id,
+          inter: bestByInter.inter,
+          iou: bestByInter.iou,
+        });
+        return bestByInter;
+      }
+      if (bestByCoverage && bestByCoverage.coverage >= MIN_CAND_COVERAGE) {
+        // eslint-disable-next-line no-console
+        console.log("[door_detector] snapCandidateForDrawPdf chosen", {
+          reason: "coverage",
+          id: bestByCoverage.id,
+          coverage: bestByCoverage.coverage,
+          iou: bestByCoverage.iou,
+        });
+        return bestByCoverage;
+      }
+      // eslint-disable-next-line no-console
+      console.log("[door_detector] snapCandidateForDrawPdf no match (overlap too weak)", {
+        bestByIoU: bestByIou ? { id: bestByIou.id, iou: bestByIou.iou } : null,
+      });
       return null;
     },
     [candidatePool]
@@ -926,6 +999,18 @@ export function PdfJsViewer(props: ComponentProps) {
           const drawn: BBox = normalizeBBox([p0[0], p0[1], p1[0], p1[1]]);
           const snap = snapCandidateForDrawPdf(drawn);
 
+          try {
+            // eslint-disable-next-line no-console
+            console.log("[door_detector] draw_rect endDrag (pdfjs)", {
+              drawn_pdf_xyxy: drawn,
+              candidates: candidatePool.length,
+              snap: snap ? { id: (snap as any).id, iou: (snap as any).iou ?? computeIoU(drawn, (snap as any).bbox), bbox: (snap as any).bbox } : null,
+              ts: Date.now(),
+            });
+          } catch {
+            // ignore
+          }
+
           // Immediate UX: draw snap/unmatched marker on the temp layer.
           const temp = ensureLayer("pz_temp");
           if (snap && temp) {
@@ -1126,7 +1211,7 @@ export function PdfJsViewer(props: ComponentProps) {
               top: 0,
               pointerEvents: "none",
               opacity: activeCanvas === "a" ? 1 : 0,
-              transition: "opacity 90ms linear",
+              visibility: activeCanvas === "a" ? "visible" : "hidden",
             }}
           />
           <canvas
@@ -1137,7 +1222,7 @@ export function PdfJsViewer(props: ComponentProps) {
               top: 0,
               pointerEvents: "none",
               opacity: activeCanvas === "b" ? 1 : 0,
-              transition: "opacity 90ms linear",
+              visibility: activeCanvas === "b" ? "visible" : "hidden",
             }}
           />
           <svg

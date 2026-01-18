@@ -458,48 +458,20 @@ def main() -> None:
                 with col_review:
                     review_slot = st.empty()
 
-                # If a pipeline run is queued for this file, replace the viewer with a loader,
-                # then run the pipeline synchronously (so the title stays constant).
+                # If a pipeline run is queued for this file, keep rendering the *existing*
+                # viewer state while analysis runs (don't swap in a loader).
+                # We'll run the pipeline *after* the viewer/right panel have rendered so the
+                # previous state remains visible until results refresh.
                 task = st.session_state.get("door_detector_pipeline_task")
-                if task and task.get("file_id") == str(file_id) and not bool(task.get("_started")):
+                should_run_pipeline_now = bool(
+                    task and task.get("file_id") == str(file_id) and not bool(task.get("_started"))
+                )
+                if should_run_pipeline_now:
                     try:
                         task["_started"] = True
                         st.session_state.door_detector_pipeline_task = task
                     except Exception:
                         pass
-                    try:
-                        # IMPORTANT: explicitly clear prior viewer output so it doesn't
-                        # remain stacked underneath the loader (Streamlit can otherwise
-                        # leave a previous iframe render in place).
-                        try:
-                            viewer_slot.empty()
-                            review_slot.empty()
-                        except Exception:
-                            pass
-                        # Hide any stale Streamlit component iframes while analyzing.
-                        # Some Streamlit builds can leave a previous components.html iframe
-                        # attached below the loader; this CSS prevents that UI artifact.
-                        viewer_slot.markdown(
-                            "<div id='door_detector-analyzing-flag' style='display:none;'></div>"
-                            "<style>"
-                            "body:has(#door_detector-analyzing-flag) section.main iframe,"
-                            "body:has(#door_detector-analyzing-flag) section.stMain iframe{"
-                            "display:none !important;"
-                            "}"
-                            "</style>"
-                            "<div class='door_detector-viewer-loading' style='height: 650px;'><div class='door_detector-viewer-loading-inner'><div class='door_detector-spinner'></div><div class='door_detector-viewer-loading-title'>Analyzing…</div><div class='door_detector-viewer-loading-sub'>Updating detections and refreshing results. This can take a moment.</div></div></div>",
-                            unsafe_allow_html=True,
-                        )
-                        review_slot.info("Analysis is running…")
-
-                        run_pipeline(
-                            str(file_id),
-                            Path(str(task.get("file_dir") or str(file_dir))),
-                            str(task.get("config_path") or "configs/door_rules.json"),
-                        )
-                    finally:
-                        st.session_state.door_detector_pipeline_task = None
-                    st.rerun()
 
                 try:
                     doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
@@ -659,6 +631,19 @@ def main() -> None:
                         active_doors=active_doors,
                         all_active_doors=active_doors_all,
                     )
+
+                # Run analysis after the UI has rendered so the previous viewer state persists
+                # during the long-running pipeline work.
+                if should_run_pipeline_now:
+                    try:
+                        run_pipeline(
+                            str(file_id),
+                            Path(str(task.get("file_dir") or str(file_dir))),
+                            str(task.get("config_path") or "configs/door_rules.json"),
+                        )
+                    finally:
+                        st.session_state.door_detector_pipeline_task = None
+                    st.rerun()
             else:
                 components.html(assets.sidebar_autopen_component_html(), height=0, scrolling=False)
                 st.info("Select a file from the library to begin.")

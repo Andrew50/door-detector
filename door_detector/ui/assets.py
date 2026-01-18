@@ -362,17 +362,14 @@ GLOBAL_STYLE_HTML = r"""
         width: 100% !important;
     }
 
-    /* Main viewer: keep PDF title area a fixed two lines tall */
+    /* Main viewer: keep PDF title tight to the viewer (top-justified) */
     .door_detector-pdf-title {
         --door_detector-title-font-size: 1.35rem;
         --door_detector-title-line-height: 1.55rem;
 
-        /* Match existing heading spacing, but keep total height stable */
+        /* Keep spacing minimal so the viewer starts right under the title */
         padding-top: 0rem;
-        margin: 0 0 0.75rem 0;
-
-        /* Always reserve exactly two lines */
-        height: calc(2 * var(--door_detector-title-line-height));
+        margin: 0 0 0.15rem 0;
         overflow: hidden;
     }
 
@@ -383,7 +380,7 @@ GLOBAL_STYLE_HTML = r"""
         margin: 0 !important;
         padding: 0 !important; /* override global .main h3 padding-top */
 
-        /* Clamp to two lines; container keeps the reserved space either way */
+        /* Clamp to two lines without reserving extra vertical space */
         display: -webkit-box;
         -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;

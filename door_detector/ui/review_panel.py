@@ -115,6 +115,12 @@ def main_viewer_controls(
     # safe hashed suffix for widget keys that we want to style via CSS.
     key_suffix = hashlib.md5(str(file_id).encode("utf-8")).hexdigest()[:12]
 
+    task = st.session_state.get("door_detector_pipeline_task")
+    is_running_for_file = bool(task and task.get("file_id") == str(file_id))
+    analysis_label = f"Analyzing {item.get('original_name', '')}".strip() or "Analyzing…"
+    if is_running_for_file:
+        st.info(f"{analysis_label} (running)")
+
     # Grid for main controls
     c1, c2, c_del = st.columns([2, 2, 1])
     with c1:
@@ -140,10 +146,6 @@ def main_viewer_controls(
         label = "Re-analyze" if status == "done" else "Analyze"
         if is_out_of_date:
             label = f"{label} (!)"
-
-        task = st.session_state.get("door_detector_pipeline_task")
-        is_running_for_file = bool(task and task.get("file_id") == str(file_id))
-        analysis_label = f"Analyzing {item.get('original_name', '')}".strip() or "Analyzing…"
 
         st.button(
             label,
@@ -323,11 +325,17 @@ def right_panel_review(
     file_id = item["id"]
     file_dir = Path(item["path"])
 
+    task = st.session_state.get("door_detector_pipeline_task")
+    is_running_for_file = bool(task and task.get("file_id") == str(file_id))
+
     # Don't show "Doors (0)" until analysis has been run at least once.
     status = item.get("status", "not_processed")
     has_run = (status == "done") or (file_dir / "doors.json").exists()
     if not has_run:
-        st.info("Analyze to see doors.")
+        if is_running_for_file:
+            st.info("Analyzing…")
+        else:
+            st.info("Analyze to see doors.")
         return
 
     # Use pre-calculated active_doors so the main viewer + right panel stay in sync.

@@ -7,8 +7,6 @@ import { PdfJsViewer } from "./pdfjs_viewer";
 const Connected = withStreamlitConnection(PdfJsViewer);
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <Connected />
-  </React.StrictMode>
+  <Connected />
 );
 
