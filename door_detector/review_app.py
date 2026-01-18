@@ -9,6 +9,7 @@ import time
 import base64
 import copy
 import urllib.parse
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1619,12 +1620,8 @@ def _process_draw_event_if_any(
             pass
     else:
         _debug_log("draw_event snap unmatched file_id=%s", str(file_id))
-        draft["unmatched_manual_boxes"].append(
-            {
-                "bbox_xyxy": drawn_full,
-                "note": "No candidate match",
-            }
-        )
+        # Do not persist unmatched draw attempts as server-side overlays; the viewer
+        # already shows an immediate magenta marker client-side.
         fstate["_last_unmatched_debug"] = _debug_unmatched_region(
             file_dir=file_dir,
             drawn_bbox_full_xyxy=drawn_full,
@@ -1651,15 +1648,46 @@ def _manual_overlay_payload_for_sink(
     fstate: Dict[str, Any],
     preview_scale: float,
 ) -> Dict[str, Any]:
-    """Return preview-space overlays for the iframe (NOT saved to labels.json)."""
+    """Return preview-space overlays for the iframe.
+
+    Important UX detail: overlays should reflect *this edit round only*.
+    Previously-confirmed doors (including those confirmed via manual additions in earlier
+    sessions) should not reappear as magenta/cyan "selection" overlays when the user
+    re-enters Edit Doors without drawing anything new.
+    """
     state = _get_working_label_state(fstate)
     out_manual: List[Dict[str, Any]] = []
+    # NOTE: We intentionally do not render persisted unmatched manual boxes in the
+    # viewer overlay. Unmatched draw attempts are shown immediately client-side,
+    # but are not kept around as server-supplied overlays.
     out_unmatched: List[Dict[str, Any]] = []
 
     if not (preview_scale > 0):
         preview_scale = 1.0
 
+    # Only render manual additions created during the *current* edit session.
+    # We do this by subtracting baseline manual additions (captured when entering edit mode)
+    # from the current draft.
+    baseline_counts: Counter = Counter()
+    baseline = fstate.get("_edit_baseline") if bool(fstate.get("edit_mode")) else None
+    if isinstance(baseline, dict):
+        for b in list(baseline.get("manual_additions", []) or []):
+            try:
+                tok = json.dumps(b, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(b)
+            baseline_counts[tok] += 1
+
     for rec in list(state.get("manual_additions", [])):
+        if baseline_counts:
+            try:
+                tok = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(rec)
+            if baseline_counts.get(tok, 0) > 0:
+                baseline_counts[tok] -= 1
+                continue
+
         drawn_full = rec.get("drawn_bbox_xyxy")
         if not isinstance(drawn_full, list) or len(drawn_full) != 4:
             continue
@@ -1679,15 +1707,7 @@ def _manual_overlay_payload_for_sink(
             }
         )
 
-    for rec in list(state.get("unmatched_manual_boxes", [])):
-        bbox_full = rec.get("bbox_xyxy")
-        if not isinstance(bbox_full, list) or len(bbox_full) != 4:
-            continue
-        bbox_prev = _scale_bbox_xyxy([float(v) for v in bbox_full], preview_scale)
-        if bbox_prev is None:
-            continue
-        out_unmatched.append({"bbox_xyxy": bbox_prev, "note": rec.get("note")})
-
+    # Keep the key for backwards compatibility with the client code.
     return {"manual_additions": out_manual, "unmatched_manual_boxes": out_unmatched}
 
 
@@ -4095,60 +4115,8 @@ def right_panel_review(
     if is_editing:
         st.divider()
         st.subheader("Edit Doors")
-        st.caption("Shift+drag in the main viewer to add. Save/Cancel are in the top controls.")
-
-        manual_adds = list(working.get("manual_additions", []))
-        if manual_adds:
-            st.markdown(f"**Manual additions ({len(manual_adds)})**")
-            for idx, rec in enumerate(manual_adds):
-                cid = rec.get("snapped_candidate_id")
-                iou = rec.get("iou")
-                label = f"{idx+1}. {cid or '(unmatched?)'}  iou={iou:.3f}" if isinstance(iou, (int, float)) else f"{idx+1}. {cid or '(unmatched?)'}"
-                cols = st.columns([5, 1])
-                cols[0].write(label)
-                if cols[1].button("Remove", key=f"rm_manual_{file_id}_{idx}", use_container_width=True):
-                    try:
-                        removed = working["manual_additions"].pop(idx)
-                    except Exception:
-                        removed = None
-                    removed_cid = str((removed or {}).get("snapped_candidate_id") or "")
-                    if removed_cid:
-                        # If this confirmation was only due to manual-add, revert to undecided.
-                        try:
-                            manual_confirmed = set(fstate.get("_edit_manual_confirmed_ids", set()))
-                        except Exception:
-                            manual_confirmed = set()
-                        still_refs = any(
-                            str(r.get("snapped_candidate_id") or "") == removed_cid
-                            for r in list(working.get("manual_additions", []))
-                        )
-                        if (removed_cid in manual_confirmed) and (not still_refs):
-                            working["confirmed_ids"].discard(removed_cid)
-                            try:
-                                fstate["_edit_manual_confirmed_ids"].discard(removed_cid)
-                            except Exception:
-                                pass
-                    st.rerun()
-        else:
-            st.markdown("**Manual additions (0)**")
-
-        unmatched = list(working.get("unmatched_manual_boxes", []))
-        if unmatched:
-            st.markdown(f"**Unmatched manual boxes ({len(unmatched)})**")
-            for idx, rec in enumerate(unmatched):
-                note = str(rec.get("note") or "unmatched")
-                cols = st.columns([5, 1])
-                cols[0].write(f"{idx+1}. {note}")
-                if cols[1].button("Remove", key=f"rm_unmatched_{file_id}_{idx}", use_container_width=True):
-                    try:
-                        working["unmatched_manual_boxes"].pop(idx)
-                    except Exception:
-                        pass
-                    st.rerun()
-        else:
-            st.markdown("**Unmatched manual boxes (0)**")
-
-        # (Debug report UI removed; see `_debug_unmatched_region` for details.)
+        # Intentionally omit the manual-add/unmatched lists here. Manual additions can be
+        # removed by selecting the snapped door and clicking "Delete / Not a door".
 
     # Train badge
     total_overrides = len(working.get("confirmed_ids", set())) + len(working.get("deleted_ids", set()))
