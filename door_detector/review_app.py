@@ -7,48 +7,16 @@ import os
 import shutil
 import time
 import base64
+import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
 
 from door_detector.analysis_signature import compute_analysis_signature
-
-def _patch_streamlit_drawable_canvas_image_to_url() -> None:
-    """Compatibility shim for streamlit-drawable-canvas.
-
-    streamlit-drawable-canvas<=0.9.x calls streamlit.elements.image.image_to_url,
-    but newer Streamlit moved the implementation and changed its signature.
-    """
-    try:
-        import streamlit.elements.image as st_image
-
-        if hasattr(st_image, "image_to_url"):
-            return
-
-        from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
-        from streamlit.elements.lib.layout_utils import LayoutConfig
-
-        def _image_to_url_compat(image, width, clamp, channels, output_format, image_id):
-            return _image_to_url(
-                image=image,
-                layout_config=LayoutConfig(width=width),
-                clamp=clamp,
-                channels=channels,
-                output_format=output_format,
-                image_id=image_id,
-            )
-
-        st_image.image_to_url = _image_to_url_compat  # type: ignore[attr-defined]
-    except Exception:
-        # If Streamlit internals change again, avoid breaking the app on import.
-        return
-
-
-_patch_streamlit_drawable_canvas_image_to_url()
+from door_detector.door_features import compute_iou
 
 from door_detector.library import Library
 from door_detector.step1_pipeline import process_pdf
@@ -178,6 +146,41 @@ st.markdown("""
        main block container; remove it so the PDF title sits closer to the top. */
     [data-testid="stMainBlockContainer"] > div,
     [data-testid="stMainBlockContainer"] > div:first-child {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
+    /* Streamlit 1.53 uses class selectors here (not always data-testid). */
+    section.stMain > div.stMainBlockContainer,
+    div.stMainBlockContainer {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
+    section.stMain > div.stMainBlockContainer > div,
+    div.stMainBlockContainer > div {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+        justify-content: flex-start !important;
+        align-content: flex-start !important;
+    }
+    /* Higher-specificity overrides for 1.53's `stMainBlockContainer.block-container.*` rules
+       (important-vs-important: specificity matters). */
+    section.stMain > div.stMainBlockContainer.block-container,
+    div.stMainBlockContainer.block-container {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
+    section.stMain > div.stMainBlockContainer.block-container > div,
+    div.stMainBlockContainer.block-container > div {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+        /* This wrapper is a flex column in Streamlit 1.53; reduce its default `gap`
+           (often 1rem) which can look like "space above" the first visible widget. */
+        gap: 0.5rem !important;
+        row-gap: 0.5rem !important;
+    }
+    /* Some Streamlit builds nest another wrapper div that carries the top padding. */
+    section.stMain > div.stMainBlockContainer.block-container > div > div,
+    div.stMainBlockContainer.block-container > div > div {
         padding-top: 0rem !important;
         margin-top: 0rem !important;
     }
@@ -369,8 +372,8 @@ st.markdown("""
     
     [data-testid="stSidebar"] h1 {
         padding-top: 0 !important;
-        margin-top: 16px !important;
-        margin-bottom: 14px !important; /* more space before Search/Upload row */
+        margin-top: 28px !important;
+        margin-bottom: 24px !important; /* more space before Search/Upload row */
     }
 
     /* Make the X button align better with the search input */
@@ -448,6 +451,27 @@ st.markdown("""
         padding: 0 !important;
     }
     div[data-testid="stTextInput"] input[aria-label^="focus_seq_sink_"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    div[data-testid="stTextInput"]:has(input[aria-label^="edit_mode_sink_"]),
+    div[data-testid="stTextInput"]:has(input[aria-label^="draw_event_sink_"]),
+    div[data-testid="stTextInput"]:has(input[aria-label^="manual_overlay_sink_"]),
+    div[data-testid="stTextInput"]:has(input[aria-label^="door_state_sink_"]),
+    div[data-testid="stTextInput"]:has(input[aria-label^="viewer_display_sink_"]) {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"] input[aria-label^="edit_mode_sink_"],
+    div[data-testid="stTextInput"] input[aria-label^="draw_event_sink_"],
+    div[data-testid="stTextInput"] input[aria-label^="manual_overlay_sink_"],
+    div[data-testid="stTextInput"] input[aria-label^="door_state_sink_"],
+    div[data-testid="stTextInput"] input[aria-label^="viewer_display_sink_"] {
         display: none !important;
         height: 0 !important;
         margin: 0 !important;
@@ -676,6 +700,13 @@ def _delete_library_item_and_reset_ui(file_id: str) -> None:
         f"auto_focus_{file_id}",
         f"jump_{file_id}",
         f"door_click_sink_{file_id}",
+        f"selected_door_sink_{file_id}",
+        f"focus_seq_sink_{file_id}",
+        f"edit_mode_sink_{file_id}",
+        f"draw_event_sink_{file_id}",
+        f"manual_overlay_sink_{file_id}",
+        f"door_state_sink_{file_id}",
+        f"viewer_display_sink_{file_id}",
         f"confirm_delete_{file_id}",
     ]:
         try:
@@ -687,6 +718,13 @@ def _delete_library_item_and_reset_ui(file_id: str) -> None:
     st.cache_data.clear()
     try:
         st.cache_resource.clear()
+    except Exception:
+        pass
+
+    # Labels schema changed (v2-only); avoid any lingering cached file artifacts.
+    # (load_file_artifacts is no longer cached, but keep this for safety.)
+    try:
+        st.session_state.pop("_last_loaded_labels_schema_version", None)
     except Exception:
         pass
 
@@ -710,27 +748,396 @@ def _clear_library_and_reset_ui() -> None:
     except Exception:
         pass
 
+    try:
+        st.session_state.pop("_last_loaded_labels_schema_version", None)
+    except Exception:
+        pass
+
 # --- Session State Helpers ---
+LABELS_SCHEMA_VERSION = 2
+_LEGACY_LABEL_KEYS = {"accepted_ids", "rejected_ids", "added_boxes", "notes"}
+_LABELS_V2_REQUIRED_KEYS = {
+    "schema_version",
+    "reviewed_at",
+    "confirmed_ids",
+    "deleted_ids",
+    "manual_additions",
+    "unmatched_manual_boxes",
+}
+
+
+def _labels_v2_default() -> Dict[str, Any]:
+    # reviewed_at is intentionally null until the first save.
+    return {
+        "schema_version": LABELS_SCHEMA_VERSION,
+        "reviewed_at": None,
+        "confirmed_ids": [],
+        "deleted_ids": [],
+        "manual_additions": [],
+        "unmatched_manual_boxes": [],
+    }
+
+
+def _validate_labels_v2_or_raise(labels_data: Dict[str, Any], *, labels_path: Path) -> None:
+    """Validate schema v2 labels.json. Raise with a clear migration message on failure."""
+    if not isinstance(labels_data, dict):
+        raise ValueError(f"Invalid labels.json (expected object): {labels_path}")
+
+    schema_version = labels_data.get("schema_version", None)
+    if schema_version != LABELS_SCHEMA_VERSION:
+        raise ValueError(
+            "\n".join(
+                [
+                    f"Unsupported labels.json schema in {labels_path}.",
+                    f"Expected schema_version={LABELS_SCHEMA_VERSION}, got {schema_version!r}.",
+                    "",
+                    "This UI no longer supports legacy label schemas.",
+                    "Please delete this labels.json (or migrate it offline) and re-review the file.",
+                ]
+            )
+        )
+
+    legacy_present = sorted(k for k in _LEGACY_LABEL_KEYS if k in labels_data)
+    if legacy_present:
+        raise ValueError(
+            "\n".join(
+                [
+                    f"labels.json in {labels_path} contains deprecated fields: {legacy_present}",
+                    "Please delete this labels.json (or migrate it offline) and re-review the file.",
+                ]
+            )
+        )
+
+    missing = sorted(k for k in _LABELS_V2_REQUIRED_KEYS if k not in labels_data)
+    if missing:
+        raise ValueError(f"labels.json in {labels_path} is missing required keys: {missing}")
+
+    # Lightweight type checks (don’t coerce silently; fail fast).
+    for lk in ["confirmed_ids", "deleted_ids", "manual_additions", "unmatched_manual_boxes"]:
+        if not isinstance(labels_data.get(lk), list):
+            raise ValueError(f"labels.json field {lk!r} must be a list: {labels_path}")
+
+
+def _viewer_display_mode_to_sink_value(mode: str) -> str:
+    """Map UI selection to a compact string the iframe JS can poll."""
+    if mode == "Highlight Selected":
+        return "selected"
+    if mode == "Off":
+        return "off"
+    return "all"
+
+
+def _snapshot_label_state(src: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "confirmed_ids": set(src.get("confirmed_ids", set())),
+        "deleted_ids": set(src.get("deleted_ids", set())),
+        "manual_additions": copy.deepcopy(list(src.get("manual_additions", []))),
+        "unmatched_manual_boxes": copy.deepcopy(list(src.get("unmatched_manual_boxes", []))),
+    }
+
+
+def _apply_label_state(dst: Dict[str, Any], state: Dict[str, Any]) -> None:
+    dst["confirmed_ids"] = set(state.get("confirmed_ids", set()))
+    dst["deleted_ids"] = set(state.get("deleted_ids", set()))
+    dst["manual_additions"] = copy.deepcopy(list(state.get("manual_additions", [])))
+    dst["unmatched_manual_boxes"] = copy.deepcopy(list(state.get("unmatched_manual_boxes", [])))
+
+
+def _get_working_label_state(fstate: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the active label state dict (draft while editing, else committed fstate)."""
+    if bool(fstate.get("edit_mode")) and isinstance(fstate.get("_edit_draft"), dict):
+        return fstate["_edit_draft"]
+    return fstate
+
+
+def _enter_edit_mode(fstate: Dict[str, Any]) -> None:
+    if bool(fstate.get("edit_mode")) and isinstance(fstate.get("_edit_draft"), dict):
+        return
+    baseline = _snapshot_label_state(fstate)
+    draft = _snapshot_label_state(fstate)
+    fstate["edit_mode"] = True
+    fstate["_edit_baseline"] = baseline
+    fstate["_edit_draft"] = draft
+    # Track which confirmations are attributable to manual additions so removing a
+    # manual record can revert to undecided unless explicitly confirmed.
+    manual_ids = set()
+    for rec in draft.get("manual_additions", []):
+        cid = rec.get("snapped_candidate_id")
+        if cid:
+            manual_ids.add(str(cid))
+    fstate["_edit_manual_confirmed_ids"] = set(draft.get("confirmed_ids", set())) & manual_ids
+
+
+def _cancel_edit_mode(fstate: Dict[str, Any]) -> None:
+    baseline = fstate.get("_edit_baseline")
+    if isinstance(baseline, dict):
+        _apply_label_state(fstate, baseline)
+    fstate["edit_mode"] = False
+    fstate["_edit_baseline"] = None
+    fstate["_edit_draft"] = None
+    fstate["_edit_manual_confirmed_ids"] = set()
+
+
+def _save_edit_mode(fstate: Dict[str, Any]) -> None:
+    draft = fstate.get("_edit_draft")
+    if isinstance(draft, dict):
+        _apply_label_state(fstate, draft)
+    fstate["edit_mode"] = False
+    fstate["_edit_baseline"] = None
+    fstate["_edit_draft"] = None
+    fstate["_edit_manual_confirmed_ids"] = set()
+
+
+def _bbox_center_xy(bbox_xyxy: List[float]) -> Tuple[float, float]:
+    x0, y0, x1, y1 = bbox_xyxy
+    return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+
+
+def _point_in_bbox(pt: Tuple[float, float], bbox_xyxy: List[float]) -> bool:
+    x, y = pt
+    x0, y0, x1, y1 = bbox_xyxy
+    return (x0 <= x <= x1) and (y0 <= y <= y1)
+
+
+def _snap_to_candidate(
+    drawn_bbox_xyxy: List[float],
+    *,
+    candidates: List[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], float]:
+    """Return (best_candidate, iou). Candidate bboxes are assumed full-res pixels."""
+    nb = _normalize_bbox_xyxy(drawn_bbox_xyxy)
+    if nb is None:
+        return None, 0.0
+    x0, y0, x1, y1 = nb
+    drawn = [x0, y0, x1, y1]
+    dw = max(1.0, x1 - x0)
+    dh = max(1.0, y1 - y0)
+    dcenter = _bbox_center_xy(drawn)
+
+    best_iou = -1.0
+    best_by_iou: Optional[Dict[str, Any]] = None
+    centers_inside: List[Tuple[float, float, Dict[str, Any]]] = []  # (dist, iou, cand)
+    centers_all: List[Tuple[float, float, Dict[str, Any]]] = []
+
+    for cand in candidates:
+        cid = cand.get("id")
+        cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
+        if cid is None or cb is None:
+            continue
+        cx0, cy0, cx1, cy1 = cb
+        cbox = [cx0, cy0, cx1, cy1]
+        iou = float(compute_iou(drawn, cbox))
+        if iou > best_iou:
+            best_iou = iou
+            best_by_iou = cand
+        ccenter = _bbox_center_xy(cbox)
+        dist = math.hypot(ccenter[0] - dcenter[0], ccenter[1] - dcenter[1])
+        centers_all.append((dist, iou, cand))
+        if _point_in_bbox(ccenter, drawn):
+            centers_inside.append((dist, iou, cand))
+
+    if not centers_all:
+        return None, 0.0
+
+    # Primary: max IoU.
+    MIN_SNAP_IOU = 0.10
+    if best_by_iou is not None and best_iou >= MIN_SNAP_IOU:
+        return best_by_iou, max(0.0, float(best_iou))
+
+    # Fallback 1: candidate center inside the drawn box.
+    if centers_inside:
+        centers_inside.sort(key=lambda t: (-t[1], t[0]))  # prefer higher IoU, then closer
+        cand = centers_inside[0][2]
+        return cand, max(0.0, float(centers_inside[0][1]))
+
+    # Fallback 2: closest center, with a sanity threshold.
+    centers_all.sort(key=lambda t: (t[0], -t[1]))
+    dist, iou, cand = centers_all[0]
+    max_dist = 0.75 * max(dw, dh)
+    if dist <= max_dist:
+        return cand, max(0.0, float(iou))
+
+    return None, 0.0
+
+
+def _scale_bbox_xyxy(bbox_xyxy: List[float], scale: float) -> Optional[List[float]]:
+    nb = _normalize_bbox_xyxy(bbox_xyxy)
+    if nb is None:
+        return None
+    x0, y0, x1, y1 = nb
+    return [x0 * scale, y0 * scale, x1 * scale, y1 * scale]
+
+
+def _clamp_bbox_xyxy(bbox_xyxy: List[float], *, w: Optional[int], h: Optional[int]) -> List[float]:
+    nb = _normalize_bbox_xyxy(bbox_xyxy)
+    if nb is None:
+        return [0.0, 0.0, 0.0, 0.0]
+    x0, y0, x1, y1 = nb
+    if w is not None and w > 0:
+        x0 = max(0.0, min(float(w), x0))
+        x1 = max(0.0, min(float(w), x1))
+    if h is not None and h > 0:
+        y0 = max(0.0, min(float(h), y0))
+        y1 = max(0.0, min(float(h), y1))
+    return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+
+
+def _process_draw_event_if_any(
+    *,
+    file_id: str,
+    file_dir: Path,
+    fstate: Dict[str, Any],
+    doors_data: Dict[str, Any],
+    preview_spec: Optional[Dict[str, Any]],
+    full_dims: Optional[Tuple[int, int]],
+) -> None:
+    """Consume a Shift+drag draw event from the iframe (if present)."""
+    if not preview_spec:
+        return
+    draw_key = f"draw_event_sink_{file_id}"
+    raw = st.session_state.get(draw_key) or ""
+    if not raw:
+        return
+    try:
+        evt = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(evt, dict):
+        return
+    if evt.get("event") != "draw_rect":
+        return
+    event_id = evt.get("event_id")
+    bbox = evt.get("bbox_xyxy")
+    if not event_id or not isinstance(bbox, list) or len(bbox) != 4:
+        return
+    if str(event_id) == str(fstate.get("_last_draw_event_id")):
+        return
+    fstate["_last_draw_event_id"] = str(event_id)
+
+    # JS only emits in edit mode, but guard anyway.
+    if not bool(fstate.get("edit_mode")):
+        return
+
+    _enter_edit_mode(fstate)
+    draft = _get_working_label_state(fstate)
+
+    scale_full_to_preview = float(preview_spec.get("scale", 1.0) or 1.0)
+    if not (scale_full_to_preview > 0):
+        return
+
+    # Convert preview → full-res pixels.
+    try:
+        x0p, y0p, x1p, y1p = [float(v) for v in bbox]
+    except Exception:
+        return
+    drawn_full = [x0p / scale_full_to_preview, y0p / scale_full_to_preview, x1p / scale_full_to_preview, y1p / scale_full_to_preview]
+
+    full_w = full_dims[0] if full_dims else None
+    full_h = full_dims[1] if full_dims else None
+    drawn_full = _clamp_bbox_xyxy(drawn_full, w=full_w, h=full_h)
+
+    candidates = list(doors_data.get("doors", []) or [])
+    best, iou = _snap_to_candidate(drawn_full, candidates=candidates)
+    if best is not None and best.get("id") is not None:
+        cid = str(best["id"])
+        snapped_full = _normalize_bbox_xyxy(best.get("bbox_xyxy")) or _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
+        rec = {
+            "drawn_bbox_xyxy": drawn_full,
+            "snapped_candidate_id": cid,
+            "iou": float(iou),
+            "snapped_bbox_xyxy": [float(snapped_full[0]), float(snapped_full[1]), float(snapped_full[2]), float(snapped_full[3])],
+        }
+        draft["manual_additions"].append(rec)
+        draft["confirmed_ids"].add(cid)
+        draft["deleted_ids"].discard(cid)
+        try:
+            fstate["_edit_manual_confirmed_ids"].add(cid)
+        except Exception:
+            pass
+        # Make the snapped door the current selection.
+        try:
+            fstate["selected_door_id"] = cid
+            st.session_state[f"jump_{file_id}"] = cid
+        except Exception:
+            pass
+    else:
+        draft["unmatched_manual_boxes"].append(
+            {
+                "bbox_xyxy": drawn_full,
+                "note": "No candidate match",
+            }
+        )
+
+
+def _manual_overlay_payload_for_sink(
+    *,
+    fstate: Dict[str, Any],
+    preview_scale: float,
+) -> Dict[str, Any]:
+    """Return preview-space overlays for the iframe (NOT saved to labels.json)."""
+    state = _get_working_label_state(fstate)
+    out_manual: List[Dict[str, Any]] = []
+    out_unmatched: List[Dict[str, Any]] = []
+
+    if not (preview_scale > 0):
+        preview_scale = 1.0
+
+    for rec in list(state.get("manual_additions", [])):
+        drawn_full = rec.get("drawn_bbox_xyxy")
+        if not isinstance(drawn_full, list) or len(drawn_full) != 4:
+            continue
+        drawn_prev = _scale_bbox_xyxy([float(v) for v in drawn_full], preview_scale)
+        if drawn_prev is None:
+            continue
+        snapped_prev = None
+        snapped_full = rec.get("snapped_bbox_xyxy")
+        if isinstance(snapped_full, list) and len(snapped_full) == 4:
+            snapped_prev = _scale_bbox_xyxy([float(v) for v in snapped_full], preview_scale)
+        out_manual.append(
+            {
+                "drawn_bbox_xyxy": drawn_prev,
+                "snapped_bbox_xyxy": snapped_prev,
+                "snapped_candidate_id": rec.get("snapped_candidate_id"),
+                "iou": rec.get("iou"),
+            }
+        )
+
+    for rec in list(state.get("unmatched_manual_boxes", [])):
+        bbox_full = rec.get("bbox_xyxy")
+        if not isinstance(bbox_full, list) or len(bbox_full) != 4:
+            continue
+        bbox_prev = _scale_bbox_xyxy([float(v) for v in bbox_full], preview_scale)
+        if bbox_prev is None:
+            continue
+        out_unmatched.append({"bbox_xyxy": bbox_prev, "note": rec.get("note")})
+
+    return {"manual_additions": out_manual, "unmatched_manual_boxes": out_unmatched}
+
+
 def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
     if "files" not in st.session_state:
         st.session_state.files = {}
     
     if file_id not in st.session_state.files:
         st.session_state.files[file_id] = {
-            "accepted": set(labels_data.get("accepted_ids", [])),
-            "rejected": set(labels_data.get("rejected_ids", [])),
-            "added_boxes": labels_data.get("added_boxes", []),
-            "notes": labels_data.get("notes", ""),
+            "confirmed_ids": set(labels_data.get("confirmed_ids", [])),
+            "deleted_ids": set(labels_data.get("deleted_ids", [])),
+            "manual_additions": list(labels_data.get("manual_additions", [])),
+            "unmatched_manual_boxes": list(labels_data.get("unmatched_manual_boxes", [])),
             "selected_door_id": None,
-            "viewer_mode": "Highlight All",
+            "viewer_display_mode": "Highlight All",
             "auto_focus": True,
+            "edit_mode": False,
+            "_edit_baseline": None,
+            "_edit_draft": None,
+            "_edit_manual_confirmed_ids": set(),
+            "_last_draw_event_id": None,
             "_focus_seq": 0,
             "_focus_last_id": None,
             "_last_clicked_door_id": None,
         }
 
 # --- Data Loading ---
-@st.cache_data(show_spinner=False)
 def load_file_artifacts(file_dir_str: str):
     file_dir = Path(file_dir_str)
     doors_path = file_dir / "doors.json"
@@ -742,15 +1149,11 @@ def load_file_artifacts(file_dir_str: str):
         with open(doors_path) as f:
             doors_data = json.load(f)
             
-    labels_data = {
-        "accepted_ids": [],
-        "rejected_ids": [],
-        "added_boxes": [],
-        "notes": ""
-    }
+    labels_data: Dict[str, Any] = _labels_v2_default()
     if labels_path.exists():
         with open(labels_path) as f:
             labels_data = json.load(f)
+        _validate_labels_v2_or_raise(labels_data, labels_path=labels_path)
             
     meta_data = {}
     if meta_path.exists():
@@ -926,21 +1329,13 @@ def _rects_to_svg(
     img_width: int,
     img_height: int,
 ) -> str:
-    if fstate.get("viewer_mode") == "Off":
-        return ""
-
     parts: List[str] = []
-    highlight_selected = fstate.get("viewer_mode") == "Highlight Selected"
-    selected_id = fstate.get("selected_door_id")
 
     def _clamp(v: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, v))
 
     for d in active_doors:
         did = d.get("id")
-        is_selected = did == selected_id
-        if highlight_selected and not is_selected:
-            continue
 
         nb = _normalize_bbox_xyxy(d.get("bbox_xyxy"))
         if nb is None:
@@ -963,14 +1358,9 @@ def _rects_to_svg(
         if w <= 0.0 or h <= 0.0:
             continue
 
-        # Match existing color semantics (selection highlight handled client-side to
-        # avoid reloading the viewer iframe on Next/Prev).
-        stroke = "#ffa500"  # undecided (orange)
-        if did in fstate.get("accepted", set()):
-            stroke = "#00ff00"
-        if d.get("is_user_added"):
-            stroke = "#00ffff"
-
+        # Styling is applied client-side (confirmed/selected/deleted/view modes) so the
+        # iframe does not need to remount for label-only state changes.
+        stroke = "#ffa500"  # default (orange)
         stroke_width = 2
         did_attr = html.escape(str(did), quote=True)
         parts.append(
@@ -995,6 +1385,11 @@ def _panzoom_image_viewer(
     click_sink_aria_label: str,
     selected_sink_aria_label: str,
     focus_seq_sink_aria_label: str,
+    edit_mode_sink_aria_label: str,
+    draw_event_sink_aria_label: str,
+    manual_overlay_sink_aria_label: str,
+    door_state_sink_aria_label: str,
+    viewer_display_sink_aria_label: str,
     auto_focus: bool,
 ) -> None:
     # This viewer provides:
@@ -1004,6 +1399,11 @@ def _panzoom_image_viewer(
     click_sink_aria_label_esc = html.escape(click_sink_aria_label, quote=True)
     selected_sink_aria_label_esc = html.escape(selected_sink_aria_label, quote=True)
     focus_seq_sink_aria_label_esc = html.escape(focus_seq_sink_aria_label, quote=True)
+    edit_mode_sink_aria_label_esc = html.escape(edit_mode_sink_aria_label, quote=True)
+    draw_event_sink_aria_label_esc = html.escape(draw_event_sink_aria_label, quote=True)
+    manual_overlay_sink_aria_label_esc = html.escape(manual_overlay_sink_aria_label, quote=True)
+    door_state_sink_aria_label_esc = html.escape(door_state_sink_aria_label, quote=True)
+    viewer_display_sink_aria_label_esc = html.escape(viewer_display_sink_aria_label, quote=True)
     viewer_html = f"""
 <div id="pz_root_{key}" style="width: 100%; height: {height}px; overflow: hidden; background: #0e1117; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);">
   <style>
@@ -1086,6 +1486,11 @@ def _panzoom_image_viewer(
   const clickSinkLabel = "{click_sink_aria_label_esc}";
   const selectedSinkLabel = "{selected_sink_aria_label_esc}";
   const focusSeqSinkLabel = "{focus_seq_sink_aria_label_esc}";
+  const editModeSinkLabel = "{edit_mode_sink_aria_label_esc}";
+  const drawEventSinkLabel = "{draw_event_sink_aria_label_esc}";
+  const manualOverlaySinkLabel = "{manual_overlay_sink_aria_label_esc}";
+  const doorStateSinkLabel = "{door_state_sink_aria_label_esc}";
+  const viewerDisplaySinkLabel = "{viewer_display_sink_aria_label_esc}";
   try {{
     console.log("[door_detector] pz init", {{
       key: {json.dumps(str(key))},
@@ -1094,6 +1499,11 @@ def _panzoom_image_viewer(
       clickSinkLabel,
       selectedSinkLabel,
       focusSeqSinkLabel,
+      editModeSinkLabel,
+      drawEventSinkLabel,
+      manualOverlaySinkLabel,
+      doorStateSinkLabel,
+      viewerDisplaySinkLabel,
       ts: Date.now(),
     }});
   }} catch (_) {{}}
@@ -1192,6 +1602,29 @@ def _panzoom_image_viewer(
     }}
   }}
 
+  function setParentInputValue(label, value) {{
+    try {{
+      const input = window.parent?.document?.querySelector(`input[aria-label="${{label}}"]`);
+      if (!input) return false;
+      input.value = String(value);
+      input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+      input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+      return true;
+    }} catch (_) {{
+      return false;
+    }}
+  }}
+
+  function readParentJson(label) {{
+    try {{
+      const raw = readParentInputValue(label);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    }} catch (_) {{
+      return null;
+    }}
+  }}
+
   function getSelectedId() {{
     const v = readParentInputValue(selectedSinkLabel);
     return v ? v : null;
@@ -1212,37 +1645,73 @@ def _panzoom_image_viewer(
     return null;
   }}
 
-  let selectedRect = null;
-  function setSelectedRect(doorId) {{
+  function getEditEnabled() {{
+    return readParentInputValue(editModeSinkLabel) === "1";
+  }}
+
+  function getViewerDisplayMode() {{
+    const v = readParentInputValue(viewerDisplaySinkLabel);
+    return v ? v : "all";
+  }}
+
+  let lastDoorStateRaw = null;
+  let confirmedSet = new Set();
+  let deletedSet = new Set();
+  let lastViewerDisplay = null;
+  let lastEditEnabled = null;
+  let localSelectedId = null;
+
+  function updateDoorStateFromSinks() {{
+    const raw = readParentInputValue(doorStateSinkLabel);
+    if (raw === lastDoorStateRaw) return false;
+    lastDoorStateRaw = raw;
+    const obj = readParentJson(doorStateSinkLabel) || {{}};
+    const c = Array.isArray(obj.confirmed_ids) ? obj.confirmed_ids : [];
+    const d = Array.isArray(obj.deleted_ids) ? obj.deleted_ids : [];
+    confirmedSet = new Set(c.map(String));
+    deletedSet = new Set(d.map(String));
+    return true;
+  }}
+
+  function applyDoorStyles() {{
     if (!svg) return;
+    const selectedId = getSelectedId() || localSelectedId;
+    const viewMode = getViewerDisplayMode();
 
-    // Clear previous selection.
-    if (selectedRect) {{
-      const baseStroke = selectedRect.getAttribute("data-base-stroke");
-      const baseStrokeWidth = selectedRect.getAttribute("data-base-stroke-width");
-      if (baseStroke) selectedRect.setAttribute("stroke", baseStroke);
-      if (baseStrokeWidth) selectedRect.setAttribute("stroke-width", baseStrokeWidth);
-    }}
+    const rects = svg.querySelectorAll("rect[data-door-id]");
+    for (const r of rects) {{
+      const did = r.getAttribute("data-door-id");
+      if (!did) continue;
 
-    const r = findRectByDoorId(doorId);
-    if (!r) {{
-      selectedRect = null;
-      return;
-    }}
+      const isSelected = selectedId && did === selectedId;
+      const isDeleted = deletedSet.has(did);
 
-    // Cache base styles once.
-    if (!r.getAttribute("data-base-stroke")) {{
-      r.setAttribute("data-base-stroke", r.getAttribute("stroke") || "#ffa500");
-    }}
-    if (!r.getAttribute("data-base-stroke-width")) {{
-      r.setAttribute("data-base-stroke-width", r.getAttribute("stroke-width") || "2");
-    }}
+      let visible = true;
+      if (viewMode === "off") visible = false;
+      else if (viewMode === "selected") visible = !!isSelected;
+      if (isDeleted) visible = false;
 
-    // Apply selected style.
-    r.setAttribute("stroke", "#ff4b4b");
-    r.setAttribute("stroke-width", "3");
-    try {{ svg.appendChild(r); }} catch (_) {{}}
-    selectedRect = r;
+      if (!visible) {{
+        r.style.display = "none";
+        r.style.pointerEvents = "none";
+        continue;
+      }}
+
+      r.style.display = "";
+      r.style.pointerEvents = "all";
+
+      if (isSelected) {{
+        r.setAttribute("stroke", "#ff4b4b");
+        r.setAttribute("stroke-width", "3");
+        try {{ svg.appendChild(r); }} catch (_) {{}}
+      }} else if (confirmedSet.has(did)) {{
+        r.setAttribute("stroke", "#00ff00");
+        r.setAttribute("stroke-width", "2");
+      }} else {{
+        r.setAttribute("stroke", "#ffa500");
+        r.setAttribute("stroke-width", "2");
+      }}
+    }}
   }}
 
   let saveTimer = null;
@@ -1372,20 +1841,20 @@ def _panzoom_image_viewer(
     // Sync highlight and optional focus based on parent state.
     const doorId = getSelectedId();
     const seq = getFocusSeq();
-    if (doorId) {{
-      setSelectedRect(doorId);
-      if (autoFocus && (!saved || saved.focusSeq !== seq)) {{
-        try {{
-          console.log("[door_detector] pz autoFocus", {{
-            key: {json.dumps(str(key))},
-            fromSaved: !!saved,
-            savedFocusSeq: saved ? saved.focusSeq : null,
-            focusSeq: seq,
-            ts: Date.now(),
-          }});
-        }} catch (_) {{}}
-        focusToDoorId(doorId);
-      }}
+    updateDoorStateFromSinks();
+    applyDoorStyles();
+    renderManualOverlays();
+    if (doorId && autoFocus && (!saved || saved.focusSeq !== seq)) {{
+      try {{
+        console.log("[door_detector] pz autoFocus", {{
+          key: {json.dumps(str(key))},
+          fromSaved: !!saved,
+          savedFocusSeq: saved ? saved.focusSeq : null,
+          focusSeq: seq,
+          ts: Date.now(),
+        }});
+      }} catch (_) {{}}
+      focusToDoorId(doorId);
     }}
   }}
 
@@ -1420,9 +1889,162 @@ def _panzoom_image_viewer(
     zoomAt(e.clientX, e.clientY, zoomFactor);
   }}, {{ passive: false }});
 
+  // Manual overlays (server-supplied) and draw overlays (client-only until rerun).
+  //
+  // NOTE: These are referenced from applyInitialView(), which can run before this
+  // section executes. Use `var` (function-scoped, hoisted) to avoid TDZ errors.
+  var manualLayer = null;
+  var tempLayer = null;
+  var lastManualOverlayRaw = null;
+  var suppressSvgClickUntil = 0;
+
+  function ensureLayer(id) {{
+    if (!svg) return null;
+    let g = null;
+    try {{ g = svg.querySelector(`#${{id}}`); }} catch (_) {{ g = null; }}
+    if (g) return g;
+    try {{
+      g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.setAttribute("id", id);
+      svg.appendChild(g);
+      return g;
+    }} catch (_) {{
+      return null;
+    }}
+  }}
+
+  function clearLayer(g) {{
+    if (!g) return;
+    try {{
+      while (g.firstChild) g.removeChild(g.firstChild);
+    }} catch (_) {{}}
+  }}
+
+  function drawBox(layer, bbox, stroke, strokeWidth, dashArray, opacity, titleText) {{
+    if (!layer || !bbox || !Array.isArray(bbox) || bbox.length !== 4) return;
+    const x0 = Math.min(bbox[0], bbox[2]);
+    const y0 = Math.min(bbox[1], bbox[3]);
+    const x1 = Math.max(bbox[0], bbox[2]);
+    const y1 = Math.max(bbox[1], bbox[3]);
+    const w = Math.max(0, x1 - x0);
+    const h = Math.max(0, y1 - y0);
+    if (!(w > 0) || !(h > 0)) return;
+
+    let r = null;
+    try {{
+      r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      r.setAttribute("x", String(x0));
+      r.setAttribute("y", String(y0));
+      r.setAttribute("width", String(w));
+      r.setAttribute("height", String(h));
+      r.setAttribute("fill", "none");
+      r.setAttribute("stroke", stroke || "#00ffff");
+      r.setAttribute("stroke-width", String(strokeWidth || 2));
+      r.setAttribute("vector-effect", "non-scaling-stroke");
+      if (dashArray) r.setAttribute("stroke-dasharray", String(dashArray));
+      if (Number.isFinite(opacity)) r.setAttribute("opacity", String(opacity));
+      r.style.pointerEvents = "none";
+      if (titleText) {{
+        const t = document.createElementNS("http://www.w3.org/2000/svg", "title");
+        t.textContent = String(titleText);
+        r.appendChild(t);
+      }}
+      layer.appendChild(r);
+    }} catch (_) {{}}
+  }}
+
+  function renderManualOverlays() {{
+    const raw = readParentInputValue(manualOverlaySinkLabel);
+    if (raw === lastManualOverlayRaw) return false;
+    lastManualOverlayRaw = raw;
+
+    const obj = readParentJson(manualOverlaySinkLabel) || {{}};
+    const manual = Array.isArray(obj.manual_additions) ? obj.manual_additions : [];
+    const unmatched = Array.isArray(obj.unmatched_manual_boxes) ? obj.unmatched_manual_boxes : [];
+
+    manualLayer = ensureLayer("pz_manual");
+    tempLayer = ensureLayer("pz_temp");
+    clearLayer(manualLayer);
+    // Once server overlays update, drop any client-only temp boxes to avoid duplicates.
+    clearLayer(tempLayer);
+
+    for (const m of manual) {{
+      const drawn = m.drawn_bbox_xyxy;
+      const snapped = m.snapped_bbox_xyxy;
+      const iou = m.iou;
+      const cid = m.snapped_candidate_id;
+      drawBox(
+        manualLayer,
+        drawn,
+        "rgba(0,255,255,0.85)",
+        2,
+        "6,4",
+        0.55,
+        cid ? `drawn (→ ${{cid}}, iou=${{iou}})` : "drawn"
+      );
+      if (snapped && Array.isArray(snapped) && snapped.length === 4) {{
+        drawBox(
+          manualLayer,
+          snapped,
+          "rgba(0,255,0,0.9)",
+          3,
+          "4,3",
+          0.85,
+          cid ? `snapped (${{cid}}, iou=${{iou}})` : "snapped"
+        );
+      }}
+    }}
+
+    for (const u of unmatched) {{
+      const bbox = u.bbox_xyxy;
+      const note = u.note || "unmatched";
+      drawBox(manualLayer, bbox, "rgba(255,0,255,0.9)", 2, "6,4", 0.7, String(note));
+    }}
+    return true;
+  }}
+
+  function clientToImage(clientX, clientY) {{
+    const rect = root.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+    const qx = (px - tx) / scale;
+    const qy = (py - ty) / scale;
+    return {{ x: qx, y: qy }};
+  }}
+
+  let drawing = false;
+  let drawStart = null;
+  let drawRect = null;
+
   root.addEventListener("pointerdown", (e) => {{
     if (resetBtn && resetBtn.contains(e.target)) return;
     if (e.button !== 0) return;
+    // Shift+drag draws a selector rectangle in Edit Doors mode.
+    if (getEditEnabled() && e.shiftKey) {{
+      drawing = true;
+      stage.style.cursor = "crosshair";
+      drawStart = clientToImage(e.clientX, e.clientY);
+      tempLayer = ensureLayer("pz_temp");
+      if (tempLayer) {{
+        try {{
+          drawRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+          drawRect.setAttribute("fill", "rgba(0,255,255,0.12)");
+          drawRect.setAttribute("stroke", "rgba(0,255,255,0.9)");
+          drawRect.setAttribute("stroke-width", "2");
+          drawRect.setAttribute("stroke-dasharray", "6,4");
+          drawRect.setAttribute("vector-effect", "non-scaling-stroke");
+          drawRect.style.pointerEvents = "none";
+          tempLayer.appendChild(drawRect);
+        }} catch (_) {{}}
+      }}
+      suppressSvgClickUntil = performance.now() + 250;
+      e.preventDefault();
+      e.stopPropagation();
+      try {{ root.setPointerCapture(e.pointerId); }} catch (_) {{}}
+      return;
+    }}
+
+    // Default: pan drag.
     dragging = true;
     stage.style.cursor = "grabbing";
     dragStartX = e.clientX;
@@ -1433,13 +2055,67 @@ def _panzoom_image_viewer(
   }});
 
   root.addEventListener("pointermove", (e) => {{
+    if (drawing && drawStart) {{
+      const p = clientToImage(e.clientX, e.clientY);
+      const x0 = Math.min(drawStart.x, p.x);
+      const y0 = Math.min(drawStart.y, p.y);
+      const x1 = Math.max(drawStart.x, p.x);
+      const y1 = Math.max(drawStart.y, p.y);
+      const w = Math.max(0, x1 - x0);
+      const h = Math.max(0, y1 - y0);
+      if (drawRect) {{
+        try {{
+          drawRect.setAttribute("x", String(x0));
+          drawRect.setAttribute("y", String(y0));
+          drawRect.setAttribute("width", String(w));
+          drawRect.setAttribute("height", String(h));
+        }} catch (_) {{}}
+      }}
+      e.preventDefault();
+      return;
+    }}
     if (!dragging) return;
     tx = dragStartTx + (e.clientX - dragStartX);
     ty = dragStartTy + (e.clientY - dragStartY);
     applyTransform();
   }});
 
-  function endDrag() {{
+  function endDrag(e) {{
+    if (drawing) {{
+      drawing = false;
+      stage.style.cursor = "grab";
+      const end = clientToImage(e.clientX, e.clientY);
+      const x0 = Math.min(drawStart?.x ?? end.x, end.x);
+      const y0 = Math.min(drawStart?.y ?? end.y, end.y);
+      const x1 = Math.max(drawStart?.x ?? end.x, end.x);
+      const y1 = Math.max(drawStart?.y ?? end.y, end.y);
+      drawStart = null;
+      // Keep the drawn rect faintly visible until the rerun overlays arrive.
+      if (drawRect) {{
+        try {{
+          drawRect.setAttribute("fill", "rgba(0,255,255,0.08)");
+          drawRect.setAttribute("stroke", "rgba(0,255,255,0.65)");
+        }} catch (_) {{}}
+      }}
+      drawRect = null;
+
+      // Emit draw event to Streamlit.
+      const w = Math.abs(x1 - x0);
+      const h = Math.abs(y1 - y0);
+      if (w >= 2 && h >= 2) {{
+        const payload = {{
+          event: "draw_rect",
+          event_id: `${{Date.now()}}_${{Math.random().toString(16).slice(2)}}`,
+          bbox_xyxy: [x0, y0, x1, y1],
+          ts: Date.now(),
+        }};
+        try {{
+          setParentInputValue(drawEventSinkLabel, JSON.stringify(payload));
+        }} catch (_) {{}}
+      }}
+      return;
+    }}
+
     if (!dragging) return;
     dragging = false;
     stage.style.cursor = "grab";
@@ -1451,19 +2127,7 @@ def _panzoom_image_viewer(
 
   function setSelectedDoorId(doorId) {{
     if (!doorId) return;
-    let input = null;
-    try {{
-      input = window.parent?.document?.querySelector('input[aria-label="{click_sink_aria_label_esc}"]');
-    }} catch (_) {{
-      input = null;
-    }}
-    if (!input) return;
-    try {{
-      input.value = String(doorId);
-      // React/Streamlit listens for "input" events.
-      input.dispatchEvent(new Event("input", {{ bubbles: true }}));
-      input.dispatchEvent(new Event("change", {{ bubbles: true }}));
-    }} catch (_) {{}}
+    setParentInputValue(clickSinkLabel, String(doorId));
   }}
 
   // Watch selection changes coming from Streamlit (right panel).
@@ -1472,10 +2136,28 @@ def _panzoom_image_viewer(
   function pollSelection() {{
     const did = getSelectedId();
     const seq = getFocusSeq();
-    if (did && did !== lastSelectedId) {{
+    const viewMode = getViewerDisplayMode();
+    const editEnabled = getEditEnabled();
+    const doorStateChanged = updateDoorStateFromSinks();
+    renderManualOverlays();
+
+    let needsStyle = false;
+    if (did !== lastSelectedId) {{
       lastSelectedId = did;
-      setSelectedRect(did);
+      localSelectedId = null;
+      needsStyle = true;
     }}
+    if (viewMode !== lastViewerDisplay) {{
+      lastViewerDisplay = viewMode;
+      needsStyle = true;
+    }}
+    if (editEnabled !== lastEditEnabled) {{
+      lastEditEnabled = editEnabled;
+      needsStyle = true;
+    }}
+    if (doorStateChanged) needsStyle = true;
+    if (needsStyle) applyDoorStyles();
+
     if (autoFocus && did) {{
       if (lastFocusSeq === null) {{
         lastFocusSeq = seq;
@@ -1490,6 +2172,8 @@ def _panzoom_image_viewer(
   if (svg) {{
     // If a door bbox is clicked, select it (and don't start a pan drag).
     svg.addEventListener("pointerdown", (e) => {{
+      // In Edit Doors mode, Shift+drag should start drawing even if you start on a door box.
+      if (getEditEnabled() && e.shiftKey) return;
       const t = e.target;
       if (t && t.getAttribute && t.getAttribute("data-door-id")) {{
         e.preventDefault();
@@ -1498,6 +2182,7 @@ def _panzoom_image_viewer(
     }}, true);
 
     svg.addEventListener("click", (e) => {{
+      if (performance.now && performance.now() < suppressSvgClickUntil) return;
       const t = e.target;
       if (!t || !t.getAttribute) return;
       const did = t.getAttribute("data-door-id");
@@ -1505,7 +2190,8 @@ def _panzoom_image_viewer(
       e.preventDefault();
       e.stopPropagation();
       // Immediate UX: highlight/focus locally without waiting for the rerun.
-      setSelectedRect(did);
+      localSelectedId = did;
+      applyDoorStyles();
       if (autoFocus) focusToDoorId(did);
       setSelectedDoorId(did);
     }});
@@ -1624,6 +2310,49 @@ def main_viewer_canvas(
         st.text_input(selected_sink_label, key=selected_sink_label, label_visibility="collapsed")
         st.text_input(focus_seq_sink_label, key=focus_seq_sink_label, label_visibility="collapsed")
 
+        # Edit-mode + overlay sinks: the viewer polls these so we can enable Shift+drag
+        # drawing and update styles/overlays without remounting the iframe.
+        edit_mode_sink_label = f"edit_mode_sink_{file_id}"
+        draw_event_sink_label = f"draw_event_sink_{file_id}"
+        manual_overlay_sink_label = f"manual_overlay_sink_{file_id}"
+        door_state_sink_label = f"door_state_sink_{file_id}"
+        viewer_display_sink_label = f"viewer_display_sink_{file_id}"
+
+        # Server → iframe values (updated every run).
+        try:
+            working = _get_working_label_state(fstate)
+            st.session_state[edit_mode_sink_label] = "1" if bool(fstate.get("edit_mode")) else "0"
+            st.session_state[viewer_display_sink_label] = _viewer_display_mode_to_sink_value(
+                str(fstate.get("viewer_display_mode") or "Highlight All")
+            )
+            st.session_state[door_state_sink_label] = json.dumps(
+                {
+                    "confirmed_ids": sorted(list(working.get("confirmed_ids", set()))),
+                    "deleted_ids": sorted(list(working.get("deleted_ids", set()))),
+                },
+                separators=(",", ":"),
+            )
+            # Manual overlay data is supplied via a separate sink (preview-space bboxes).
+            st.session_state[manual_overlay_sink_label] = json.dumps(
+                _manual_overlay_payload_for_sink(
+                    fstate=fstate,
+                    preview_scale=float(preview_spec.get("scale", 1.0) or 1.0),
+                ),
+                separators=(",", ":"),
+            )
+        except Exception:
+            pass
+
+        # Iframe → server events (do not overwrite once set by JS).
+        if draw_event_sink_label not in st.session_state:
+            st.session_state[draw_event_sink_label] = ""
+
+        st.text_input(edit_mode_sink_label, key=edit_mode_sink_label, label_visibility="collapsed")
+        st.text_input(draw_event_sink_label, key=draw_event_sink_label, label_visibility="collapsed")
+        st.text_input(manual_overlay_sink_label, key=manual_overlay_sink_label, label_visibility="collapsed")
+        st.text_input(door_state_sink_label, key=door_state_sink_label, label_visibility="collapsed")
+        st.text_input(viewer_display_sink_label, key=viewer_display_sink_label, label_visibility="collapsed")
+
         viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
         viewer_width_hint = max(600, min(2000, viewer_width_hint))
         aspect = float(VIEWER_ASPECT_RATIO_HW)
@@ -1635,31 +2364,6 @@ def main_viewer_canvas(
 
         # NOTE: Don't wrap this in `st.container(height=...)` because Streamlit makes that
         # container scrollable (adds a scrollbar) which steals scroll/drag interactions.
-        if fstate["viewer_mode"] == "Add Door":
-            # Use the (smaller) preview for interactive drawing to keep the UI snappy.
-            bg_img = Image.open(preview_spec["path"])
-
-            # Fit-to-container (approx) for first render.
-            fit_scale = min(1.0, min(viewer_width_hint / bg_img.width, viewer_height / bg_img.height))
-            display_width = max(400, int(bg_img.width * fit_scale))
-            display_height = max(400, int(bg_img.height * fit_scale))
-
-            # Resize background for performance.
-            bg_img = bg_img.resize((display_width, display_height), Image.LANCZOS)
-
-            canvas_result = st_canvas(
-                fill_color="rgba(0, 255, 255, 0.3)",
-                stroke_width=2,
-                stroke_color="#00ffff",
-                background_image=bg_img,
-                update_streamlit=True,
-                height=display_height,
-                width=display_width,
-                drawing_mode="rect",
-                key=f"canvas_{file_id}",
-            )
-            return canvas_result, active_doors
-
         rects_svg = _rects_to_svg(
             active_doors=active_doors,
             fstate=fstate,
@@ -1680,6 +2384,11 @@ def main_viewer_canvas(
             click_sink_aria_label=click_sink_label,
             selected_sink_aria_label=selected_sink_label,
             focus_seq_sink_aria_label=focus_seq_sink_label,
+            edit_mode_sink_aria_label=edit_mode_sink_label,
+            draw_event_sink_aria_label=draw_event_sink_label,
+            manual_overlay_sink_aria_label=manual_overlay_sink_label,
+            door_state_sink_aria_label=door_state_sink_label,
+            viewer_display_sink_aria_label=viewer_display_sink_label,
             auto_focus=bool(fstate.get("auto_focus", True)),
         )
         return None, active_doors
@@ -1693,7 +2402,6 @@ def main_viewer_controls(
     full_dims: Optional[Tuple[int, int]],
     doors_data: Dict,
     fstate: Dict,
-    canvas_result: Any,
 ):
     file_id = item["id"]
     file_dir = Path(item["path"])
@@ -1741,11 +2449,11 @@ def main_viewer_controls(
             args=(str(file_id), str(file_dir), str(config_path), analysis_label),
         )
     with c2:
-        modes = ["Highlight All", "Highlight Selected", "Off", "Add Door"]
-        fstate["viewer_mode"] = st.selectbox(
+        modes = ["Highlight All", "Highlight Selected", "Off"]
+        fstate["viewer_display_mode"] = st.selectbox(
             "Mode", 
             modes,
-            index=modes.index(fstate["viewer_mode"]) if fstate["viewer_mode"] in modes else 0,
+            index=modes.index(fstate.get("viewer_display_mode")) if fstate.get("viewer_display_mode") in modes else 0,
             label_visibility="collapsed"
         )
     with c_del:
@@ -1784,52 +2492,26 @@ def main_viewer_controls(
 
     c3, c4 = st.columns(2)
     with c3:
-        if fstate["viewer_mode"] == "Add Door":
-            if st.button("Cancel", use_container_width=True):
-                fstate["viewer_mode"] = "Highlight All"
+        if not bool(fstate.get("edit_mode")):
+            if st.button("Edit Doors", use_container_width=True, type="secondary"):
+                _enter_edit_mode(fstate)
                 st.rerun()
         else:
-            if st.button("Add Door", use_container_width=True):
-                fstate["viewer_mode"] = "Add Door"
+            col_save, col_cancel = st.columns(2)
+            if col_save.button("Save", use_container_width=True, type="primary"):
+                _save_edit_mode(fstate)
+                save_current_labels(file_id, file_dir)
                 st.rerun()
+            if col_cancel.button("Cancel", use_container_width=True, type="secondary"):
+                _cancel_edit_mode(fstate)
+                st.rerun()
+            st.caption("Shift+drag to add rectangles (snap-to-candidate).")
     with c4:
         auto_focus_key = f"auto_focus_{file_id}"
         # Keep widget state and per-file fstate in sync.
         if auto_focus_key not in st.session_state:
             st.session_state[auto_focus_key] = bool(fstate.get("auto_focus", True))
         fstate["auto_focus"] = st.checkbox("Auto-focus", key=auto_focus_key)
-
-    if fstate["viewer_mode"] == "Add Door":
-        st.info("Draw rectangles on the PDF.")
-        if st.button("Save Added Doors", type="primary", use_container_width=True):
-            if canvas_result and canvas_result.json_data:
-                objects = canvas_result.json_data["objects"]
-                display_width = canvas_result.image_data.shape[1] if canvas_result.image_data is not None else 1
-                display_height = canvas_result.image_data.shape[0] if canvas_result.image_data is not None else 1
-                if full_dims:
-                    full_w, full_h = full_dims
-                else:
-                    full_w, full_h = display_width, display_height
-
-                scale_x = full_w / display_width if display_width else 1.0
-                scale_y = full_h / display_height if display_height else 1.0
-                
-                added_count = 0
-                for obj in objects:
-                    if obj["type"] == "rect":
-                        x0 = obj["left"] * scale_x
-                        y0 = obj["top"] * scale_y
-                        x1 = (obj["left"] + obj["width"]) * scale_x
-                        y1 = (obj["top"] + obj["height"]) * scale_y
-                        fstate["added_boxes"].append({"bbox_xyxy": [x0, y0, x1, y1]})
-                        added_count += 1
-                
-                if added_count > 0:
-                    save_current_labels(file_id, file_dir)
-                    fstate["viewer_mode"] = "Highlight All"
-                    st.rerun()
-                else:
-                    st.warning("No rectangles drawn.")
 
 def _sync_selected_door_for_run(
     *,
@@ -1912,7 +2594,7 @@ def right_panel_review(
         st.info("Analyze to see doors.")
         return
     
-    # Use pre-calculated active_doors (which already includes added_boxes)
+    # Use pre-calculated active_doors so the main viewer + right panel stay in sync.
     all_visible = active_doors.copy()
     all_visible.sort(key=lambda x: x["confidence"], reverse=True)
     
@@ -2032,20 +2714,37 @@ def right_panel_review(
             st.image(image.crop((left, upper, right, lower)), use_container_width=True)
 
     # Actions
+    working = _get_working_label_state(fstate)
+    is_editing = bool(fstate.get("edit_mode"))
     c1, c2, c3 = st.columns(3)
-    if c1.button("Accept", use_container_width=True):
-        fstate["accepted"].add(did)
-        fstate["rejected"].discard(did)
-        save_current_labels(file_id, file_dir)
-        st.rerun()
-    if c2.button("Reject", use_container_width=True):
-        if selected_door.get("is_user_added"):
-            fstate["added_boxes"] = [b for b in fstate["added_boxes"] if f"u_{int(b['bbox_xyxy'][0])}_{int(b['bbox_xyxy'][1])}" != did]
+    if c1.button("Confirm door", use_container_width=True):
+        working["confirmed_ids"].add(did)
+        working["deleted_ids"].discard(did)
+        # Treat as explicit confirmation (so removing a manual-add record won't unconfirm).
+        if is_editing:
+            try:
+                fstate["_edit_manual_confirmed_ids"].discard(did)
+            except Exception:
+                pass
         else:
-            fstate["rejected"].add(did)
-            fstate["accepted"].discard(did)
-        save_current_labels(file_id, file_dir)
-        fstate["selected_door_id"] = None # Move to next
+            save_current_labels(file_id, file_dir)
+        st.rerun()
+    if c2.button("Delete / Not a door", use_container_width=True):
+        working["deleted_ids"].add(did)
+        working["confirmed_ids"].discard(did)
+        if is_editing:
+            try:
+                fstate["_edit_manual_confirmed_ids"].discard(did)
+            except Exception:
+                pass
+            # If the user marks a candidate as not-a-door, drop any manual-add records
+            # that snapped to it (they are no longer meaningful).
+            working["manual_additions"] = [
+                r for r in list(working.get("manual_additions", [])) if str(r.get("snapped_candidate_id") or "") != str(did)
+            ]
+        else:
+            save_current_labels(file_id, file_dir)
+        fstate["selected_door_id"] = None  # Move to next
         st.rerun()
     if c3.button("Skip", use_container_width=True):
         if selected_idx < len(all_visible) - 1:
@@ -2055,11 +2754,74 @@ def right_panel_review(
             st.rerun()
 
     st.divider()
-    st.write(f"**Stats:** {len(fstate['accepted'])} Acc, {len(fstate['rejected'])} Rej, {len(fstate['added_boxes'])} Add")
+    # Show stats for the currently active label state (draft while editing).
+    st.write(
+        f"**Stats:** "
+        f"{len(working.get('confirmed_ids', set()))} confirmed, "
+        f"{len(working.get('deleted_ids', set()))} deleted, "
+        f"{len(working.get('manual_additions', []))} manual-added, "
+        f"{len(working.get('unmatched_manual_boxes', []))} unmatched"
+    )
+
+    if is_editing:
+        st.divider()
+        st.subheader("Edit Doors")
+        st.caption("Shift+drag in the main viewer to add. Save/Cancel are in the top controls.")
+
+        manual_adds = list(working.get("manual_additions", []))
+        if manual_adds:
+            st.markdown(f"**Manual additions ({len(manual_adds)})**")
+            for idx, rec in enumerate(manual_adds):
+                cid = rec.get("snapped_candidate_id")
+                iou = rec.get("iou")
+                label = f"{idx+1}. {cid or '(unmatched?)'}  iou={iou:.3f}" if isinstance(iou, (int, float)) else f"{idx+1}. {cid or '(unmatched?)'}"
+                cols = st.columns([5, 1])
+                cols[0].write(label)
+                if cols[1].button("Remove", key=f"rm_manual_{file_id}_{idx}", use_container_width=True):
+                    try:
+                        removed = working["manual_additions"].pop(idx)
+                    except Exception:
+                        removed = None
+                    removed_cid = str((removed or {}).get("snapped_candidate_id") or "")
+                    if removed_cid:
+                        # If this confirmation was only due to manual-add, revert to undecided.
+                        try:
+                            manual_confirmed = set(fstate.get("_edit_manual_confirmed_ids", set()))
+                        except Exception:
+                            manual_confirmed = set()
+                        still_refs = any(
+                            str(r.get("snapped_candidate_id") or "") == removed_cid
+                            for r in list(working.get("manual_additions", []))
+                        )
+                        if (removed_cid in manual_confirmed) and (not still_refs):
+                            working["confirmed_ids"].discard(removed_cid)
+                            try:
+                                fstate["_edit_manual_confirmed_ids"].discard(removed_cid)
+                            except Exception:
+                                pass
+                    st.rerun()
+        else:
+            st.markdown("**Manual additions (0)**")
+
+        unmatched = list(working.get("unmatched_manual_boxes", []))
+        if unmatched:
+            st.markdown(f"**Unmatched manual boxes ({len(unmatched)})**")
+            for idx, rec in enumerate(unmatched):
+                note = str(rec.get("note") or "unmatched")
+                cols = st.columns([5, 1])
+                cols[0].write(f"{idx+1}. {note}")
+                if cols[1].button("Remove", key=f"rm_unmatched_{file_id}_{idx}", use_container_width=True):
+                    try:
+                        working["unmatched_manual_boxes"].pop(idx)
+                    except Exception:
+                        pass
+                    st.rerun()
+        else:
+            st.markdown("**Unmatched manual boxes (0)**")
     
     # Train badge
-    total_overrides = len(fstate["accepted"]) + len(fstate["rejected"]) + len(fstate["added_boxes"])
-    if total_overrides >= 5:
+    total_overrides = len(working.get("confirmed_ids", set())) + len(working.get("deleted_ids", set()))
+    if (not is_editing) and total_overrides >= 5:
         if st.button("Train Model", use_container_width=True):
             with st.spinner("Training..."):
                 fit_reweighter(Path("artifacts"), Path("models/reweighter_v1.json"))
@@ -2121,12 +2883,12 @@ def run_pipeline(file_id: str, file_dir: Path, config_path: str):
 def save_current_labels(file_id: str, file_dir: Path):
     fstate = st.session_state.files[file_id]
     labels_to_save = {
-        "schema_version": 1,
+        "schema_version": LABELS_SCHEMA_VERSION,
         "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "accepted_ids": list(fstate["accepted"]),
-        "rejected_ids": list(fstate["rejected"]),
-        "added_boxes": fstate["added_boxes"],
-        "notes": fstate["notes"]
+        "confirmed_ids": sorted(list(fstate.get("confirmed_ids", set()))),
+        "deleted_ids": sorted(list(fstate.get("deleted_ids", set()))),
+        "manual_additions": list(fstate.get("manual_additions", [])),
+        "unmatched_manual_boxes": list(fstate.get("unmatched_manual_boxes", [])),
     }
     save_labels(file_dir, labels_to_save)
 
@@ -2179,7 +2941,11 @@ with col_app:
                 st.rerun()
 
             t0 = time.perf_counter()
-            doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+            try:
+                doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
             perf["load_file_artifacts_ms"] = (time.perf_counter() - t0) * 1000.0
             init_file_state(file_id, doors_data, labels_data)
             fstate = st.session_state.files[file_id]
@@ -2199,6 +2965,16 @@ with col_app:
             )
             perf["get_or_create_page_preview_ms"] = (time.perf_counter() - t1) * 1000.0
 
+            # Consume any Shift+drag events before computing the visible list/overlay.
+            _process_draw_event_if_any(
+                file_id=str(file_id),
+                file_dir=file_dir,
+                fstate=fstate,
+                doors_data=doors_data,
+                preview_spec=preview_spec,
+                full_dims=full_dims,
+            )
+
             title = html.escape(str(selected_item.get("original_name", "")))
             st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
 
@@ -2206,25 +2982,10 @@ with col_app:
 
             # Compute active doors once so the main viewer + right panel stay in perfect sync.
             detections = doors_data.get("doors", [])
-            active_doors: List[Dict[str, Any]] = [d for d in detections if d.get("id") not in fstate["rejected"]]
-            for box in fstate["added_boxes"]:
-                bbox = box.get("bbox_xyxy")
-                if not bbox:
-                    continue
-                # Stable ID for added box based on coordinates
-                try:
-                    box_id = f"u_{int(bbox[0])}_{int(bbox[1])}"
-                except Exception:
-                    continue
-                active_doors.append(
-                    {
-                        "id": box_id,
-                        "type": "added",
-                        "bbox_xyxy": bbox,
-                        "confidence": 1.0,
-                        "is_user_added": True,
-                    }
-                )
+            deleted_ids = _get_working_label_state(fstate).get("deleted_ids", set())
+            overlay_doors: List[Dict[str, Any]] = [d for d in detections if d.get("id") is not None]
+            # Right panel / navigation list excludes deleted; overlay hides deleted via JS state sink.
+            active_doors: List[Dict[str, Any]] = [d for d in overlay_doors if d.get("id") not in deleted_ids]
 
             click_sink_label = f"door_click_sink_{file_id}"
 
@@ -2243,7 +3004,7 @@ with col_app:
                 "run=%d file_id=%s mode=%s pre_sync selected=%s focus_seq=%s prev=%s next=%s",
                 run_seq,
                 file_id,
-                fstate.get("viewer_mode"),
+                fstate.get("viewer_display_mode"),
                 fstate.get("selected_door_id"),
                 fstate.get("_focus_seq"),
                 bool(st.session_state.get(f"jump_{file_id}__prev")),
@@ -2263,13 +3024,13 @@ with col_app:
             with col_main:
                 t2 = time.perf_counter()
                 _debug_log("run=%d file_id=%s render_main start", run_seq, file_id)
-                canvas_result, _ = main_viewer_canvas(
+                _canvas_result, _ = main_viewer_canvas(
                     selected_item,
                     preview_spec=preview_spec,
                     full_dims=full_dims,
                     doors_data=doors_data,
                     fstate=fstate,
-                    active_doors=active_doors,
+                    active_doors=overlay_doors,
                     click_sink_label=click_sink_label,
                 )
                 perf["render_main_panel_ms"] = (time.perf_counter() - t2) * 1000.0
@@ -2288,7 +3049,6 @@ with col_app:
                     full_dims=full_dims,
                     doors_data=doors_data,
                     fstate=fstate,
-                    canvas_result=canvas_result,
                 )
                 st.divider()
                 right_panel_review(

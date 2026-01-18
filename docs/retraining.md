@@ -115,28 +115,33 @@ Keep it intentionally simple:
 
 ```json
 {
-  "schema_version": 1,
-  "page_id": "floor_plan_01",
+  "schema_version": 2,
   "reviewed_at": "2026-01-14T12:40:00Z",
-  "accepted_ids": ["d_000123", "d_000130"],
-  "rejected_ids": ["d_000124"],
-  "added_boxes": [
+  "confirmed_ids": ["d_000123", "d_000130"],
+  "deleted_ids": ["d_000124"],
+  "manual_additions": [
     {
-      "bbox_xyxy": [512.0, 220.0, 605.0, 310.0],
-      "note": "missed door near stair core"
+      "drawn_bbox_xyxy": [512.0, 220.0, 605.0, 310.0],
+      "snapped_candidate_id": "d_000130",
+      "iou": 0.63,
+      "snapped_bbox_xyxy": [500.5, 215.2, 612.1, 320.9]
     }
   ],
-  "notes": "Many false positives around curved furniture."
+  "unmatched_manual_boxes": [
+    {
+      "bbox_xyxy": [800.0, 100.0, 880.0, 180.0],
+      "note": "No candidate match"
+    }
+  ]
 }
 ```
 
 Interpretation:
 
-- **Accepted** predictions become positive examples.
-- **Rejected** predictions become negative examples.
-- **Added boxes** represent false negatives. They can be used later for:
-  - improving candidate generation rules, and/or
-  - training a pixel detector (bonus/Option 2)
+- **confirmed_ids** → positive examples (vector features)
+- **deleted_ids** → negative examples (vector features)
+- **manual_additions** are snapped to existing candidates; they contribute via the snapped candidate IDs.
+- **unmatched_manual_boxes** are UI-only visibility; they are ignored for training (no candidate/features).
 
 ## Feature design (what to learn weights over)
 

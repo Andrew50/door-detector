@@ -88,18 +88,24 @@ Reviewer feedback is persisted alongside the artifacts:
 
 ```json
 {
-  "schema_version": 1,
-  "page_id": "floor_plan_p0",
+  "schema_version": 2,
   "reviewed_at": "2026-01-14T12:40:00Z",
-  "accepted_ids": ["d_000123"],
-  "rejected_ids": ["d_000124"],
-  "added_boxes": [
+  "confirmed_ids": ["d_000123"],
+  "deleted_ids": ["d_000124"],
+  "manual_additions": [
     {
-      "bbox_xyxy": [512.0, 220.0, 605.0, 310.0],
-      "note": "Added via UI"
+      "drawn_bbox_xyxy": [512.0, 220.0, 605.0, 310.0],
+      "snapped_candidate_id": "d_000130",
+      "iou": 0.63,
+      "snapped_bbox_xyxy": [500.5, 215.2, 612.1, 320.9]
     }
   ],
-  "notes": "..."
+  "unmatched_manual_boxes": [
+    {
+      "bbox_xyxy": [800.0, 100.0, 880.0, 180.0],
+      "note": "No candidate match"
+    }
+  ]
 }
 ```
 

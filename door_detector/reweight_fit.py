@@ -3,7 +3,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 
@@ -24,8 +24,6 @@ def fit_reweighter(artifacts_root: Path, output_model: Path) -> None:
         print("No labels.json files found. Go review some detections first!")
         return
 
-    from door_detector.door_features import compute_iou
-
     for label_path in label_files:
         dir_path = label_path.parent
         doors_path = dir_path / "doors.json"
@@ -37,40 +35,28 @@ def fit_reweighter(artifacts_root: Path, output_model: Path) -> None:
             labels_data = json.load(f)
         with open(doors_path) as f:
             doors_data = json.load(f)
-            
-        accepted = set(labels_data.get("accepted_ids", []))
-        rejected = set(labels_data.get("rejected_ids", []))
-        added_boxes = labels_data.get("added_boxes", [])
-        
-        all_candidates = doors_data.get("doors", [])
-        
-        # 1a. Process accepted/rejected from doors.json
-        for door in all_candidates:
-            did = door["id"]
-            if did in accepted or did in rejected:
-                feats = [door["features"].get(n, 0.0) for n in feature_names]
-                features_list.append(feats)
-                labels_list.append(1 if did in accepted else 0)
 
-        # 1b. Process added boxes: try to match them to a candidate that was NOT in the final list
-        # (or even one that was, but wasn't explicitly accepted/rejected yet)
-        for box in added_boxes:
-            best_iou = 0
-            best_cand = None
-            for cand in all_candidates:
-                iou = compute_iou(box["bbox_xyxy"], cand["bbox_xyxy"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_cand = cand
-            
-            if best_iou > 0.5: # If we matched a candidate
-                # Check if we already added this candidate via 'accepted'
-                if best_cand["id"] in accepted:
-                    continue # Already added
-                
-                feats = [best_cand["features"].get(n, 0.0) for n in feature_names]
-                features_list.append(feats)
-                labels_list.append(1) # It was an added box, so it's a positive
+        # v2 labels only
+        if labels_data.get("schema_version") != 2:
+            print(f"Skipping non-v2 labels.json: {label_path}")
+            continue
+
+        confirmed = set(labels_data.get("confirmed_ids", []))
+        deleted = set(labels_data.get("deleted_ids", []))
+
+        all_candidates = doors_data.get("doors", [])
+
+        # Train on candidate feature vectors only.
+        for door in all_candidates:
+            did = door.get("id")
+            if did is None:
+                continue
+            if did not in confirmed and did not in deleted:
+                continue
+
+            feats = [door.get("features", {}).get(n, 0.0) for n in feature_names]
+            features_list.append(feats)
+            labels_list.append(1 if did in confirmed else 0)
 
     if not features_list:
         print("No reviewed detections found in labels.json files.")
