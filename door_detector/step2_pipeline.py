@@ -44,7 +44,9 @@ def run_step2(
     # 3. Detect doors
     import time
     start_time = time.time()
-    doors = detect_doors(primitives, meta, config)
+    det = detect_doors(primitives, meta, config)
+    doors = list(det.get("doors", []) if isinstance(det, dict) else (det or []))
+    candidates = list(det.get("candidates", []) if isinstance(det, dict) else [])
     detect_ms = (time.time() - start_time) * 1000
 
     # 4. Save doors.json
@@ -56,7 +58,8 @@ def run_step2(
         "analysis_signature": analysis_signature,
         "mode": meta["mode"],
         "detect_ms": detect_ms,
-        "doors": doors
+        "doors": doors,
+        "candidates": candidates,
     }
     
     with open(output_dir / "doors.json", "w") as f:

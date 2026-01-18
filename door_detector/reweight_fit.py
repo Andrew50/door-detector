@@ -44,7 +44,7 @@ def fit_reweighter(artifacts_root: Path, output_model: Path) -> None:
         confirmed = set(labels_data.get("confirmed_ids", []))
         deleted = set(labels_data.get("deleted_ids", []))
 
-        all_candidates = doors_data.get("doors", [])
+        all_candidates = doors_data.get("candidates", doors_data.get("doors", [])) or []
 
         # Train on candidate feature vectors only.
         for door in all_candidates:

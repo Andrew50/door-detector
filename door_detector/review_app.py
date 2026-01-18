@@ -8,6 +8,7 @@ import shutil
 import time
 import base64
 import copy
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -485,6 +486,32 @@ st.markdown("""
         padding: 0 !important;
     }
     div[data-testid="stTextInput"] input[aria-label^="auto_focus_sink_"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    div[data-testid="stTextInput"]:has(input[aria-label^="unmatched_debug_sink_"]) {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"] input[aria-label^="unmatched_debug_sink_"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    div[data-testid="stTextInput"]:has(input[aria-label^="candidate_pool_sink_"]) {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"] input[aria-label^="candidate_pool_sink_"] {
         display: none !important;
         height: 0 !important;
         margin: 0 !important;
@@ -1081,11 +1108,9 @@ def _debug_unmatched_region(
 
     This runs only when Debug logs is enabled and prints to the server console.
     """
-    try:
-        if not st.session_state.get("debug_perf"):
-            return None
-    except Exception:
-        return None
+    # Always compute a report (so we can surface it to the browser console even if
+    # the right panel isn't updating). Server-console logging remains gated by
+    # the debug checkbox via `_debug_log(...)`.
 
     primitives_path = file_dir / "primitives.json"
     meta_path = file_dir / "meta.json"
@@ -1163,12 +1188,18 @@ def _debug_unmatched_region(
 
     leaf_tested = 0
     leaf_fail_len_ratio = 0
+    leaf_fail_len_ratio_too_small = 0
+    leaf_fail_len_ratio_too_large = 0
     leaf_fail_hinge = 0
     leaf_fail_center = 0
     leaf_fail_radial = 0
     leaf_fail_tip = 0
     leaf_pass = 0
     cand_below_conf = 0
+
+    # Keep a few near-misses to help tune thresholds.
+    best_len_ratio_misses: List[Dict[str, Any]] = []  # sorted by delta-to-range asc
+    len_ratio_vals: List[float] = []
 
     best_candidate: Optional[Dict[str, Any]] = None
     best_candidate_below: Optional[Dict[str, Any]] = None
@@ -1246,8 +1277,32 @@ def _debug_unmatched_region(
             if float(radius) <= 1e-6:
                 continue
             len_ratio = float(l_len) / float(radius)
+            len_ratio_vals.append(len_ratio)
             if not (min_len_ratio <= len_ratio <= max_len_ratio):
                 leaf_fail_len_ratio += 1
+                if len_ratio < min_len_ratio:
+                    leaf_fail_len_ratio_too_small += 1
+                    delta = float(min_len_ratio) - float(len_ratio)
+                else:
+                    leaf_fail_len_ratio_too_large += 1
+                    delta = float(len_ratio) - float(max_len_ratio)
+
+                # Save a few closest misses to the allowed interval (after hinge/center checks we
+                # don't know yet, but this still helps show if the door leaf is systematically short).
+                miss = {
+                    "b_idx": int(b_idx),
+                    "l_idx": int(li["idx"]),
+                    "len_ratio": float(len_ratio),
+                    "l_len": float(l_len),
+                    "radius": float(radius),
+                    "delta_to_range": float(delta),
+                    "line_bbox": li["bbox"],
+                    "arc_bbox": arc_bbox,
+                }
+                best_len_ratio_misses.append(miss)
+                best_len_ratio_misses.sort(key=lambda m: float(m.get("delta_to_range", 1e9)))
+                if len(best_len_ratio_misses) > 8:
+                    best_len_ratio_misses = best_len_ratio_misses[:8]
                 continue
 
             arc_start = pts[0]
@@ -1364,6 +1419,16 @@ def _debug_unmatched_region(
 
     # Also return a compact report for UI display.
     try:
+        len_ratio_stats = None
+        if len_ratio_vals:
+            vals = sorted(len_ratio_vals)
+            mid = len(vals) // 2
+            median = vals[mid] if len(vals) % 2 == 1 else (vals[mid - 1] + vals[mid]) / 2.0
+            len_ratio_stats = {
+                "min": float(vals[0]),
+                "median": float(median),
+                "max": float(vals[-1]),
+            }
         report = {
             "roi": [round(v, 1) for v in roi],
             "drawn": [round(v, 1) for v in drawn],
@@ -1381,11 +1446,16 @@ def _debug_unmatched_region(
                 "pass": int(leaf_pass),
                 "fail": {
                     "len_ratio": int(leaf_fail_len_ratio),
+                    "len_ratio_too_small": int(leaf_fail_len_ratio_too_small),
+                    "len_ratio_too_large": int(leaf_fail_len_ratio_too_large),
                     "hinge": int(leaf_fail_hinge),
                     "center": int(leaf_fail_center),
                     "radial": int(leaf_fail_radial),
                     "tip": int(leaf_fail_tip),
                 },
+                "len_ratio_range": [float(min_len_ratio), float(max_len_ratio)],
+                "len_ratio_stats": len_ratio_stats,
+                "closest_len_ratio_misses": best_len_ratio_misses,
             },
             "min_confidence": float(min_confidence),
             "below_conf": int(cand_below_conf),
@@ -1411,6 +1481,20 @@ def _process_draw_event_if_any(
         return
     draw_key = f"draw_event_sink_{file_id}"
     raw = st.session_state.get(draw_key) or ""
+
+    # Fallback: some Streamlit builds may not rerun on the hidden draw_event sink change.
+    # In that case we also stuff the payload into the existing click sink as a sentinel.
+    if not raw:
+        click_key = f"door_click_sink_{file_id}"
+        click_raw = st.session_state.get(click_key) or ""
+        if isinstance(click_raw, str) and click_raw.startswith("__draw_event__"):
+            try:
+                encoded = click_raw[len("__draw_event__") :]
+                # payload is URI-encoded JSON
+                raw = urllib.parse.unquote(encoded)
+                _debug_log("draw_event fallback from click sink file_id=%s", str(file_id))
+            except Exception:
+                raw = ""
     if not raw:
         return
     try:
@@ -1460,7 +1544,7 @@ def _process_draw_event_if_any(
     full_h = full_dims[1] if full_dims else None
     drawn_full = _clamp_bbox_xyxy(drawn_full, w=full_w, h=full_h)
 
-    candidates = list(doors_data.get("doors", []) or [])
+    candidates = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
     best = None
     iou = 0.0
 
@@ -1517,6 +1601,14 @@ def _process_draw_event_if_any(
     # Consume the sink value so it doesn't grow / re-trigger on reconnects.
     try:
         st.session_state[draw_key] = ""
+    except Exception:
+        pass
+
+    # Also clear the click sink sentinel if it was used.
+    try:
+        click_key = f"door_click_sink_{file_id}"
+        if isinstance(st.session_state.get(click_key), str) and str(st.session_state.get(click_key)).startswith("__draw_event__"):
+            st.session_state[click_key] = ""
     except Exception:
         pass
 
@@ -1844,6 +1936,8 @@ def _panzoom_image_viewer(
     door_state_sink_aria_label: str,
     viewer_display_sink_aria_label: str,
     auto_focus_sink_aria_label: str,
+    unmatched_debug_sink_aria_label: str,
+    candidate_pool_sink_aria_label: str,
 ) -> None:
     # This viewer provides:
     # - scrollwheel zoom (centered at cursor)
@@ -1858,6 +1952,8 @@ def _panzoom_image_viewer(
     door_state_sink_aria_label_esc = html.escape(door_state_sink_aria_label, quote=True)
     viewer_display_sink_aria_label_esc = html.escape(viewer_display_sink_aria_label, quote=True)
     auto_focus_sink_aria_label_esc = html.escape(auto_focus_sink_aria_label, quote=True)
+    unmatched_debug_sink_aria_label_esc = html.escape(unmatched_debug_sink_aria_label, quote=True)
+    candidate_pool_sink_aria_label_esc = html.escape(candidate_pool_sink_aria_label, quote=True)
     viewer_html = f"""
 {_sidebar_autopen_component_html()}
 <div id="pz_root_{key}" style="width: 100%; height: {height}px; overflow: hidden; background: #0e1117; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);">
@@ -1947,6 +2043,8 @@ def _panzoom_image_viewer(
   const viewerDisplaySinkLabel = "{viewer_display_sink_aria_label_esc}";
 
   const autoFocusSinkLabel = "{auto_focus_sink_aria_label_esc}";
+  const unmatchedDebugSinkLabel = "{unmatched_debug_sink_aria_label_esc}";
+  const candidatePoolSinkLabel = "{candidate_pool_sink_aria_label_esc}";
   function parseBool(v, defaultValue) {{
     if (v === true) return true;
     if (v === false) return false;
@@ -1959,6 +2057,7 @@ def _panzoom_image_viewer(
     return parseBool(readParentInputValue(autoFocusSinkLabel), true);
   }}
   let autoFocus = getAutoFocus();
+  let lastUnmatchedDebugRaw = null;
 
   try {{
     console.log("[door_detector] pz init", {{
@@ -1974,6 +2073,8 @@ def _panzoom_image_viewer(
       doorStateSinkLabel,
       viewerDisplaySinkLabel,
       autoFocusSinkLabel,
+      unmatchedDebugSinkLabel,
+      candidatePoolSinkLabel,
       ts: Date.now(),
     }});
   }} catch (_) {{}}
@@ -2573,9 +2674,16 @@ def _panzoom_image_viewer(
   }}
 
   function snapCandidateForDraw(drawn) {{
+    // Prefer a broader candidate pool (server-supplied), otherwise fall back to
+    // the rendered overlay rects.
+    const poolRaw = readParentInputValue(candidatePoolSinkLabel);
+    const poolObj = readParentJson(candidatePoolSinkLabel);
+    const pool = poolObj && Array.isArray(poolObj.candidates) ? poolObj.candidates : null;
+    const hasPool = !!(pool && pool.length);
+
     if (!svg) return null;
     const rects = svg.querySelectorAll("rect[data-door-id]");
-    if (!rects || rects.length === 0) return null;
+    if ((!rects || rects.length === 0) && !hasPool) return null;
 
     const x0 = Math.min(drawn[0], drawn[2]);
     const y0 = Math.min(drawn[1], drawn[3]);
@@ -2596,19 +2704,31 @@ def _panzoom_image_viewer(
     let bestInter = -1;
     let bestByInter = null;
 
-    for (const r of rects) {{
-      const did = r.getAttribute("data-door-id");
-      if (!did) continue;
-      // Use SVG geometry instead of relying on attributes (which can be missing/NaN).
-      let bb = null;
-      try {{ bb = r.getBBox(); }} catch (_) {{ bb = null; }}
-      if (!bb) continue;
-      const rw = Number(bb.width);
-      const rh = Number(bb.height);
-      const rx = Number(bb.x);
-      const ry = Number(bb.y);
-      if (!(rw > 0) || !(rh > 0) || !Number.isFinite(rx) || !Number.isFinite(ry)) continue;
-      const cand = [rx, ry, rx + rw, ry + rh];
+    const iter = hasPool ? pool : rects;
+    for (const r of iter) {{
+      let did = null;
+      let cand = null;
+      if (hasPool) {{
+        did = r && r.id ? String(r.id) : null;
+        cand = r && Array.isArray(r.bbox_xyxy) ? r.bbox_xyxy : null;
+      }} else {{
+        did = r.getAttribute("data-door-id");
+        if (!did) continue;
+        // Use SVG geometry instead of relying on attributes (which can be missing/NaN).
+        let bb = null;
+        try {{ bb = r.getBBox(); }} catch (_) {{ bb = null; }}
+        if (!bb) continue;
+        const rw = Number(bb.width);
+        const rh = Number(bb.height);
+        const rx = Number(bb.x);
+        const ry = Number(bb.y);
+        if (!(rw > 0) || !(rh > 0) || !Number.isFinite(rx) || !Number.isFinite(ry)) continue;
+        cand = [rx, ry, rx + rw, ry + rh];
+      }}
+      if (!did || !cand || cand.length !== 4) continue;
+      const rx0 = Number(cand[0]), ry0 = Number(cand[1]), rx1 = Number(cand[2]), ry1 = Number(cand[3]);
+      if (!Number.isFinite(rx0) || !Number.isFinite(ry0) || !Number.isFinite(rx1) || !Number.isFinite(ry1)) continue;
+      cand = [rx0, ry0, rx1, ry1];
       const iou = computeIoU(norm, cand);
       const inter = computeIntersectionArea(norm, cand);
       const candArea = Math.max(0, (cand[2] - cand[0])) * Math.max(0, (cand[3] - cand[1]));
@@ -2648,18 +2768,31 @@ def _panzoom_image_viewer(
         const o = overlap[i];
         sample.push({{ id: o.id, bbox: o.bbox, iou: o.iou, inter: o.inter, coverage: o.coverage }});
       }}
-      // Compute candidate coordinate range (using bbox geometry).
-      for (const rr of rects) {{
-        let bb = null;
-        try {{ bb = rr.getBBox(); }} catch (_) {{ bb = null; }}
-        if (!bb) continue;
-        const rx0 = Number(bb.x), ry0 = Number(bb.y);
-        const rx1 = rx0 + Number(bb.width), ry1 = ry0 + Number(bb.height);
-        if (!Number.isFinite(rx0) || !Number.isFinite(ry0) || !Number.isFinite(rx1) || !Number.isFinite(ry1)) continue;
-        minX = Math.min(minX, rx0);
-        minY = Math.min(minY, ry0);
-        maxX = Math.max(maxX, rx1);
-        maxY = Math.max(maxY, ry1);
+      // Compute candidate coordinate range (using the same source we’re snapping against).
+      if (hasPool) {{
+        for (const rr of pool) {{
+          if (!rr || !Array.isArray(rr.bbox_xyxy) || rr.bbox_xyxy.length !== 4) continue;
+          const rx0 = Number(rr.bbox_xyxy[0]), ry0 = Number(rr.bbox_xyxy[1]);
+          const rx1 = Number(rr.bbox_xyxy[2]), ry1 = Number(rr.bbox_xyxy[3]);
+          if (!Number.isFinite(rx0) || !Number.isFinite(ry0) || !Number.isFinite(rx1) || !Number.isFinite(ry1)) continue;
+          minX = Math.min(minX, rx0);
+          minY = Math.min(minY, ry0);
+          maxX = Math.max(maxX, rx1);
+          maxY = Math.max(maxY, ry1);
+        }}
+      }} else {{
+        for (const rr of rects) {{
+          let bb = null;
+          try {{ bb = rr.getBBox(); }} catch (_) {{ bb = null; }}
+          if (!bb) continue;
+          const rx0 = Number(bb.x), ry0 = Number(bb.y);
+          const rx1 = rx0 + Number(bb.width), ry1 = ry0 + Number(bb.height);
+          if (!Number.isFinite(rx0) || !Number.isFinite(ry0) || !Number.isFinite(rx1) || !Number.isFinite(ry1)) continue;
+          minX = Math.min(minX, rx0);
+          minY = Math.min(minY, ry0);
+          maxX = Math.max(maxX, rx1);
+          maxY = Math.max(maxY, ry1);
+        }}
       }}
 
       // Also compute the nearest candidate to the drawn box (even if no overlap).
@@ -2709,7 +2842,10 @@ def _panzoom_image_viewer(
         drawn: norm,
         drawnWH: [dw, dh],
         candRange: (minX !== Infinity) ? [minX, minY, maxX, maxY] : null,
-        candidates: rects.length,
+        source: hasPool ? "pool" : "svg",
+        poolRawBytes: poolRaw ? poolRaw.length : 0,
+        poolCandidates: hasPool ? pool.length : 0,
+        candidates: hasPool ? pool.length : rects.length,
         overlapCandidates: overlap.length,
         bestByIoU: best ? {{ id: best.id, iou: best.iou }} : null,
         bestByCoverage: bestByCoverage ? {{ id: bestByCoverage.id, coverage: bestByCoverage.coverage, iou: bestByCoverage.iou, inter: bestByCoverage.inter }} : null,
@@ -2728,7 +2864,10 @@ def _panzoom_image_viewer(
             drawn: norm,
             drawnWH: [dw, dh],
             candRange: (minX !== Infinity) ? [minX, minY, maxX, maxY] : null,
-            candidates: rects.length,
+            source: hasPool ? "pool" : "svg",
+            poolRawBytes: poolRaw ? poolRaw.length : 0,
+            poolCandidates: hasPool ? pool.length : 0,
+            candidates: hasPool ? pool.length : rects.length,
             overlapCandidates: overlap.length,
             bestByIoU: best ? {{ id: best.id, iou: best.iou }} : null,
             bestByCoverage: bestByCoverage ? {{ id: bestByCoverage.id, coverage: bestByCoverage.coverage, iou: bestByCoverage.iou, inter: bestByCoverage.inter }} : null,
@@ -2818,6 +2957,22 @@ def _panzoom_image_viewer(
       const note = u.note || "unmatched";
       drawBox(manualLayer, bbox, "rgba(255,0,255,0.9)", 2, "6,4", 0.7, String(note));
     }}
+    return true;
+  }}
+
+  function pollUnmatchedDebug() {{
+    const raw = readParentInputValue(unmatchedDebugSinkLabel);
+    if (!raw) return false;
+    if (raw === lastUnmatchedDebugRaw) return false;
+    lastUnmatchedDebugRaw = raw;
+    try {{
+      let obj = null;
+      try {{ obj = JSON.parse(raw); }} catch (_) {{ obj = null; }}
+      // Print as normal lines so it’s easy to copy/paste without expanding groups.
+      console.log("[door_detector] unmatched_debug_report raw", raw);
+      if (obj) console.log("[door_detector] unmatched_debug_report parsed", obj);
+      else console.warn("[door_detector] unmatched_debug_report parse_failed");
+    }} catch (_) {{}}
     return true;
   }}
 
@@ -3012,7 +3167,17 @@ def _panzoom_image_viewer(
           // As a robust fallback, also poke the existing click sink with a sentinel
           // value that will not match any door id, solely to trigger the rerun.
           if (ok) {{
-            setParentInputValue(clickSinkLabel, `__draw_event__${{payload.event_id}}`);
+            const encoded = encodeURIComponent(JSON.stringify(payload));
+            const ok2 = setParentInputValue(clickSinkLabel, `__draw_event__${{encoded}}`);
+            try {{
+              console.log("[door_detector] draw_rect sink_write", {{
+                drawEventOk: ok,
+                clickSentinelOk: ok2,
+                drawEventLabel: drawEventSinkLabel,
+                clickSinkLabel,
+                lastSinkWrite: window.__door_detectorLastSinkWrite || null,
+              }});
+            }} catch (_) {{}}
           }}
         }} catch (_) {{}}
       }}
@@ -3071,6 +3236,7 @@ def _panzoom_image_viewer(
     const editEnabled = getEditEnabled();
     const doorStateChanged = updateDoorStateFromSinks();
     renderManualOverlays();
+    pollUnmatchedDebug();
 
     const newAutoFocus = getAutoFocus();
     if (newAutoFocus !== autoFocus) {{
@@ -3093,8 +3259,22 @@ def _panzoom_image_viewer(
       needsStyle = true;
     }}
     if (editEnabled !== lastEditEnabled) {{
+      const wasEditing = !!lastEditEnabled;
       lastEditEnabled = editEnabled;
       needsStyle = true;
+      // On exit from Edit Doors, clear any edit-only overlays immediately
+      // (blue drawn box, magenta unmatched boxes, etc).
+      if (wasEditing && !editEnabled) {{
+        try {{
+          manualLayer = ensureLayer("pz_manual");
+          tempLayer = ensureLayer("pz_temp");
+          clearLayer(manualLayer);
+          clearLayer(tempLayer);
+          lastManualOverlayRaw = null;
+          lastUnmatchedDebugRaw = null;
+          console.log("[door_detector] edit_mode exited: cleared overlays");
+        }} catch (_) {{}}
+      }}
     }}
     if (doorStateChanged) needsStyle = true;
     if (needsStyle) applyDoorStyles();
@@ -3279,6 +3459,8 @@ def main_viewer_canvas(
         manual_overlay_sink_label = f"manual_overlay_sink_{file_id}"
         door_state_sink_label = f"door_state_sink_{file_id}"
         viewer_display_sink_label = f"viewer_display_sink_{file_id}"
+        unmatched_debug_sink_label = f"unmatched_debug_sink_{file_id}"
+        candidate_pool_sink_label = f"candidate_pool_sink_{file_id}"
 
         # Server → iframe values (updated every run).
         try:
@@ -3295,13 +3477,42 @@ def main_viewer_canvas(
                 separators=(",", ":"),
             )
             # Manual overlay data is supplied via a separate sink (preview-space bboxes).
-            st.session_state[manual_overlay_sink_label] = json.dumps(
-                _manual_overlay_payload_for_sink(
+            # Only show these while editing so exiting Edit Doors clears the overlays.
+            if bool(fstate.get("edit_mode")):
+                manual_payload = _manual_overlay_payload_for_sink(
                     fstate=fstate,
                     preview_scale=float(preview_spec.get("scale", 1.0) or 1.0),
-                ),
-                separators=(",", ":"),
-            )
+                )
+            else:
+                manual_payload = {"manual_additions": [], "unmatched_manual_boxes": []}
+            st.session_state[manual_overlay_sink_label] = json.dumps(manual_payload, separators=(",", ":"))
+            st.session_state[unmatched_debug_sink_label] = str(fstate.get("_last_unmatched_debug") or "")
+            # Candidate pool for snapping: preview-space bboxes for a broad set of candidates.
+            # This allows snap-to-candidate even when the candidate is not in the final `doors` list.
+            try:
+                scale = float(preview_spec.get("scale", 1.0) or 1.0)
+            except Exception:
+                scale = 1.0
+            pool = list(doors_data.get("candidates", []) or [])
+            out_pool: List[Dict[str, Any]] = []
+            # Keep this small enough for Streamlit hidden-input transport; the pool is
+            # sorted by confidence in Step 2 so high-recall candidates should still appear.
+            for cand in pool[:1200]:
+                cid = cand.get("id")
+                bbox = cand.get("bbox_xyxy")
+                if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
+                    continue
+                nb = _normalize_bbox_xyxy(bbox)
+                if nb is None:
+                    continue
+                # full → preview
+                out_pool.append(
+                    {
+                        "id": str(cid),
+                        "bbox_xyxy": [float(nb[0]) * scale, float(nb[1]) * scale, float(nb[2]) * scale, float(nb[3]) * scale],
+                    }
+                )
+            st.session_state[candidate_pool_sink_label] = json.dumps({"candidates": out_pool}, separators=(",", ":"))
         except Exception:
             pass
 
@@ -3314,6 +3525,8 @@ def main_viewer_canvas(
         st.text_input(manual_overlay_sink_label, key=manual_overlay_sink_label, label_visibility="collapsed")
         st.text_input(door_state_sink_label, key=door_state_sink_label, label_visibility="collapsed")
         st.text_input(viewer_display_sink_label, key=viewer_display_sink_label, label_visibility="collapsed")
+        st.text_input(unmatched_debug_sink_label, key=unmatched_debug_sink_label, label_visibility="collapsed")
+        st.text_input(candidate_pool_sink_label, key=candidate_pool_sink_label, label_visibility="collapsed")
 
         viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
         viewer_width_hint = max(600, min(2000, viewer_width_hint))
@@ -3352,6 +3565,8 @@ def main_viewer_canvas(
             door_state_sink_aria_label=door_state_sink_label,
             viewer_display_sink_aria_label=viewer_display_sink_label,
             auto_focus_sink_aria_label=auto_focus_sink_label,
+            unmatched_debug_sink_aria_label=unmatched_debug_sink_label,
+            candidate_pool_sink_aria_label=candidate_pool_sink_label,
         )
         return None, active_doors
     else:
@@ -4029,6 +4244,36 @@ with col_app:
             detections = doors_data.get("doors", [])
             deleted_ids = _get_working_label_state(fstate).get("deleted_ids", set())
             overlay_doors: List[Dict[str, Any]] = [d for d in detections if d.get("id") is not None]
+            # Ensure any confirmed snapped candidates are also rendered (even if they were
+            # not in the strict output doors list).
+            try:
+                working = _get_working_label_state(fstate)
+                extra_ids = set(working.get("confirmed_ids", set()))
+                for rec in list(working.get("manual_additions", [])):
+                    cid = rec.get("snapped_candidate_id")
+                    if cid:
+                        extra_ids.add(str(cid))
+                existing_ids = {str(d.get("id")) for d in overlay_doors if d.get("id") is not None}
+                pool = list(doors_data.get("candidates", []) or [])
+                pool_map = {str(c.get("id")): c for c in pool if c.get("id") is not None}
+                for cid in sorted(extra_ids - existing_ids):
+                    cand = pool_map.get(str(cid))
+                    if not cand:
+                        continue
+                    bbox = cand.get("bbox_xyxy")
+                    if not bbox:
+                        continue
+                    overlay_doors.append(
+                        {
+                            "id": str(cid),
+                            "type": str(cand.get("type") or "candidate"),
+                            "bbox_xyxy": bbox,
+                            "confidence": float(cand.get("confidence", 0.0) or 0.0),
+                            "features": cand.get("features", {}),
+                        }
+                    )
+            except Exception:
+                pass
             # Right panel / navigation list excludes deleted; overlay hides deleted via JS state sink.
             active_doors_all: List[Dict[str, Any]] = [d for d in overlay_doors if d.get("id") not in deleted_ids]
 

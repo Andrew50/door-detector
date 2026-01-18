@@ -82,12 +82,12 @@ def detect_doors(
     primitives: Dict[str, Any],
     meta: Dict[str, Any],
     config: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """Detect doors in a floor plan using vector primitives and rule-based logic."""
     
     if meta["mode"] == "scan" and config["mode_policy"].get("scan") == "empty_with_message":
         # For scans in v1, we skip detection
-        return []
+        return {"doors": [], "candidates": []}
 
     lines = primitives.get("lines", [])
     beziers = primitives.get("beziers", [])
@@ -103,7 +103,11 @@ def detect_doors(
         ]
         line_index.add(i, bbox)
 
-    candidates = []
+    # Two pools:
+    # - `doors`: strict, post-threshold/post-NMS list (what the model “predicts”)
+    # - `candidates`: broader pool for snapping/training (looser leaf len_ratio only)
+    strict_candidates: List[Dict[str, Any]] = []
+    candidate_pool: List[Dict[str, Any]] = []
     # Track "arc clusters" (many similar arcs sharing center+radius) to suppress
     # common annotation bubbles / callout circles which are often built from
     # multiple Beziers (e.g., 4 quarter-arcs).
@@ -113,6 +117,16 @@ def detect_doors(
     # 2. Swing door detection
     if config["swing"]["enabled"]:
         swing_conf = config["swing"]
+        out_conf = config.get("output", {})
+        min_conf = float(out_conf.get("min_confidence", 0.55) or 0.55)
+        # Looser leaf ratio for candidate pool (does NOT affect final doors).
+        pool_min_len_ratio = 0.22
+        pool_max_len_ratio = 2.20
+        pool_max_hinge_dist_ratio = 0.55
+        pool_require_endpoint_near_center = False
+        pool_max_center_dist_ratio = 0.60
+        pool_max_radial_angle_deg = 50.0
+        pool_max_tip_to_arc_ratio = 0.70
         for b_idx, bez in enumerate(beziers):
             # Sample and fit arc
             pts = sample_bezier(
@@ -167,7 +181,10 @@ def detect_doors(
                 
                 # Length ratio
                 len_ratio = l_len / radius
-                if not (leaf_conf["min_length_ratio"] <= len_ratio <= leaf_conf["max_length_ratio"]):
+                in_strict_len_ratio = bool(leaf_conf["min_length_ratio"] <= len_ratio <= leaf_conf["max_length_ratio"])
+                in_pool_len_ratio = bool(pool_min_len_ratio <= len_ratio <= pool_max_len_ratio)
+                # If it's outside even the loose pool bounds, skip early.
+                if not in_pool_len_ratio:
                     continue
                 
                 # Hinge proximity: one line endpoint near one arc endpoint or center
@@ -184,21 +201,36 @@ def detect_doors(
                 d1_center = dist_point_to_point(p1, center)
                 
                 min_hinge_dist = min(d0_start, d0_end, d1_start, d1_end)
+                strict_hinge_ok = True
                 if min_hinge_dist > radius * leaf_conf["max_hinge_dist_ratio"]:
-                    # Also check center if it's a wedge style
                     if min(d0_center, d1_center) > radius * leaf_conf["max_hinge_dist_ratio"]:
-                        continue
+                        strict_hinge_ok = False
+
+                pool_hinge_ok = True
+                if min_hinge_dist > radius * pool_max_hinge_dist_ratio:
+                    if min(d0_center, d1_center) > radius * pool_max_hinge_dist_ratio:
+                        pool_hinge_ok = False
+                if not pool_hinge_ok:
+                    continue
 
                 # Common false positive: annotation/callout circles with nearby leader
                 # lines. Those leaders touch the circle boundary but do NOT originate
                 # at the circle center (hinge). For swing doors, the leaf line almost
                 # always has an endpoint near the arc center.
+                strict_center_ok = True
                 if leaf_conf.get("require_endpoint_near_center", False):
                     max_center_ratio = float(
                         leaf_conf.get("max_center_dist_ratio", leaf_conf.get("max_hinge_dist_ratio", 0.25))
                     )
                     if min(d0_center, d1_center) > radius * max_center_ratio:
-                        continue
+                        strict_center_ok = False
+
+                pool_center_ok = True
+                if pool_require_endpoint_near_center:
+                    if min(d0_center, d1_center) > radius * pool_max_center_dist_ratio:
+                        pool_center_ok = False
+                if not pool_center_ok:
+                    continue
 
                 # Optional radial alignment check: the leaf line should roughly align
                 # with the radius to the arc endpoint it meets (reject tangents).
@@ -210,7 +242,13 @@ def detect_doors(
                         max_radial_angle = None
                 radial_angle_deg = None
                 tip_to_arc_dist = None
-                if max_radial_angle is not None and max_radial_angle > 0:
+                pool_radial_ok = True
+                strict_radial_ok = True
+                strict_tip_ok = True
+                pool_tip_ok = True
+
+                # Compute radial alignment once, then apply different thresholds.
+                if (max_radial_angle is not None and max_radial_angle > 0) or (pool_max_radial_angle_deg and pool_max_radial_angle_deg > 0):
                     hinge_pt = p0 if d0_center <= d1_center else p1
                     tip_pt = p1 if hinge_pt == p0 else p0
                     # Choose the arc endpoint closest to the leaf tip.
@@ -229,8 +267,10 @@ def detect_doors(
                         dot = (lx * rx + ly * ry) / (ln * rn)
                         dot = max(-1.0, min(1.0, dot))
                         radial_angle_deg = math.degrees(math.acos(dot))
-                        if radial_angle_deg > max_radial_angle:
-                            continue
+                        if max_radial_angle is not None and max_radial_angle > 0 and radial_angle_deg > max_radial_angle:
+                            strict_radial_ok = False
+                        if pool_max_radial_angle_deg and pool_max_radial_angle_deg > 0 and radial_angle_deg > pool_max_radial_angle_deg:
+                            pool_radial_ok = False
 
                     max_tip_ratio = leaf_conf.get("max_tip_to_arc_ratio", None)
                     if max_tip_ratio is not None and tip_to_arc_dist is not None:
@@ -240,7 +280,13 @@ def detect_doors(
                             max_tip_ratio = None
                         if max_tip_ratio is not None and max_tip_ratio > 0:
                             if tip_to_arc_dist > radius * max_tip_ratio:
-                                continue
+                                strict_tip_ok = False
+                    if pool_max_tip_to_arc_ratio is not None and tip_to_arc_dist is not None:
+                        if pool_max_tip_to_arc_ratio > 0 and tip_to_arc_dist > radius * pool_max_tip_to_arc_ratio:
+                            pool_tip_ok = False
+
+                if not pool_radial_ok or not pool_tip_ok:
+                    continue
 
                 # Basic score
                 score_conf = swing_conf["scoring"]
@@ -251,42 +297,65 @@ def detect_doors(
                 denom = max(1.0, 90.0 - min_a)
                 angle_score = (float(angle_span) - min_a) / denom
                 angle_score = max(0.0, min(1.0, angle_score))
-                prox_score = max(0, 1.0 - (min_hinge_dist / (radius * leaf_conf["max_hinge_dist_ratio"])))
+                prox_score_strict = max(0, 1.0 - (min_hinge_dist / (radius * leaf_conf["max_hinge_dist_ratio"])))
+                prox_score_pool = max(0, 1.0 - (min_hinge_dist / (radius * pool_max_hinge_dist_ratio)))
                 
-                confidence = (
+                conf_strict = (
                     score_conf["w_fit"] * fit_score +
                     score_conf["w_angle"] * angle_score +
-                    score_conf["w_proximity"] * prox_score
+                    score_conf["w_proximity"] * prox_score_strict
                 )
-                
-                if confidence >= config["output"]["min_confidence"]:
-                    # Create a stable ID based on the primitives used
-                    stable_key = f"swing|b={b_idx}|l={l_idx}"
-                    door_id = "d_" + hashlib.sha1(stable_key.encode()).hexdigest()[:10]
-                    
-                    candidates.append({
-                        "id": door_id,
-                        "type": "swing",
-                        "bbox_xyxy": get_bbox(pts + [p0, p1]),
-                        "confidence": float(confidence),
-                        "features": {
-                            "rmse": float(rmse),
-                            "radius": float(radius),
-                            "angle_span": float(angle_span),
-                            "hinge_dist": float(min_hinge_dist),
-                            "len_ratio": float(len_ratio),
-                            "center_dist": float(min(d0_center, d1_center)),
-                            # Keep feature values numeric so optional learned reweighting
-                            # never encounters `None` (which would break numpy math).
-                            "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else 0.0,
-                            "tip_to_arc_dist": float(tip_to_arc_dist) if tip_to_arc_dist is not None else 0.0,
-                        },
-                        "primitives": {"beziers": [b_idx], "lines": [l_idx]},
-                        "_circle_key": circle_key,
-                    })
+                conf_pool = (
+                    score_conf["w_fit"] * fit_score +
+                    score_conf["w_angle"] * angle_score +
+                    score_conf["w_proximity"] * prox_score_pool
+                )
+
+                # Create a stable ID based on the primitives used.
+                stable_key = f"swing|b={b_idx}|l={l_idx}"
+                door_id = "d_" + hashlib.sha1(stable_key.encode()).hexdigest()[:10]
+
+                base = {
+                    "id": door_id,
+                    "type": "swing",
+                    "bbox_xyxy": get_bbox(pts + [p0, p1]),
+                    "features": {
+                        "rmse": float(rmse),
+                        "radius": float(radius),
+                        "angle_span": float(angle_span),
+                        "hinge_dist": float(min_hinge_dist),
+                        "len_ratio": float(len_ratio),
+                        "center_dist": float(min(d0_center, d1_center)),
+                        # Keep feature values numeric so optional learned reweighting
+                        # never encounters `None` (which would break numpy math).
+                        "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else 0.0,
+                        "tip_to_arc_dist": float(tip_to_arc_dist) if tip_to_arc_dist is not None else 0.0,
+                    },
+                    "primitives": {"beziers": [b_idx], "lines": [l_idx]},
+                    "_circle_key": circle_key,
+                }
+
+                # Candidate pool keeps looser len_ratio and looser hinge/center/radial/tip.
+                cand_pool = dict(base)
+                cand_pool["confidence"] = float(conf_pool)
+                cand_pool["pool"] = True
+                candidate_pool.append(cand_pool)
+
+                # Strict list uses config bounds + strict geometry gates + min_conf.
+                strict_ok = (
+                    in_strict_len_ratio
+                    and strict_hinge_ok
+                    and strict_center_ok
+                    and strict_radial_ok
+                    and strict_tip_ok
+                )
+                if strict_ok and float(conf_strict) >= min_conf:
+                    cand_strict = dict(base)
+                    cand_strict["confidence"] = float(conf_strict)
+                    strict_candidates.append(cand_strict)
 
     # 2.25 Suppress annotation circle clusters (if enabled)
-    if candidates and config.get("swing", {}).get("enabled") and config.get("swing", {}).get("arc", {}).get("suppress_circle_clusters", False):
+    if strict_candidates and config.get("swing", {}).get("enabled") and config.get("swing", {}).get("arc", {}).get("suppress_circle_clusters", False):
         arc_conf = config["swing"]["arc"]
         min_arcs = int(arc_conf.get("circle_cluster_min_arcs", 3))
         # Only suppress clusters that look like "mostly a full circle".
@@ -294,33 +363,56 @@ def detect_doors(
         # Bezier segments but only cover ~90° total.
         min_total_angle = float(arc_conf.get("circle_cluster_min_total_angle_deg", 250.0))
         filtered: List[Dict[str, Any]] = []
-        for cand in candidates:
+        for cand in strict_candidates:
             key = cand.get("_circle_key", None)
             if key is not None:
                 if arc_cluster_counts.get(key, 0) >= min_arcs and arc_cluster_sum_angle.get(key, 0.0) >= min_total_angle:
                     continue
             filtered.append(cand)
-        candidates = filtered
+        strict_candidates = filtered
+
+    if candidate_pool and config.get("swing", {}).get("enabled") and config.get("swing", {}).get("arc", {}).get("suppress_circle_clusters", False):
+        # Apply the same suppression to the pool to remove obvious annotation bubbles.
+        arc_conf = config["swing"]["arc"]
+        min_arcs = int(arc_conf.get("circle_cluster_min_arcs", 3))
+        min_total_angle = float(arc_conf.get("circle_cluster_min_total_angle_deg", 250.0))
+        filtered_pool: List[Dict[str, Any]] = []
+        for cand in candidate_pool:
+            key = cand.get("_circle_key", None)
+            if key is not None:
+                if arc_cluster_counts.get(key, 0) >= min_arcs and arc_cluster_sum_angle.get(key, 0.0) >= min_total_angle:
+                    continue
+            filtered_pool.append(cand)
+        candidate_pool = filtered_pool
 
     # Remove internal fields before output / reweighting
-    for cand in candidates:
+    for cand in strict_candidates:
+        cand.pop("_circle_key", None)
+    for cand in candidate_pool:
         cand.pop("_circle_key", None)
 
     # 2.5 Apply reweighter if available
     if "reweighter_path" in config and Path(config["reweighter_path"]).exists():
-        candidates = apply_reweighter(candidates, config["reweighter_path"])
+        strict_candidates = apply_reweighter(strict_candidates, config["reweighter_path"])
+        # Reweighter is also useful for ranking the pool (snapping/training), so apply it too.
+        candidate_pool = apply_reweighter(candidate_pool, config["reweighter_path"])
 
     # 3. Simple NMS
-    if not candidates:
-        return []
+    if not strict_candidates:
+        # Still return the pool even if strict list is empty.
+        candidate_pool.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+        return {
+            "doors": [],
+            "candidates": candidate_pool[:5000],
+        }
         
     # Sort by confidence
-    candidates.sort(key=lambda x: x["confidence"], reverse=True)
+    strict_candidates.sort(key=lambda x: x["confidence"], reverse=True)
     
     keep = []
     nms_iou = config["output"]["nms_iou"]
     
-    for cand in candidates:
+    for cand in strict_candidates:
         overlap = False
         for kept in keep:
             if compute_iou(cand["bbox_xyxy"], kept["bbox_xyxy"]) > nms_iou:
@@ -328,6 +420,11 @@ def detect_doors(
                 break
         if not overlap:
             keep.append(cand)
-            
-    return keep[:config["output"]["max_doors"]]
+
+    # Cap the pool size to keep doors.json manageable (still broad enough for snapping).
+    candidate_pool.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+    return {
+        "doors": keep[:config["output"]["max_doors"]],
+        "candidates": candidate_pool[:5000],
+    }
 
