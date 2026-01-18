@@ -78,8 +78,8 @@ Without a learned model, `confidence == heuristic_confidence`.
 
 Selection logic:
 
-- If a reweighter model exists (`reweighter_path` points to a file):
-  - final `doors` are selected from the **broad** `candidates` pool.
+- If a reweighter model exists (per-type model path in `configs/door_rules.json` under `reweighters.<door_type>`):
+  - final `doors` are selected from the **broad** `candidates` pool (post-reweight decisioning).
 - If no model exists:
   - final `doors` fall back to a conservative strict set.
 
@@ -92,11 +92,13 @@ Decision/tuning knobs live in `configs/door_rules.json`:
 
 ### 4) Apply the learned reweighter (optional)
 
-If `configs/door_rules.json` includes `reweighter_path` and the model file exists,
-`detect_doors()` applies the reweighter to both:
+If `configs/door_rules.json` includes `reweighters` and a per-type model file exists,
+`detect_doors()` applies the reweighter to candidates of that type:
 
 - the strict set (used as a conservative fallback)
 - the broader pool (`candidates`) used for snapping/training and (when reweighted) final selection
+
+Note: for backward compatibility, older configs may use `reweighter_path` (single model). In that case it is treated as the swing reweighter.
 
 The reweighter replaces each candidate’s `confidence` with a logistic-regression probability computed from its feature vector.
 That probability is then used for **final keep/drop** via `output.min_confidence_after_reweight`.
@@ -167,16 +169,16 @@ The server result is what gets written into `labels.json` as `snapped_candidate_
 
 ---
 
-## Label storage (`labels.json`, schema v2)
+## Label storage (`labels.json`, schema v3)
 
-Each artifacts directory can store a `labels.json` with schema version 2:
+Each artifacts directory can store a `labels.json` with schema version 3:
 
-- `confirmed_ids`: positive labels (doors)
+- `confirmed_by_type`: typed positive labels (doors), keyed by door type
 - `deleted_ids`: negative labels (not doors)
 - `manual_additions`: records of Shift+drag selections (includes drawn box + snapped candidate id + IoU)
 - `unmatched_manual_boxes`: selector boxes that did not match any candidate (UI-only; not used for training)
 
-The UI is intentionally **v2-only**: legacy fields are rejected.
+The UI is **v3-first** and will migrate schema v2 labels on load (treating v2 `confirmed_ids` as swing confirmations).
 
 On re-analysis, the UI re-applies:
 
@@ -193,7 +195,7 @@ Training is implemented in:
 
 Inputs:
 
-- `artifacts/**/labels.json` (schema v2 only)
+- `artifacts/**/labels.json` (schema v3; v2 is migrated/accepted for backwards compatibility)
 - corresponding `artifacts/**/doors.json`
 
 Training samples:

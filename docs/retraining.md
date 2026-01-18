@@ -38,7 +38,8 @@ Per page:
 
 Global (learned parameters):
 
-- `models/reweighter_v1.json`: feature normalization + weights + bias\n+  (the deployment keep/drop threshold is configured in `configs/door_rules.json`, not stored in the model)
+- `models/reweighter_<type>_v1.json`: per-door-type feature normalization + weights + bias
+  - (the deployment keep/drop thresholds are configured in `configs/door_rules.json`, not stored in the model)
 
 ## Core idea: separate “propose” from “score”
 
@@ -78,7 +79,9 @@ Recommended format (example):
   "generated_at": "2026-01-14T12:34:56Z",
   "detector": {
     "name": "vector_candidate_v1",
-    "reweighter": "models/reweighter_v1.json"
+    "reweighters": {
+      "swing": "models/reweighter_swing_v1.json"
+    }
   },
   "doors": [
     {
@@ -262,7 +265,7 @@ Given a folder of reviewed artifacts:
   - negatives = rejected predictions
 - Fit model weights (warm-started + regularized toward the prior for stability on small data)
 - Apply minimum-data gating (don’t write a new model unless both classes exist and there is enough labeled data)
-- Save `models/reweighter_v1.json`
+- Save `models/reweighter_<type>_v1.json` (one model per door type)
 
 Deployment tuning (precision/recall) is controlled via `configs/door_rules.json`:
 

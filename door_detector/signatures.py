@@ -24,11 +24,27 @@ def compute_analysis_signature(config_path: Path) -> str:
     config = json.loads(config_bytes)
 
     sig_content = bytearray(config_bytes)
-    reweighter_path = config.get("reweighter_path")
-    if isinstance(reweighter_path, str) and reweighter_path:
-        re_path = Path(reweighter_path)
+
+    # Preferred: per-type reweighters.
+    reweighters = config.get("reweighters")
+    if isinstance(reweighters, dict):
+        for k in sorted(reweighters.keys(), key=lambda x: str(x)):
+            v = reweighters.get(k)
+            if not isinstance(v, str) or not v:
+                continue
+            re_path = Path(v)
+            if re_path.exists():
+                sig_content.extend(b"|reweighter:")
+                sig_content.extend(str(k).encode("utf-8"))
+                sig_content.extend(b"|")
+                sig_content.extend(re_path.read_bytes())
+
+    # Backward compatibility: single reweighter path.
+    legacy_path = config.get("reweighter_path")
+    if isinstance(legacy_path, str) and legacy_path:
+        re_path = Path(legacy_path)
         if re_path.exists():
-            sig_content.extend(b"|")
+            sig_content.extend(b"|reweighter:legacy|")
             sig_content.extend(re_path.read_bytes())
 
     return hashlib.sha256(bytes(sig_content)).hexdigest()

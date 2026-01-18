@@ -23,6 +23,9 @@ def create_door_overlay(image: Image.Image, doors: List[Dict[str, Any]], output_
 
     colors = {
         "swing": (0, 255, 0),  # Green
+        "double": (0, 180, 255),  # Cyan-blue
+        "pocket": (255, 215, 0),  # Gold
+        "bifold": (186, 85, 211),  # Purple
     }
     default_color = (255, 0, 0)  # Red
 

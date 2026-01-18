@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
-from door_detector.ui.labels import labels_v2_default, validate_labels_v2_or_raise
+from door_detector.ui.labels import LABELS_SCHEMA_VERSION, labels_v3_default, migrate_labels_v2_to_v3, validate_labels_v3_or_raise
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -65,8 +65,16 @@ def _remap_labels_ids_in_place(labels_data: Dict[str, Any], doors_data: Dict[str
                 out.append(legacy_to_current.get(s, s))
             return out
 
+        # v2: confirmed_ids
         if isinstance(labels_data.get("confirmed_ids"), list):
             labels_data["confirmed_ids"] = _remap_list(labels_data.get("confirmed_ids") or [])
+        # v3: confirmed_by_type
+        if isinstance(labels_data.get("confirmed_by_type"), dict):
+            cbt = labels_data.get("confirmed_by_type") or {}
+            for k, v in list(cbt.items()):
+                if isinstance(v, list):
+                    cbt[k] = _remap_list(v)
+            labels_data["confirmed_by_type"] = cbt
         if isinstance(labels_data.get("deleted_ids"), list):
             labels_data["deleted_ids"] = _remap_list(labels_data.get("deleted_ids") or [])
         if isinstance(labels_data.get("manual_additions"), list):
@@ -94,14 +102,19 @@ def load_file_artifacts(file_dir_str: str) -> tuple[Dict[str, Any], Dict[str, An
         with open(doors_path) as f:
             doors_data = json.load(f)
 
-    labels_data: Dict[str, Any] = labels_v2_default()
+    labels_data: Dict[str, Any] = labels_v3_default()
     if labels_path.exists():
         with open(labels_path) as f:
             labels_data = json.load(f)
-        validate_labels_v2_or_raise(labels_data, labels_path=labels_path)
         # If `doors.json` uses a newer id scheme, remap old label ids to current
         # candidate ids (without changing the UX).
         _remap_labels_ids_in_place(labels_data, doors_data)
+
+        # Migrate v2 -> v3 on load (UI uses v3 internally).
+        if isinstance(labels_data, dict) and labels_data.get("schema_version") == 2:
+            labels_data = migrate_labels_v2_to_v3(labels_data)
+
+        validate_labels_v3_or_raise(labels_data, labels_path=labels_path)
 
     meta_data: Dict[str, Any] = {}
     if meta_path.exists():

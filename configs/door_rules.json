@@ -1,6 +1,11 @@
 {
-  "schema_version": 1,
-  "reweighter_path": "models/reweighter_v1.json",
+  "schema_version": 2,
+  "reweighters": {
+    "swing": "models/reweighter_swing_v1.json",
+    "double": "models/reweighter_double_v1.json",
+    "pocket": "models/reweighter_pocket_v1.json",
+    "bifold": "models/reweighter_bifold_v1.json"
+  },
   "mode_policy": {
     "vector": "vector_rules",
     "hybrid": "vector_rules",
@@ -43,6 +48,50 @@
       "w_fit": 0.45,
       "w_angle": 0.25,
       "w_proximity": 0.30
+    }
+  },
+  "double": {
+    "enabled": true,
+    "pairing": {
+      "max_center_dist_ratio": 3.0,
+      "max_radius_ratio": 1.35,
+      "max_bbox_iou": 0.15
+    },
+    "scoring": {
+      "w_pair": 0.40,
+      "w_avg_conf": 0.60
+    }
+  },
+  "pocket": {
+    "enabled": true,
+    "dashed": {
+      "require_dashed": true,
+      "min_dash_fraction": 0.0
+    },
+    "geometry": {
+      "min_track_length_px": 25.0,
+      "max_track_length_px": 600.0,
+      "pad_px": 8.0
+    },
+    "scoring": {
+      "w_dashed": 0.40,
+      "w_length": 0.60
+    }
+  },
+  "bifold": {
+    "enabled": true,
+    "zigzag": {
+      "min_segments": 3,
+      "max_segments": 8,
+      "endpoint_snap_px": 3.0,
+      "min_turn_angle_deg": 30.0
+    },
+    "geometry": {
+      "pad_px": 6.0
+    },
+    "scoring": {
+      "w_segments": 0.55,
+      "w_compactness": 0.45
     }
   }
 }

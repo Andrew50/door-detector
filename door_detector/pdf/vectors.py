@@ -19,6 +19,48 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
     drawings = page.get_drawings()
 
     for drawing in drawings:
+        # Capture drawing-level styling (PyMuPDF applies these to the items).
+        # Note: get_drawings() structure can vary slightly across PyMuPDF versions,
+        # so keep this defensive and JSON-serializable.
+        try:
+            stroke_width = float(drawing.get("width") or drawing.get("linewidth") or 1.0)
+        except Exception:
+            stroke_width = 1.0
+
+        dash_pattern: list[float] = []
+        try:
+            d = drawing.get("dashes")
+            if isinstance(d, (list, tuple)):
+                dash_pattern = [float(x) for x in d if x is not None]
+            elif isinstance(d, str) and d.strip():
+                # Some PyMuPDF versions expose dashes as a string like: "[ 0 3 ] 0"
+                # where the bracketed numbers are the dash pattern and the trailing
+                # number is the dash phase. Parse numbers defensively.
+                nums: list[float] = []
+                for tok in d.replace("[", " ").replace("]", " ").split():
+                    try:
+                        nums.append(float(tok))
+                    except Exception:
+                        continue
+                # Heuristic: if it looks like "pattern + phase", drop the last number.
+                if len(nums) >= 3:
+                    dash_pattern = nums[:-1]
+                else:
+                    dash_pattern = nums
+        except Exception:
+            dash_pattern = []
+
+        is_dashed = bool(len(dash_pattern) >= 2 and any((float(x) or 0.0) > 0 for x in dash_pattern))
+
+        stroke_color = None
+        try:
+            c = drawing.get("color")
+            # Typically RGB floats in 0..1; keep raw value (JSON-able).
+            if isinstance(c, (list, tuple)) and len(c) in (3, 4):
+                stroke_color = [float(x) for x in c]
+        except Exception:
+            stroke_color = None
+
         items = drawing.get("items", [])
         for item in items:
             item_type = item[0]
@@ -26,14 +68,34 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
             if item_type == "l":  # Line segment
                 p0 = {"x": item[1][0], "y": item[1][1]}
                 p1 = {"x": item[2][0], "y": item[2][1]}
-                lines.append({"p0": p0, "p1": p1})
+                lines.append(
+                    {
+                        "p0": p0,
+                        "p1": p1,
+                        "stroke_width": stroke_width,
+                        "dash_pattern": dash_pattern,
+                        "is_dashed": is_dashed,
+                        "stroke_color": stroke_color,
+                    }
+                )
 
             elif item_type == "c":  # Cubic Bezier curve
                 p0 = {"x": item[1][0], "y": item[1][1]}
                 p1 = {"x": item[2][0], "y": item[2][1]}
                 p2 = {"x": item[3][0], "y": item[3][1]}
                 p3 = {"x": item[4][0], "y": item[4][1]}
-                beziers.append({"p0": p0, "p1": p1, "p2": p2, "p3": p3})
+                beziers.append(
+                    {
+                        "p0": p0,
+                        "p1": p1,
+                        "p2": p2,
+                        "p3": p3,
+                        "stroke_width": stroke_width,
+                        "dash_pattern": dash_pattern,
+                        "is_dashed": is_dashed,
+                        "stroke_color": stroke_color,
+                    }
+                )
 
             elif item_type == "re":  # Rectangle
                 rect_coords = item[1]
@@ -42,7 +104,15 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
                 x1 = max(rect_coords[0], rect_coords[2])
                 y1 = max(rect_coords[1], rect_coords[3])
 
-                rects.append({"rect": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}})
+                rects.append(
+                    {
+                        "rect": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+                        "stroke_width": stroke_width,
+                        "dash_pattern": dash_pattern,
+                        "is_dashed": is_dashed,
+                        "stroke_color": stroke_color,
+                    }
+                )
 
     extract_time_ms = (time.time() - start_time) * 1000
 

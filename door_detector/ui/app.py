@@ -22,10 +22,18 @@ from door_detector.step2_pipeline import run_step2
 
 from door_detector.ui import assets
 from door_detector.ui.artifacts_io import get_full_page_dims, get_or_create_page_preview, load_file_artifacts
-from door_detector.ui.labels import coerce_id_set, enter_edit_mode as _enter_edit_mode, get_working_label_state as _get_working_label_state
+from door_detector.doors.types import normalize_door_type
+from door_detector.ui.labels import (
+    coerce_confirmed_by_type,
+    coerce_id_set,
+    flatten_confirmed_ids,
+    enter_edit_mode as _enter_edit_mode,
+    get_working_label_state as _get_working_label_state,
+)
 from door_detector.ui.review_panel import main_viewer_controls, right_panel_review, _sync_selected_door_for_run
 from door_detector.ui.sidebar import sidebar_library
 from door_detector.ui.viewer import _normalize_bbox_xyxy, main_viewer_canvas
+from door_detector.doors.detect import debug_explain_unmatched_box
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -46,7 +54,7 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
 
     if file_id not in st.session_state.files:
         st.session_state.files[file_id] = {
-            "confirmed_ids": coerce_id_set(labels_data.get("confirmed_ids", [])),
+            "confirmed_by_type": coerce_confirmed_by_type(labels_data.get("confirmed_by_type", {})),
             "deleted_ids": coerce_id_set(labels_data.get("deleted_ids", [])),
             "manual_additions": list(labels_data.get("manual_additions", [])),
             "unmatched_manual_boxes": list(labels_data.get("unmatched_manual_boxes", [])),
@@ -142,9 +150,56 @@ def _snap_to_candidate(
 
 
 def _debug_unmatched_region(*, file_dir: Path, drawn_bbox_full_xyxy: List[float], config_path: str) -> Optional[str]:
-    """Optional debug aid for unmatched Shift+drag boxes (kept lightweight here)."""
-    _debug_log("unmatched_debug stub file_dir=%s bbox=%s", str(file_dir), str(drawn_bbox_full_xyxy))
-    return None
+    """Debug aid for unmatched Shift+drag boxes.
+
+    Returns a JSON string; the viewer prints it to the browser console.
+    """
+    try:
+        primitives_path = file_dir / "primitives.json"
+        if not primitives_path.exists():
+            return json.dumps(
+                {
+                    "kind": "unmatched_box_debug_v1",
+                    "error": "missing_primitives.json",
+                    "file_dir": str(file_dir),
+                    "bbox_full_xyxy": drawn_bbox_full_xyxy,
+                },
+                separators=(",", ":"),
+            )
+        primitives = json.loads(primitives_path.read_bytes())
+    except Exception as e:
+        return json.dumps(
+            {
+                "kind": "unmatched_box_debug_v1",
+                "error": "failed_to_load_primitives",
+                "file_dir": str(file_dir),
+                "bbox_full_xyxy": drawn_bbox_full_xyxy,
+                "exception": str(e),
+            },
+            separators=(",", ":"),
+        )
+
+    try:
+        cfg = json.loads(Path(config_path).read_bytes())
+    except Exception as e:
+        cfg = {"error": f"failed_to_load_config: {e}"}
+
+    try:
+        rep = debug_explain_unmatched_box(primitives=primitives, bbox_full_xyxy=drawn_bbox_full_xyxy, config=cfg)
+        rep["file_dir"] = str(file_dir)
+        rep["config_path"] = str(config_path)
+        return json.dumps(rep, separators=(",", ":"))
+    except Exception as e:
+        return json.dumps(
+            {
+                "kind": "unmatched_box_debug_v1",
+                "error": "failed_to_compute_debug_report",
+                "file_dir": str(file_dir),
+                "bbox_full_xyxy": drawn_bbox_full_xyxy,
+                "exception": str(e),
+            },
+            separators=(",", ":"),
+        )
 
 
 def _process_draw_event_if_any(
@@ -242,14 +297,27 @@ def _process_draw_event_if_any(
     if best is not None and best.get("id") is not None:
         cid = str(best["id"])
         snapped_full = _normalize_bbox_xyxy(best.get("bbox_xyxy")) or _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
+        label_type = normalize_door_type(best.get("type"), default="swing")
         rec = {
             "drawn_bbox_xyxy": drawn_full,
             "snapped_candidate_id": cid,
             "iou": float(iou),
             "snapped_bbox_xyxy": [float(snapped_full[0]), float(snapped_full[1]), float(snapped_full[2]), float(snapped_full[3])],
+            "label_type": label_type,
         }
         draft["manual_additions"].append(rec)
-        draft["confirmed_ids"].add(cid)
+        # Typed confirmation: ensure the id belongs to exactly one confirmed bucket.
+        try:
+            cbt = draft.get("confirmed_by_type")
+            if not isinstance(cbt, dict):
+                cbt = {}
+                draft["confirmed_by_type"] = cbt
+            for t, ids in list(cbt.items()):
+                if isinstance(ids, set):
+                    ids.discard(cid)
+            cbt.setdefault(label_type, set()).add(cid)
+        except Exception:
+            pass
         draft["deleted_ids"].discard(cid)
         try:
             fstate["_edit_manual_confirmed_ids"].add(cid)
@@ -457,7 +525,7 @@ def main() -> None:
                 # not in the strict output doors list).
                 try:
                     working = _get_working_label_state(fstate)
-                    extra_ids = set(working.get("confirmed_ids", set()))
+                    extra_ids = flatten_confirmed_ids(working.get("confirmed_by_type", {}))
                     for rec in list(working.get("manual_additions", [])):
                         cid = rec.get("snapped_candidate_id")
                         if cid:

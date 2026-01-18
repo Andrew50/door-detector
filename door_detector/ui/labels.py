@@ -8,33 +8,35 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
+from door_detector.doors.types import DOOR_TYPES
 
-LABELS_SCHEMA_VERSION = 2
+
+LABELS_SCHEMA_VERSION = 3
 _LEGACY_LABEL_KEYS = {"accepted_ids", "rejected_ids", "added_boxes", "notes"}
-_LABELS_V2_REQUIRED_KEYS = {
+_LABELS_V3_REQUIRED_KEYS = {
     "schema_version",
     "reviewed_at",
-    "confirmed_ids",
+    "confirmed_by_type",
     "deleted_ids",
     "manual_additions",
     "unmatched_manual_boxes",
 }
 
 
-def labels_v2_default() -> Dict[str, Any]:
-    """Return an empty schema v2 labels object (reviewed_at is null until first save)."""
+def labels_v3_default() -> Dict[str, Any]:
+    """Return an empty schema v3 labels object (reviewed_at is null until first save)."""
     return {
         "schema_version": LABELS_SCHEMA_VERSION,
         "reviewed_at": None,
-        "confirmed_ids": [],
+        "confirmed_by_type": {t: [] for t in DOOR_TYPES},
         "deleted_ids": [],
         "manual_additions": [],
         "unmatched_manual_boxes": [],
     }
 
 
-def validate_labels_v2_or_raise(labels_data: Dict[str, Any], *, labels_path: Path) -> None:
-    """Validate schema v2 labels.json. Raise with a clear migration message on failure."""
+def validate_labels_v3_or_raise(labels_data: Dict[str, Any], *, labels_path: Path) -> None:
+    """Validate schema v3 labels.json. Raise with a clear migration message on failure."""
     if not isinstance(labels_data, dict):
         raise ValueError(f"Invalid labels.json (expected object): {labels_path}")
 
@@ -46,8 +48,9 @@ def validate_labels_v2_or_raise(labels_data: Dict[str, Any], *, labels_path: Pat
                     f"Unsupported labels.json schema in {labels_path}.",
                     f"Expected schema_version={LABELS_SCHEMA_VERSION}, got {schema_version!r}.",
                     "",
-                    "This UI no longer supports legacy label schemas.",
-                    "Please delete this labels.json (or migrate it offline) and re-review the file.",
+                    "This UI expects schema v3 labels. If this is an older schema,",
+                    "it should be migrated automatically when loaded by the UI.",
+                    "If it is not, please delete this labels.json and re-review the file.",
                 ]
             )
         )
@@ -63,14 +66,24 @@ def validate_labels_v2_or_raise(labels_data: Dict[str, Any], *, labels_path: Pat
             )
         )
 
-    missing = sorted(k for k in _LABELS_V2_REQUIRED_KEYS if k not in labels_data)
+    missing = sorted(k for k in _LABELS_V3_REQUIRED_KEYS if k not in labels_data)
     if missing:
         raise ValueError(f"labels.json in {labels_path} is missing required keys: {missing}")
 
     # Lightweight type checks (don’t coerce silently; fail fast).
-    for lk in ["confirmed_ids", "deleted_ids", "manual_additions", "unmatched_manual_boxes"]:
+    if not isinstance(labels_data.get("confirmed_by_type"), dict):
+        raise ValueError(f"labels.json field 'confirmed_by_type' must be an object: {labels_path}")
+    for lk in ["deleted_ids", "manual_additions", "unmatched_manual_boxes"]:
         if not isinstance(labels_data.get(lk), list):
             raise ValueError(f"labels.json field {lk!r} must be a list: {labels_path}")
+
+    # Ensure confirmed_by_type values are lists.
+    for t in DOOR_TYPES:
+        v = (labels_data.get("confirmed_by_type") or {}).get(t)
+        if v is None:
+            continue
+        if not isinstance(v, list):
+            raise ValueError(f"labels.json confirmed_by_type[{t!r}] must be a list: {labels_path}")
 
 
 def save_labels(dir_path: Path, labels_data: Dict[str, Any]) -> None:
@@ -97,9 +110,47 @@ def coerce_id_set(v: Any) -> set[str]:
     return out
 
 
+def coerce_confirmed_by_type(v: Any) -> dict[str, set[str]]:
+    """Coerce confirmed_by_type into dict[str, set[str]] with stable keys."""
+    out: dict[str, set[str]] = {t: set() for t in DOOR_TYPES}
+    if v is None:
+        return out
+    if not isinstance(v, dict):
+        return out
+    for t in DOOR_TYPES:
+        out[t] = coerce_id_set(v.get(t, []))
+    return out
+
+
+def flatten_confirmed_ids(confirmed_by_type: dict[str, set[str]]) -> set[str]:
+    out: set[str] = set()
+    if not isinstance(confirmed_by_type, dict):
+        return out
+    for _, ids in confirmed_by_type.items():
+        try:
+            out |= set(ids or set())
+        except Exception:
+            continue
+    return out
+
+
+def migrate_labels_v2_to_v3(labels_v2: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort migration: v2 confirmed_ids are assumed to be swing confirmations."""
+    confirmed_ids = labels_v2.get("confirmed_ids", []) if isinstance(labels_v2, dict) else []
+    deleted_ids = labels_v2.get("deleted_ids", []) if isinstance(labels_v2, dict) else []
+    return {
+        "schema_version": LABELS_SCHEMA_VERSION,
+        "reviewed_at": labels_v2.get("reviewed_at", None),
+        "confirmed_by_type": {t: (list(confirmed_ids) if t == "swing" else []) for t in DOOR_TYPES},
+        "deleted_ids": list(deleted_ids) if isinstance(deleted_ids, list) else [],
+        "manual_additions": list(labels_v2.get("manual_additions", []) or []),
+        "unmatched_manual_boxes": list(labels_v2.get("unmatched_manual_boxes", []) or []),
+    }
+
+
 def snapshot_label_state(src: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "confirmed_ids": coerce_id_set(src.get("confirmed_ids", set())),
+        "confirmed_by_type": coerce_confirmed_by_type(src.get("confirmed_by_type", {})),
         "deleted_ids": coerce_id_set(src.get("deleted_ids", set())),
         "manual_additions": copy.deepcopy(list(src.get("manual_additions", []))),
         "unmatched_manual_boxes": copy.deepcopy(list(src.get("unmatched_manual_boxes", []))),
@@ -107,7 +158,7 @@ def snapshot_label_state(src: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_label_state(dst: Dict[str, Any], state: Dict[str, Any]) -> None:
-    dst["confirmed_ids"] = coerce_id_set(state.get("confirmed_ids", set()))
+    dst["confirmed_by_type"] = coerce_confirmed_by_type(state.get("confirmed_by_type", {}))
     dst["deleted_ids"] = coerce_id_set(state.get("deleted_ids", set()))
     dst["manual_additions"] = copy.deepcopy(list(state.get("manual_additions", [])))
     dst["unmatched_manual_boxes"] = copy.deepcopy(list(state.get("unmatched_manual_boxes", [])))
@@ -135,7 +186,7 @@ def enter_edit_mode(fstate: Dict[str, Any]) -> None:
         cid = rec.get("snapped_candidate_id")
         if cid:
             manual_ids.add(str(cid))
-    fstate["_edit_manual_confirmed_ids"] = set(draft.get("confirmed_ids", set())) & manual_ids
+    fstate["_edit_manual_confirmed_ids"] = flatten_confirmed_ids(draft.get("confirmed_by_type", {})) & manual_ids
 
 
 def cancel_edit_mode(fstate: Dict[str, Any]) -> None:
@@ -159,11 +210,12 @@ def save_edit_mode(fstate: Dict[str, Any]) -> None:
 
 
 def make_labels_payload_from_fstate(fstate: Dict[str, Any]) -> Dict[str, Any]:
-    """Create schema v2 labels payload from an in-memory file state."""
+    """Create schema v3 labels payload from an in-memory file state."""
+    confirmed_by_type = coerce_confirmed_by_type(fstate.get("confirmed_by_type", {}))
     return {
         "schema_version": LABELS_SCHEMA_VERSION,
         "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "confirmed_ids": sorted(list(coerce_id_set(fstate.get("confirmed_ids", set())))),
+        "confirmed_by_type": {t: sorted(list(confirmed_by_type.get(t, set()))) for t in DOOR_TYPES},
         "deleted_ids": sorted(list(coerce_id_set(fstate.get("deleted_ids", set())))),
         "manual_additions": list(fstate.get("manual_additions", [])),
         "unmatched_manual_boxes": list(fstate.get("unmatched_manual_boxes", [])),

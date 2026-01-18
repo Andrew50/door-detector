@@ -20,12 +20,14 @@ from door_detector.reweight_fit import fit_reweighter
 from door_detector.ui.labels import (
     cancel_edit_mode as _cancel_edit_mode,
     enter_edit_mode as _enter_edit_mode,
+    flatten_confirmed_ids,
     get_working_label_state as _get_working_label_state,
     make_labels_payload_from_fstate,
     save_edit_mode as _save_edit_mode,
     save_labels,
 )
 from door_detector.ui.viewer import _normalize_bbox_xyxy
+from door_detector.doors.types import DOOR_TYPES, normalize_door_type
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -435,6 +437,29 @@ def right_panel_review(
         unsafe_allow_html=True,
     )
 
+    # Typed label control (what the reviewer says this door *is*).
+    # This is separate from the model-predicted door type (displayed above).
+    label_type_key = f"label_type_{file_id}"
+    working = _get_working_label_state(fstate)
+    # Compute current labeled type (if confirmed), else default to predicted type.
+    labeled_type = None
+    try:
+        cbt = working.get("confirmed_by_type", {}) if isinstance(working, dict) else {}
+        if isinstance(cbt, dict):
+            for t in DOOR_TYPES:
+                ids = cbt.get(t)
+                if isinstance(ids, set) and did in ids:
+                    labeled_type = t
+                    break
+    except Exception:
+        labeled_type = None
+    default_label_type = labeled_type or normalize_door_type(selected_door.get("type"), default="swing")
+    if label_type_key not in st.session_state:
+        st.session_state[label_type_key] = default_label_type
+    if str(st.session_state.get(label_type_key) or "") not in DOOR_TYPES:
+        st.session_state[label_type_key] = default_label_type
+    st.selectbox("Label as", list(DOOR_TYPES), key=label_type_key)
+
     # Zoom
     if preview_spec:
         image = Image.open(preview_spec["path"])
@@ -474,11 +499,29 @@ def right_panel_review(
             st.image(image.crop((left, upper, right, lower)), use_container_width=True)
 
     # Actions
-    working = _get_working_label_state(fstate)
     is_editing = bool(fstate.get("edit_mode"))
     c1, c2, c3 = st.columns(3)
     if c1.button("Confirm door", use_container_width=True):
-        working["confirmed_ids"].add(did)
+        # Ensure confirmed_by_type exists.
+        try:
+            cbt = working.get("confirmed_by_type")
+            if not isinstance(cbt, dict):
+                cbt = {t: set() for t in DOOR_TYPES}
+                working["confirmed_by_type"] = cbt
+        except Exception:
+            cbt = {t: set() for t in DOOR_TYPES}
+            working["confirmed_by_type"] = cbt
+
+        label_type = normalize_door_type(st.session_state.get(label_type_key), default=default_label_type)
+        # Candidate can only be confirmed as exactly one type.
+        for t in DOOR_TYPES:
+            try:
+                ids = cbt.get(t)
+                if isinstance(ids, set):
+                    ids.discard(did)
+            except Exception:
+                continue
+        cbt.setdefault(label_type, set()).add(did)
         working["deleted_ids"].discard(did)
         # Treat as explicit confirmation (so removing a manual-add record won't unconfirm).
         if is_editing:
@@ -491,7 +534,15 @@ def right_panel_review(
         st.rerun()
     if c2.button("Delete / Not a door", use_container_width=True):
         working["deleted_ids"].add(did)
-        working["confirmed_ids"].discard(did)
+        try:
+            cbt = working.get("confirmed_by_type")
+            if isinstance(cbt, dict):
+                for t in DOOR_TYPES:
+                    ids = cbt.get(t)
+                    if isinstance(ids, set):
+                        ids.discard(did)
+        except Exception:
+            pass
         if is_editing:
             try:
                 fstate["_edit_manual_confirmed_ids"].discard(did)
@@ -519,7 +570,7 @@ def right_panel_review(
     # Show stats for the currently active label state (draft while editing).
     st.write(
         f"**Stats:** "
-        f"{len(working.get('confirmed_ids', set()))} confirmed, "
+        f"{len(flatten_confirmed_ids(working.get('confirmed_by_type', {})))} confirmed, "
         f"{len(working.get('deleted_ids', set()))} deleted, "
         f"{len(working.get('manual_additions', []))} manual-added, "
         f"{len(working.get('unmatched_manual_boxes', []))} unmatched"
@@ -530,11 +581,11 @@ def right_panel_review(
         st.subheader("Edit Doors")
 
     # Train badge
-    total_overrides = len(working.get("confirmed_ids", set())) + len(working.get("deleted_ids", set()))
+    total_overrides = len(flatten_confirmed_ids(working.get("confirmed_by_type", {}))) + len(working.get("deleted_ids", set()))
     if (not is_editing) and total_overrides >= 5:
         if st.button("Train Model", use_container_width=True):
             with st.spinner("Training..."):
-                fit_reweighter(Path("artifacts"), Path("models/reweighter_v1.json"))
+                fit_reweighter(Path("artifacts"), Path("models"))
                 st.success("Model updated!")
                 st.cache_data.clear()
                 st.rerun()

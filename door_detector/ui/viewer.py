@@ -17,7 +17,7 @@ import streamlit.components.v1 as components
 from PIL import Image
 
 from door_detector.ui.assets import sidebar_autopen_component_html
-from door_detector.ui.labels import get_working_label_state as _get_working_label_state
+from door_detector.ui.labels import flatten_confirmed_ids, get_working_label_state as _get_working_label_state
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -1753,7 +1753,7 @@ def main_viewer_canvas(
             )
             st.session_state[door_state_sink_label] = json.dumps(
                 {
-                    "confirmed_ids": sorted(list(working.get("confirmed_ids", set()))),
+                    "confirmed_ids": sorted(list(flatten_confirmed_ids(working.get("confirmed_by_type", {})))),
                     "deleted_ids": sorted(list(working.get("deleted_ids", set()))),
                 },
                 separators=(",", ":"),
