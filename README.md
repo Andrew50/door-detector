@@ -49,14 +49,11 @@ Door Detector supports a multi-step pipeline with feedback-driven improvement, a
 ./venv/bin/streamlit run door_detector/review_app.py
 ```
 
-The UI is organized into three tabs:
+The UI is a single-page app with a sidebar library and a main viewer + review panel:
 
-- **🚀 Run Pipeline**: Upload PDFs, select page index, and run the full Step 1 (normalization) and Step 2 (detection) process.
-- **🔍 Review Detections**: Navigate through detections, cycle through doors, and provide feedback:
-    - **Accept/Reject**: Mark model predictions as true or false positives.
-    - **Add Missed Doors**: Use the drawing tool to mark false negatives (missed doors).
-    - **Save Labels**: Feedback is saved to `labels.json` in the artifact directory.
-- **🧠 Train Reweighter**: Train a logistic regression model on your saved labels to improve future detection confidence.
+- **Upload & run**: Upload PDFs to the library and run the pipeline (Step 1 + Step 2).
+- **Review**: Inspect detections, accept/reject, and add missed doors via rectangle drawing; feedback is saved to `labels.json`.
+- **Train**: Trigger reweighter training from your accumulated labels.
 
 ### 2. Command Line Usage (Optional)
 

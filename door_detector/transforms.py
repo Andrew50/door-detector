@@ -13,8 +13,11 @@ def get_render_matrix(page: fitz.Page, dpi: int) -> fitz.Matrix:
     transformed via `compute_transform()` align with `page.png`.
     """
     scale = dpi / 72.0
-    rotation_deg = int(page.rotation) % 360
-    return fitz.Matrix(scale, scale).prerotate(rotation_deg)
+    # IMPORTANT:
+    # In PyMuPDF, `page.get_pixmap()` already accounts for `page.rotation` as part
+    # of the page geometry. Applying an additional prerotate here can double-apply
+    # rotation (e.g. 90° → 180°), causing transform/pixmap mismatches.
+    return fitz.Matrix(scale, scale)
 
 
 def compute_transform(
@@ -35,20 +38,23 @@ def compute_transform(
     scale = dpi / 72.0
     rotation_deg = int(page.rotation) % 360
 
-    # PyMuPDF rasterizes using a render matrix (scale + optional rotation). To
-    # align vector coordinates from `page.get_drawings()` with the rendered
-    # pixmap, apply the same render matrix and then translate so the transformed
-    # page bbox starts at (0, 0). This avoids off-screen (negative) coordinates
-    # on rotated pages.
+    # PyMuPDF rasterizes using a render matrix. In our setup the rendered pixmap
+    # dimensions match the rotated page geometry automatically, so mapping
+    # `page.get_drawings()` coordinates into pixel space is a simple scale (no
+    # additional prerotate here). We still translate so the transformed bbox
+    # starts at (0, 0).
     cropbox = page.cropbox
     mediabox = page.mediabox
     page_rect = page.rect
 
-    # Same matrix used in `render_page(...)`.
-    base = get_render_matrix(page, dpi)
+    # IMPORTANT:
+    # `page.get_pixmap(matrix=Matrix(scale,scale))` produces an image that reflects
+    # `page.rotation` automatically, but `page.get_drawings()` coordinates are in
+    # the *unrotated* page coordinate space. To map drawings into the rendered
+    # pixel space, we must explicitly apply the page rotation here.
+    base = fitz.Matrix(scale, scale).prerotate(rotation_deg)
 
-    # `page.get_drawings()` coordinates are in the unrotated page space (cropbox).
-    # Compute the transformed bbox of that space and shift into a 0-based pixmap.
+    # Compute the transformed bbox and shift into a 0-based pixmap.
     bbox = cropbox * base
     shift_x = -float(bbox.x0)
     shift_y = -float(bbox.y0)

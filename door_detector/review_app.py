@@ -15,6 +15,8 @@ import streamlit.components.v1 as components
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
+from door_detector.analysis_signature import compute_analysis_signature
+
 def _patch_streamlit_drawable_canvas_image_to_url() -> None:
     """Compatibility shim for streamlit-drawable-canvas.
 
@@ -325,6 +327,35 @@ st.markdown("""
         margin: 0 !important;
         padding: 0 !important;
     }
+
+    /* Selected door details */
+    .door_detector-door-meta {
+        display: flex;
+        align-items: baseline;
+        gap: 16px; /* spacing between items (no pipe separators) */
+        padding: 6px 2px;
+    }
+    .door_detector-door-meta-item {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 6px;
+    }
+    .door_detector-door-meta-label {
+        font-size: 13px;
+        font-weight: 650;
+        opacity: 0.8;
+    }
+    .door_detector-door-meta-type {
+        font-size: 22px;
+        font-weight: 800;
+        letter-spacing: 0.2px;
+        text-transform: capitalize;
+    }
+    .door_detector-door-meta-confidence {
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: 0.2px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -349,101 +380,6 @@ VIEWER_ASPECT_RATIO_HW = 0.75  # height/width
 lib = st.session_state.library
 
 # --- Session State Helpers ---
-def _affine_apply(aff: Any, x: float, y: float) -> Tuple[float, float]:
-    a, b, c, d, e, f = [float(v) for v in aff]
-    px = a * x + c * y + e
-    py = b * x + d * y + f
-    return px, py
-
-
-def _invert_affine(aff: Any) -> Optional[List[float]]:
-    """Invert [a,b,c,d,e,f] where x' = a*x + c*y + e; y' = b*x + d*y + f."""
-    try:
-        a, b, c, d, e, f = [float(v) for v in aff]
-    except Exception:
-        return None
-    det = a * d - b * c
-    if abs(det) < 1e-12:
-        return None
-    return [
-        d / det,
-        -b / det,
-        -c / det,
-        a / det,
-        (c * f - d * e) / det,
-        (b * e - a * f) / det,
-    ]
-
-
-def _infer_bbox_origin_shift_from_transform(
-    meta_data: Dict[str, Any], transform_data: Dict[str, Any]
-) -> Optional[Tuple[float, float]]:
-    """
-    Infer a (dx, dy) shift that makes the transformed page bbox start at (0, 0).
-
-    This repairs older/buggy transforms where rotation+scale are correct but the
-    translation is off (common on rotated PDFs), yielding negative bboxes.
-    """
-    try:
-        full_w = float(meta_data.get("pix_width", 0))
-        full_h = float(meta_data.get("pix_height", 0))
-        if full_w <= 0 or full_h <= 0:
-            return None
-    except Exception:
-        return None
-
-    page_rect = meta_data.get("page_rect") or transform_data.get("page_rect")
-    aff = transform_data.get("pdf_to_pix_affine")
-    if not isinstance(page_rect, dict) or not isinstance(aff, list) or len(aff) != 6:
-        return None
-
-    try:
-        x0 = float(page_rect["x0"])
-        y0 = float(page_rect["y0"])
-        x1 = float(page_rect["x1"])
-        y1 = float(page_rect["y1"])
-    except Exception:
-        return None
-
-    corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
-    pts = [_affine_apply(aff, x, y) for x, y in corners]
-    min_x = min(p[0] for p in pts)
-    min_y = min(p[1] for p in pts)
-    max_x = max(p[0] for p in pts)
-    max_y = max(p[1] for p in pts)
-    w = max_x - min_x
-    h = max_y - min_y
-
-    # If the transformed page bbox doesn't match the raster dimensions, don't guess.
-    tol = 8.0  # pixels (float math + rounding tolerance)
-    if abs(w - full_w) > tol or abs(h - full_h) > tol:
-        return None
-
-    dx = -min_x
-    dy = -min_y
-    if abs(dx) < 1e-6:
-        dx = 0.0
-    if abs(dy) < 1e-6:
-        dy = 0.0
-
-    return (dx, dy)
-
-
-def _count_offscreen_doors(doors: List[Dict[str, Any]], *, w: float, h: float) -> int:
-    off = 0
-    for d in doors:
-        bbox = d.get("bbox_xyxy")
-        try:
-            x0, y0, x1, y1 = [float(v) for v in bbox]
-        except Exception:
-            continue
-        x0, x1 = (x0, x1) if x0 <= x1 else (x1, x0)
-        y0, y1 = (y0, y1) if y0 <= y1 else (y1, y0)
-        if x1 < 0 or y1 < 0 or x0 > w or y0 > h:
-            off += 1
-    return off
-
-
 def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
     if "files" not in st.session_state:
         st.session_state.files = {}
@@ -465,7 +401,6 @@ def load_file_artifacts(file_dir_str: str):
     doors_path = file_dir / "doors.json"
     labels_path = file_dir / "labels.json"
     meta_path = file_dir / "meta.json"
-    transform_path = file_dir / "transform.json"
     
     doors_data = {}
     if doors_path.exists():
@@ -486,76 +421,6 @@ def load_file_artifacts(file_dir_str: str):
     if meta_path.exists():
         with open(meta_path) as f:
             meta_data = json.load(f)
-
-    transform_data = {}
-    if transform_path.exists():
-        try:
-            with open(transform_path) as f:
-                transform_data = json.load(f)
-        except Exception:
-            transform_data = {}
-
-    # Repair common transform issues so bboxes align to (0,0)-(pix_width,pix_height).
-    #
-    # Background:
-    # - Older artifacts stored bboxes in a pixel space that effectively applied a rotated
-    #   PDF→pix affine. In our pipeline, vector primitives from PyMuPDF are in cropbox
-    #   coordinates, so the "correct" pixel space for visualization is simply:
-    #     pix = pdf * scale  (no extra rotation terms).
-    # - For those older artifacts, we can reproject:
-    #     old_pix -> pdf (via inverse affine) -> correct_pix (via scale).
-    try:
-        if isinstance(doors_data.get("doors"), list) and transform_data:
-            doors_list = doors_data["doors"]
-            full_w = float(meta_data.get("pix_width", 0) or 0)
-            full_h = float(meta_data.get("pix_height", 0) or 0)
-
-            aff = transform_data.get("pdf_to_pix_affine")
-            inv = _invert_affine(aff) if aff is not None else None
-            scale = float(transform_data.get("scale", 1.0) or 1.0)
-
-            did_reproject = False
-            if isinstance(aff, list) and len(aff) == 6 and inv and scale > 0:
-                # If the affine includes rotation/shear terms, it's a strong signal of a legacy
-                # (misaligned) artifact. Reproject to the canonical cropbox-pixel space.
-                a, b, c, d, e, f = [float(v) for v in aff]
-                needs_reproject = (abs(b) > 1e-6) or (abs(c) > 1e-6)
-                if needs_reproject:
-                    for door in doors_list:
-                        bbox = door.get("bbox_xyxy")
-                        try:
-                            x0, y0, x1, y1 = [float(v) for v in bbox]
-                        except Exception:
-                            continue
-
-                        # Transform both corners back to PDF(cropbox) coords, then rescale.
-                        px0, py0 = _affine_apply(inv, x0, y0)
-                        px1, py1 = _affine_apply(inv, x1, y1)
-                        door["bbox_xyxy"] = [px0 * scale, py0 * scale, px1 * scale, py1 * scale]
-
-                    did_reproject = True
-
-            # If we didn't reproject, fall back to a pure origin shift if it looks like just
-            # a translation issue.
-            if not did_reproject and full_w > 0 and full_h > 0:
-                dx_dy = _infer_bbox_origin_shift_from_transform(meta_data, transform_data)
-                if dx_dy:
-                    dx, dy = dx_dy
-                    if dx != 0.0 or dy != 0.0:
-                        for door in doors_list:
-                            bbox = door.get("bbox_xyxy")
-                            try:
-                                x0, y0, x1, y1 = [float(v) for v in bbox]
-                            except Exception:
-                                continue
-                            door["bbox_xyxy"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
-
-            pre_off = _count_offscreen_doors(doors_list, w=full_w, h=full_h) if (full_w > 0 and full_h > 0) else 0
-            if did_reproject:
-                doors_data["_bbox_transform_fix"] = {"mode": "reproject_inv_affine_rescale"}
-                logger.info("Reprojected door bboxes for %s (remaining offscreen=%d)", file_dir_str, pre_off)
-    except Exception as e:
-        logger.info("BBox origin shift repair skipped for %s (%s)", file_dir_str, e)
 
     return doors_data, labels_data, meta_data
 
@@ -666,16 +531,7 @@ def save_labels(dir_path: Path, labels_data: Dict[str, Any]):
 
 def get_current_signature(config_path: str):
     try:
-        with open(config_path, "rb") as f:
-            config_bytes = f.read()
-        config = json.loads(config_bytes)
-        sig_content = config_bytes
-        if "reweighter_path" in config:
-            re_path = Path(config["reweighter_path"])
-            if re_path.exists():
-                with open(re_path, "rb") as f:
-                    sig_content += b"|" + f.read()
-        return hashlib.sha256(sig_content).hexdigest()
+        return compute_analysis_signature(Path(config_path))
     except Exception:
         return None
 
@@ -1387,6 +1243,11 @@ def right_panel_review(
         delta = -1 if prev_clicked else 1
         idx = door_ids.index(current_id)
         current_id = door_ids[(idx + delta) % len(door_ids)]
+        # Force a rerun so the main viewer (rendered earlier in the script) picks up
+        # the updated selection and highlights the same door as the crop panel.
+        st.session_state[jump_key] = current_id
+        fstate["selected_door_id"] = current_id
+        st.rerun()
 
     # Must happen before the selectbox is instantiated.
     if st.session_state.get(jump_key) != current_id:
@@ -1412,8 +1273,29 @@ def right_panel_review(
     # Details of selected
     selected_door = all_visible[selected_idx]
     did = selected_door["id"]
-    
-    st.write(f"**ID:** `{did}` | **Type:** {selected_door['type']} | **Conf:** {selected_door['confidence']:.3f}")
+    door_type = html.escape(str(selected_door.get("type", "")))
+    try:
+        conf = float(selected_door.get("confidence", 0.0) or 0.0)
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    conf_pct = int(round(conf * 100))
+
+    st.markdown(
+        f"""
+<div class="door_detector-door-meta">
+  <div class="door_detector-door-meta-item">
+    <span class="door_detector-door-meta-label">Type</span>
+    <span class="door_detector-door-meta-type">{door_type}</span>
+  </div>
+  <div class="door_detector-door-meta-item">
+    <span class="door_detector-door-meta-label">Confidence</span>
+    <span class="door_detector-door-meta-confidence">{conf_pct}%</span>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
     
     # Zoom
     if preview_spec:
@@ -1471,7 +1353,9 @@ def right_panel_review(
         st.rerun()
     if c3.button("Skip", use_container_width=True):
         if selected_idx < len(all_visible) - 1:
-            fstate["selected_door_id"] = all_visible[selected_idx + 1]["id"]
+            next_id = all_visible[selected_idx + 1]["id"]
+            fstate["selected_door_id"] = next_id
+            st.session_state[jump_key] = next_id
             st.rerun()
 
     st.divider()
@@ -1490,20 +1374,32 @@ def right_panel_review(
 def run_pipeline(file_id: str, file_dir: Path, config_path: str):
     lib.update_status(file_id, "processing")
     try:
-        # If Step 1 artifacts already exist (common for imported folders),
-        # don't require `source.pdf` — just run Step 2.
+        # IMPORTANT:
+        # Step 2 relies on Step 1's coordinate system. If `source.pdf` is present,
+        # always rerun Step 1 to guarantee `page.png` + `primitives.json` match the
+        # current transform logic (especially important after transform fixes).
         primitives_path = file_dir / "primitives.json"
         meta_path = file_dir / "meta.json"
         image_path = file_dir / "page.png"
+        pdf_path = file_dir / "source.pdf"
 
         has_step1_artifacts = primitives_path.exists() and meta_path.exists() and image_path.exists()
-        if not has_step1_artifacts:
-            pdf_path = file_dir / "source.pdf"
+        can_run_step1 = pdf_path.exists()
+
+        if can_run_step1:
             process_pdf(pdf_path, file_dir, dpi=400, page_index=0)
+        elif not has_step1_artifacts:
+            raise FileNotFoundError(
+                f"Missing Step 1 artifacts in {file_dir} and no source.pdf found; cannot rerun Step 1."
+            )
 
         run_step2(file_dir, Path(config_path))
         lib.update_status(file_id, "done")
         st.cache_data.clear()
+        try:
+            st.cache_resource.clear()
+        except Exception:
+            pass
     except Exception as e:
         lib.update_status(file_id, "error", str(e))
 
