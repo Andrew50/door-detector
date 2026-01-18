@@ -23,7 +23,7 @@ Step 2 writes both fields here:
 
 ---
 
-## Detection pipeline (Step 2): propose → score → NMS
+## Detection pipeline (Step 2): propose → score → (optional reweight) → select → NMS
 
 All door detection happens in:
 
@@ -58,7 +58,11 @@ Each candidate gets a heuristic confidence composed from sub-scores:
 
 These weights come from config (`swing.scoring` in `configs/door_rules.json`).
 
-### 3) Split into two outputs
+In `doors.json`, this score is preserved as `heuristic_confidence`.
+The active `confidence` field is what the system uses for ranking and thresholding.
+Without a learned model, `confidence == heuristic_confidence`.
+
+### 3) Outputs: `candidates` + `doors`
 
 `detect_doors()` builds:
 
@@ -68,19 +72,34 @@ These weights come from config (`swing.scoring` in `configs/door_rules.json`).
   - sorted and capped (to keep `doors.json` manageable)
 
 - `doors` (**final predictions**):
-  - strict geometry gates
-  - must also pass `output.min_confidence`
+  - selected from a scored candidate set
+  - keep/drop threshold is applied **after** optional reweighting
   - then NMS (IoU-based) is applied to produce the final list
+
+Selection logic:
+
+- If a reweighter model exists (`reweighter_path` points to a file):
+  - final `doors` are selected from the **broad** `candidates` pool.
+- If no model exists:
+  - final `doors` fall back to a conservative strict set.
+
+Decision/tuning knobs live in `configs/door_rules.json`:
+
+- `output.min_candidate_confidence`: pre-filter on `heuristic_confidence` (controls candidate volume)
+- `output.min_confidence_after_reweight`: final keep/drop threshold on `confidence`
+- `output.max_candidates_before_nms`: safety cap before NMS
+- `output.nms_iou`, `output.max_doors`: final suppression/cap
 
 ### 4) Apply the learned reweighter (optional)
 
 If `configs/door_rules.json` includes `reweighter_path` and the model file exists,
-`detect_doors()` applies the reweighter to **both**:
+`detect_doors()` applies the reweighter to both:
 
-- the final strict list (`doors`)
-- the broader pool (`candidates`)
+- the strict set (used as a conservative fallback)
+- the broader pool (`candidates`) used for snapping/training and (when reweighted) final selection
 
 The reweighter replaces each candidate’s `confidence` with a logistic-regression probability computed from its feature vector.
+That probability is then used for **final keep/drop** via `output.min_confidence_after_reweight`.
 
 This is implemented in:
 
@@ -97,7 +116,8 @@ These determine **which candidates exist at all**.
 - **Config-driven thresholds**: `configs/door_rules.json`
   - `swing.arc.*` (radius, angle, RMSE, cluster suppression settings)
   - `swing.leaf.*` (len ratio, hinge distance, radial/tip constraints)
-  - `output.min_confidence`, `output.nms_iou`, `output.max_doors`
+  - `output.min_candidate_confidence`, `output.min_confidence_after_reweight`, `output.nms_iou`, `output.max_doors`
+  - (`output.min_confidence` is retained as a legacy fallback/default)
 
 - **Hardcoded pool looseness**: `door_detector/doors/detect.py`
   - “pool_*” thresholds expand the set of candidates exported in `doors.json["candidates"]`
@@ -105,8 +125,8 @@ These determine **which candidates exist at all**.
 
 ### Learned reweighter
 
-This only changes candidate `confidence` (ranking), based on a feature vector.
-It does not change geometry or create new candidates.
+This changes candidate `confidence` based on a feature vector.
+It does not change geometry or create new candidates, but it **can** change the final keep/drop decision because the threshold is applied after reweighting.
 
 ---
 
@@ -184,20 +204,22 @@ Training samples:
 
 Feature vector:
 
-- The trainer uses a fixed feature list (currently): `rmse`, `radius`, `angle_span`, `hinge_dist`, `len_ratio`
+- The trainer uses a fixed feature list (currently):
+  `rmse`, `radius`, `angle_span`, `hinge_dist`, `len_ratio`, `center_dist`, `radial_angle_deg`, `tip_to_arc_dist`
 - It reads features from `doors.json["candidates"]` (fallback to `doors.json["doors"]`)
 
 Model:
 
 - standardize features (mean/std)
-- logistic regression with gradient descent
+- logistic regression with conservative training (warm start + regularization toward prior + minimum-data gating)
 - writes `models/reweighter_v1.json` (weights + scaler + bias)
 
 ---
 
 ## Known limitations / tuning notes
 
-- **Candidate ids stability**: ids are currently derived from primitive indices (Bezier index + line index). If the primitive ordering changes, ids can drift across reruns.
+- **Candidate id stability**: ids are derived from quantized geometry (not primitive indices), so reruns are stable under primitive reordering.
+  (In the unlikely case of truly identical geometry candidates, ids may collide—those are effectively duplicates for labeling.)
 - **Pool thresholds are hardcoded**: the “looser pool” constraints live in `door_detector/doors/detect.py` today. If you need them tunable per deployment, move them into config.
-- **Reweighter scope**: it can only rescore candidates that exist (and only uses a small feature set unless expanded).
+- **Reweighter scope**: it can only score candidates that exist; it cannot create new candidates.
 

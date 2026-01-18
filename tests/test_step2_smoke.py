@@ -64,6 +64,13 @@ def test_step2_smoke() -> None:
         assert "candidates" in data
         assert isinstance(data["doors"], list)
         assert isinstance(data["candidates"], list)
+        # Candidates must contain enough structure for snapping + training.
+        if data["candidates"]:
+            c0 = data["candidates"][0]
+            assert "id" in c0
+            assert "bbox_xyxy" in c0
+            assert "confidence" in c0
+            assert "features" in c0
         # This PDF is constructed to satisfy the strict swing-door thresholds.
         assert len(data["doors"]) >= 1
 

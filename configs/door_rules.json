@@ -1,11 +1,16 @@
 {
   "schema_version": 1,
+  "reweighter_path": "models/reweighter_v1.json",
   "mode_policy": {
     "vector": "vector_rules",
     "hybrid": "vector_rules",
     "scan": "empty_with_message"
   },
   "output": {
+    "min_candidate_confidence": 0.0,
+    "min_confidence_after_reweight": 0.55,
+    "max_candidates_before_nms": 2000,
+    "max_candidates": 5000,
     "min_confidence": 0.55,
     "nms_iou": 0.35,
     "max_doors": 500

@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -42,27 +42,78 @@ class SpatialIndex:
         return list(results)
 
 
+def _q(v: float, *, step: float) -> int:
+    """Quantize a float deterministically to an integer bin."""
+    if step <= 0:
+        step = 1.0
+    try:
+        return int(round(float(v) / float(step)))
+    except Exception:
+        return 0
+
+
+def _stable_swing_candidate_id(
+    *,
+    center: Tuple[float, float],
+    radius: float,
+    angle_span: float,
+    arc_start: Tuple[float, float],
+    arc_end: Tuple[float, float],
+    hinge_pt: Tuple[float, float],
+    tip_pt: Tuple[float, float],
+    bbox_xyxy: List[float],
+    quant_step_px: float = 1.0,
+) -> str:
+    """Return a stable candidate id derived from quantized geometry (not indices)."""
+    # Canonicalize arc endpoints so reversing curve direction doesn't change the id.
+    a0 = (_q(arc_start[0], step=quant_step_px), _q(arc_start[1], step=quant_step_px))
+    a1 = (_q(arc_end[0], step=quant_step_px), _q(arc_end[1], step=quant_step_px))
+    if a1 < a0:
+        a0, a1 = a1, a0
+
+    payload = {
+        "id_version": "swing_geom_v1",
+        "type": "swing",
+        "center": (_q(center[0], step=quant_step_px), _q(center[1], step=quant_step_px)),
+        "radius": _q(radius, step=quant_step_px),
+        "angle_span": _q(angle_span, step=1.0),
+        "arc_endpoints": (a0, a1),
+        "hinge": (_q(hinge_pt[0], step=quant_step_px), _q(hinge_pt[1], step=quant_step_px)),
+        "tip": (_q(tip_pt[0], step=quant_step_px), _q(tip_pt[1], step=quant_step_px)),
+        "bbox": tuple(_q(float(v), step=quant_step_px) for v in (bbox_xyxy or [0, 0, 0, 0])),
+    }
+    stable = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "d_" + hashlib.sha1(stable).hexdigest()[:12]
+
+
 def apply_reweighter(candidates: List[Dict[str, Any]], model_path: str) -> List[Dict[str, Any]]:
     """Apply a learned reweighter to update candidate confidence scores."""
     try:
         with open(model_path) as f:
             model = json.load(f)
 
-        weights = np.array(model["weights"])
-        bias = model["bias"]
-        feature_order = model["feature_order"]
-        scaler = model["scaler"]
+        weights = np.array(model["weights"], dtype=float)
+        bias = float(model["bias"])
+        feature_order = list(model["feature_order"])
+        scaler = dict(model["scaler"])
 
-        means = np.array(scaler["mean"])
-        stds = np.array(scaler["std"])
+        means = np.array(scaler["mean"], dtype=float)
+        stds = np.array(scaler["std"], dtype=float)
+
+        if weights.ndim != 1:
+            raise ValueError("invalid model weights shape")
+        if len(feature_order) != int(weights.shape[0]):
+            raise ValueError("feature_order length does not match weights")
+        if means.shape != weights.shape or stds.shape != weights.shape:
+            raise ValueError("scaler mean/std shapes do not match weights")
 
         for cand in candidates:
             x = []
             for feat_name in feature_order:
-                val = cand["features"].get(feat_name, 0.0)
+                val = (cand.get("features") or {}).get(feat_name, 0.0)
                 x.append(val)
 
-            x = np.array(x)
+            x = np.array(x, dtype=float)
             x_scaled = (x - means) / (stds + 1e-8)
 
             z = np.dot(x_scaled, weights) + bias
@@ -96,8 +147,8 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
         line_index.add(i, bbox)
 
     # Two pools:
-    # - `doors`: strict, post-threshold/post-NMS list (what the model “predicts”)
-    # - `candidates`: broader pool for snapping/training (looser leaf len_ratio only)
+    # - `strict_candidates`: conservative baseline for final output when no reweighter exists
+    # - `candidate_pool`: broader pool for snapping/training and (when reweighted) final selection
     strict_candidates: List[Dict[str, Any]] = []
     candidate_pool: List[Dict[str, Any]] = []
     arc_cluster_counts: Dict[Tuple[int, int, int], int] = {}
@@ -106,7 +157,7 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     if config["swing"]["enabled"]:
         swing_conf = config["swing"]
         out_conf = config.get("output", {})
-        min_conf = float(out_conf.get("min_confidence", 0.55) or 0.55)
+        legacy_min_conf = float(out_conf.get("min_confidence", 0.55) or 0.55)
         # Looser leaf ratio for candidate pool (does NOT affect final doors).
         pool_min_len_ratio = 0.22
         pool_max_len_ratio = 2.20
@@ -271,13 +322,30 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
                 conf_strict = score_conf["w_fit"] * fit_score + score_conf["w_angle"] * angle_score + score_conf["w_proximity"] * prox_score_strict
                 conf_pool = score_conf["w_fit"] * fit_score + score_conf["w_angle"] * angle_score + score_conf["w_proximity"] * prox_score_pool
 
-                stable_key = f"swing|b={b_idx}|l={l_idx}"
-                door_id = "d_" + hashlib.sha1(stable_key.encode()).hexdigest()[:10]
+                # Canonicalize hinge/tip for stable IDs and consistent features.
+                # Also compute a legacy index-derived id for one-time migration of old labels.
+                legacy_key = f"swing|b={b_idx}|l={l_idx}"
+                legacy_id = "d_" + hashlib.sha1(legacy_key.encode()).hexdigest()[:10]
+                hinge_pt = p0 if d0_center <= d1_center else p1
+                tip_pt = p1 if hinge_pt == p0 else p0
+                bbox_xyxy = get_bbox(pts + [p0, p1])
+                door_id = _stable_swing_candidate_id(
+                    center=center,
+                    radius=float(radius),
+                    angle_span=float(angle_span),
+                    arc_start=tuple(arc_start),
+                    arc_end=tuple(arc_end),
+                    hinge_pt=hinge_pt,
+                    tip_pt=tip_pt,
+                    bbox_xyxy=bbox_xyxy,
+                    quant_step_px=1.0,
+                )
 
-                base = {
+                base: Dict[str, Any] = {
                     "id": door_id,
+                    "legacy_ids": [legacy_id],
                     "type": "swing",
-                    "bbox_xyxy": get_bbox(pts + [p0, p1]),
+                    "bbox_xyxy": bbox_xyxy,
                     "features": {
                         "rmse": float(rmse),
                         "radius": float(radius),
@@ -293,6 +361,7 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
                 }
 
                 cand_pool = dict(base)
+                cand_pool["heuristic_confidence"] = float(conf_pool)
                 cand_pool["confidence"] = float(conf_pool)
                 cand_pool["pool"] = True
                 candidate_pool.append(cand_pool)
@@ -304,9 +373,11 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
                     and strict_radial_ok
                     and strict_tip_ok
                 )
-                if strict_ok and float(conf_strict) >= min_conf:
+                if strict_ok:
                     cand_strict = dict(base)
+                    cand_strict["heuristic_confidence"] = float(conf_strict)
                     cand_strict["confidence"] = float(conf_strict)
+                    cand_strict["pool"] = False
                     strict_candidates.append(cand_strict)
 
     if strict_candidates and config.get("swing", {}).get("enabled") and config.get("swing", {}).get("arc", {}).get("suppress_circle_clusters", False):
@@ -340,27 +411,70 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     for cand in candidate_pool:
         cand.pop("_circle_key", None)
 
-    if "reweighter_path" in config and Path(config["reweighter_path"]).exists():
-        strict_candidates = apply_reweighter(strict_candidates, config["reweighter_path"])
-        candidate_pool = apply_reweighter(candidate_pool, config["reweighter_path"])
+    out_conf = config.get("output", {}) or {}
+    legacy_min_conf = float(out_conf.get("min_confidence", 0.55) or 0.55)
+    min_candidate_conf = float(out_conf.get("min_candidate_confidence", 0.0) or 0.0)
+    min_keep_conf = float(out_conf.get("min_confidence_after_reweight", legacy_min_conf) or legacy_min_conf)
+    max_candidates_out = int(out_conf.get("max_candidates", 5000) or 5000)
+    max_candidates_before_nms = out_conf.get("max_candidates_before_nms", None)
+    try:
+        max_candidates_before_nms_int: Optional[int] = int(max_candidates_before_nms) if max_candidates_before_nms is not None else None
+    except Exception:
+        max_candidates_before_nms_int = None
 
-    if not strict_candidates:
-        candidate_pool.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
-        return {"doors": [], "candidates": candidate_pool[:5000]}
+    nms_iou = float(out_conf.get("nms_iou", 0.35) or 0.35)
+    max_doors = int(out_conf.get("max_doors", 500) or 500)
 
-    strict_candidates.sort(key=lambda x: x["confidence"], reverse=True)
+    model_path = config.get("reweighter_path")
+    has_model = isinstance(model_path, str) and bool(model_path) and Path(model_path).exists()
+    if has_model:
+        strict_candidates = apply_reweighter(strict_candidates, model_path)
+        candidate_pool = apply_reweighter(candidate_pool, model_path)
 
-    keep = []
-    nms_iou = config["output"]["nms_iou"]
-    for cand in strict_candidates:
+    # Always export candidates (for snapping/training), sorted by current confidence.
+    candidate_pool.sort(key=lambda x: float(x.get("confidence", 0.0) or 0.0), reverse=True)
+    exported_candidates = candidate_pool[: max(0, max_candidates_out)]
+
+    # Final selection:
+    # - If a model exists, select from the broad pool (post-reweight decisioning).
+    # - Otherwise, keep the conservative strict selection behavior.
+    selection_src = candidate_pool if has_model else strict_candidates
+    if not selection_src:
+        return {"doors": [], "candidates": exported_candidates}
+
+    # Pre-filter using the heuristic score (candidate volume control).
+    filtered = [
+        c
+        for c in selection_src
+        if float(c.get("heuristic_confidence", c.get("confidence", 0.0)) or 0.0) >= min_candidate_conf
+    ]
+    if not filtered:
+        return {"doors": [], "candidates": exported_candidates}
+
+    filtered.sort(key=lambda x: float(x.get("confidence", 0.0) or 0.0), reverse=True)
+    if isinstance(max_candidates_before_nms_int, int) and max_candidates_before_nms_int > 0:
+        filtered = filtered[:max_candidates_before_nms_int]
+
+    # Post-reweight threshold (actual keep/drop decision).
+    kept = [c for c in filtered if float(c.get("confidence", 0.0) or 0.0) >= min_keep_conf]
+    if not kept:
+        return {"doors": [], "candidates": exported_candidates}
+
+    # NMS on kept candidates, highest confidence first.
+    final: List[Dict[str, Any]] = []
+    for cand in kept:
+        cb = cand.get("bbox_xyxy")
+        if not isinstance(cb, list) or len(cb) != 4:
+            continue
         overlap = False
-        for kept in keep:
-            if compute_iou(cand["bbox_xyxy"], kept["bbox_xyxy"]) > nms_iou:
+        for prev in final:
+            if compute_iou(cb, prev["bbox_xyxy"]) > nms_iou:
                 overlap = True
                 break
         if not overlap:
-            keep.append(cand)
+            final.append(cand)
+        if len(final) >= max_doors:
+            break
 
-    candidate_pool.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
-    return {"doors": keep[: config["output"]["max_doors"]], "candidates": candidate_pool[:5000]}
+    return {"doors": final, "candidates": exported_candidates}
 

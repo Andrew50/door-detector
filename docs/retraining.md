@@ -38,7 +38,7 @@ Per page:
 
 Global (learned parameters):
 
-- `models/reweighter_v1.json`: feature normalization + weights + threshold(s)
+- `models/reweighter_v1.json`: feature normalization + weights + bias\n+  (the deployment keep/drop threshold is configured in `configs/door_rules.json`, not stored in the model)
 
 ## Core idea: separate “propose” from “score”
 
@@ -203,27 +203,31 @@ Store learned parameters in JSON:
 
 ```json
 {
-  "schema_version": 1,
-  "model_type": "logreg_l2",
+  "schema_version": 2,
+  "model_type": "logreg",
   "feature_order": [
-    "arc_angle_deg",
-    "arc_radius_norm",
-    "arc_fit_error",
-    "leaf_length_norm",
-    "hinge_gap_norm",
-    "stroke_width_ratio",
-    "local_line_density"
+    "rmse",
+    "radius",
+    "angle_span",
+    "hinge_dist",
+    "len_ratio",
+    "center_dist",
+    "radial_angle_deg",
+    "tip_to_arc_dist"
   ],
   "scaler": {
     "type": "zscore",
-    "mean": [90.1, 8.2, 0.02, 7.9, 0.3, 1.01, 0.28],
-    "std":  [12.7, 2.1, 0.01, 1.9, 0.2, 0.08, 0.10]
+    "mean": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "std":  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
   },
-  "weights": [1.2, 0.9, -2.5, 0.7, -1.0, 0.4, -0.8],
-  "bias": -0.3,
-  "decision_threshold": 0.65
+  "weights": [0.1, 0.2, 0.3, -0.1, 0.4, -0.2, -0.3, -0.1],
+  "bias": -0.3
 }
 ```
+
+Thresholding is intentionally configured separately, via:
+
+- `configs/door_rules.json` → `output.min_confidence_after_reweight`
 
 ## Implementation checklist (what code you’d write)
 
@@ -234,7 +238,7 @@ Store learned parameters in JSON:
   - generate candidates
   - compute features
   - score with the reweighter (if present)
-  - apply threshold → final doors
+  - apply post-reweight threshold → final doors
 - Write `doors.json` and `doors_overlay.png`
 
 ### Review UI
@@ -256,10 +260,14 @@ Given a folder of reviewed artifacts:
 - Build a dataset:
   - positives = accepted predictions
   - negatives = rejected predictions
-- Fit model weights
-- Choose threshold to hit a target:
-  - e.g., “maximize F1” or “precision ≥ 0.9”
+- Fit model weights (warm-started + regularized toward the prior for stability on small data)
+- Apply minimum-data gating (don’t write a new model unless both classes exist and there is enough labeled data)
 - Save `models/reweighter_v1.json`
+
+Deployment tuning (precision/recall) is controlled via `configs/door_rules.json`:
+
+- `output.min_candidate_confidence` (candidate volume)
+- `output.min_confidence_after_reweight` (final keep/drop threshold)
 
 ## Why this option is often best in a short take-home
 
