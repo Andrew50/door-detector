@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -59,9 +60,46 @@ st.set_page_config(page_title="Door Detector: Door Detection & Review", layout="
 # --- UI Styling ---
 st.markdown("""
 <style>
+    /* Hide Streamlit chrome (cosmetic only; not a security boundary) */
+    header { display: none !important; }
+    [data-testid="stHeader"] { display: none !important; }
+    [data-testid="stToolbar"] { display: none !important; }
+    #MainMenu { display: none !important; }
+    footer { display: none !important; }
+    [data-testid="stDeployButton"] { display: none !important; }
+
+    /* Remove Streamlit's default huge bottom spacing in main area */
+    html body section.stMain {
+        padding-bottom: 0rem !important;
+        margin-bottom: 0rem !important;
+    }
+    html body section.stMain > div {
+        padding-bottom: 0rem !important;
+        margin-bottom: 0rem !important;
+    }
+    html body section.stMain .block-container {
+        padding-bottom: 0rem !important;
+        margin-bottom: 0rem !important;
+    }
+    /* Some Streamlit versions include an empty bottom container */
+    [data-testid="stBottomBlockContainer"] { display: none !important; }
+
     /* Pull main content to the top (align with sidebar header) */
     [data-testid="stAppViewContainer"] .main .block-container {
         padding-top: 0rem !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+        padding-bottom: 0rem !important;
+        margin-top: 0rem !important;
+        max-width: 100% !important;
+    }
+
+    /* Streamlit sometimes targets this container directly; keep it tight. */
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 0rem !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+        padding-bottom: 0rem !important;
         margin-top: 0rem !important;
     }
     [data-testid="stAppViewContainer"] .main h1, 
@@ -255,6 +293,10 @@ if "search_visible" not in st.session_state:
 if "search_query" not in st.session_state:
     st.session_state.search_query = ""
 
+if "viewer_height" not in st.session_state:
+    # Larger default to better fill tall viewports (reduces "blank footer" area).
+    st.session_state.viewer_height = 1000
+
 lib = st.session_state.library
 
 # --- Session State Helpers ---
@@ -333,6 +375,16 @@ def _pil_image_to_data_url(img: Image.Image) -> str:
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
+def _normalize_bbox_xyxy(bbox: Any) -> Optional[Tuple[float, float, float, float]]:
+    """Return (x0, y0, x1, y1) with x0<=x1 and y0<=y1, or None if invalid."""
+    try:
+        x0, y0, x1, y1 = [float(v) for v in bbox]
+    except Exception:
+        return None
+    if not (math.isfinite(x0) and math.isfinite(y0) and math.isfinite(x1) and math.isfinite(y1)):
+        return None
+    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
 def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
     data_url = _pil_image_to_data_url(img)
     # This viewer provides:
@@ -341,7 +393,45 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
     # - initial fit-to-container with letterboxing
     html = f"""
 <div id="pz_root_{key}" style="width: 100%; height: {height}px; overflow: hidden; background: #0e1117; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);">
+  <style>
+    /* Scoped to this component instance */
+    #pz_root_{key} .pz-reset {{
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 5;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      background: rgba(17, 25, 40, 0.65);
+      color: rgba(255, 255, 255, 0.92);
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+      opacity: 0;
+      transform: translateY(-4px);
+      transition: opacity 120ms ease, transform 120ms ease, border-color 120ms ease, background 120ms ease;
+      user-select: none;
+      pointer-events: none; /* enabled only when visible */
+    }}
+    #pz_root_{key} .pz-reset.pz-reset--visible {{
+      opacity: 1;
+      transform: translateY(0px);
+      pointer-events: auto;
+    }}
+    #pz_root_{key} .pz-reset:hover {{
+      background: rgba(17, 25, 40, 0.82);
+      border-color: rgba(255, 255, 255, 0.26);
+    }}
+    #pz_root_{key} .pz-reset:active {{
+      transform: translateY(0px) scale(0.98);
+    }}
+  </style>
   <div id="pz_stage_{key}" style="width: 100%; height: 100%; position: relative; user-select: none; cursor: grab; touch-action: none;">
+    <button id="pz_reset_{key}" class="pz-reset" type="button" aria-label="Reset zoom" aria-hidden="true" tabindex="-1">Reset</button>
     <img
       id="pz_img_{key}"
       src="{data_url}"
@@ -355,11 +445,17 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
   const root = document.getElementById("pz_root_{key}");
   const stage = document.getElementById("pz_stage_{key}");
   const img = document.getElementById("pz_img_{key}");
+  const resetBtn = document.getElementById("pz_reset_{key}");
   if (!root || !stage || !img) return;
 
   let scale = 1;
   let tx = 0;
   let ty = 0;
+
+  // "Original state" = initial fit-to-container transform.
+  let baseScale = 1;
+  let baseTx = 0;
+  let baseTy = 0;
 
   let dragging = false;
   let dragStartX = 0;
@@ -373,6 +469,29 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
 
   function applyTransform() {{
     img.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`;
+    updateResetVisibility();
+  }}
+
+  function isAtBase() {{
+    const eps = 0.5; // pixels for tx/ty (and ~0.5 for scale*1000 below)
+    const scaleClose = Math.abs(scale - baseScale) < 0.0005;
+    const txClose = Math.abs(tx - baseTx) < eps;
+    const tyClose = Math.abs(ty - baseTy) < eps;
+    return scaleClose && txClose && tyClose;
+  }}
+
+  function updateResetVisibility() {{
+    if (!resetBtn) return;
+    const visible = !isAtBase();
+    if (visible) {{
+      resetBtn.classList.add("pz-reset--visible");
+      resetBtn.setAttribute("aria-hidden", "false");
+      resetBtn.tabIndex = 0;
+    }} else {{
+      resetBtn.classList.remove("pz-reset--visible");
+      resetBtn.setAttribute("aria-hidden", "true");
+      resetBtn.tabIndex = -1;
+    }}
   }}
 
   function fitToContainer() {{
@@ -382,12 +501,19 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
     const ih = img.naturalHeight || img.height;
     if (!cw || !ch || !iw || !ih) return;
 
-    // Prefer fitting to height to reduce top/bottom letterboxing.
-    // This can crop horizontally on narrow containers, but works well with drag+zoom.
+    // Initial zoom should be the MAX zoom that keeps the entire image visible:
+    // fit-to-container in BOTH directions (no initial cropping on extreme aspect ratios).
     const pad = 6; // subtle breathing room against the rounded border
-    scale = Math.min(1, (ch - pad * 2) / ih);
+    const cwPad = cw - pad * 2;
+    const chPad = ch - pad * 2;
+    if (cwPad <= 0 || chPad <= 0) return;
+    scale = clamp(Math.min(cwPad / iw, chPad / ih), 0.05, 20);
     tx = (cw - iw * scale) / 2;
     ty = (ch - ih * scale) / 2;
+
+    baseScale = scale;
+    baseTx = tx;
+    baseTy = ty;
     applyTransform();
   }}
 
@@ -412,6 +538,28 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
   if (img.complete) fitToContainer();
   else img.addEventListener("load", fitToContainer, {{ once: true }});
 
+  // Keep the "original state" in sync on resize, but only if user hasn't deviated.
+  try {{
+    const ro = new ResizeObserver(() => {{
+      if (isAtBase()) fitToContainer();
+    }});
+    ro.observe(root);
+  }} catch (_) {{}}
+
+  if (resetBtn) {{
+    // Prevent pan-drag initiation when clicking the reset button.
+    resetBtn.addEventListener("pointerdown", (e) => {{
+      e.preventDefault();
+      e.stopPropagation();
+    }});
+    resetBtn.addEventListener("click", (e) => {{
+      e.preventDefault();
+      e.stopPropagation();
+      // Reset back to original fit-to-container for current container size.
+      fitToContainer();
+    }});
+  }}
+
   root.addEventListener("wheel", (e) => {{
     e.preventDefault();
     const zoomFactor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
@@ -419,6 +567,7 @@ def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
   }}, {{ passive: false }});
 
   root.addEventListener("pointerdown", (e) => {{
+    if (resetBtn && resetBtn.contains(e.target)) return;
     if (e.button !== 0) return;
     dragging = true;
     stage.style.cursor = "grabbing";
@@ -529,7 +678,7 @@ def main_viewer_canvas(item: Dict, image: Image.Image, doors_data: Dict, fstate:
                 "is_user_added": True
             })
 
-        viewer_height = 800
+        viewer_height = int(st.session_state.get("viewer_height", 1000))
         viewer_width_hint = 1200  # used only for Add Door canvas sizing
 
         # NOTE: Don't wrap this in `st.container(height=...)` because Streamlit makes that
@@ -573,7 +722,10 @@ def main_viewer_canvas(item: Dict, image: Image.Image, doors_data: Dict, fstate:
                     continue
 
                 bbox = d["bbox_xyxy"]
-                bbox_s = [int(round(x * viewer_scale)) for x in bbox]
+                nb = _normalize_bbox_xyxy(bbox)
+                if nb is None:
+                    continue
+                bbox_s = [int(round(x * viewer_scale)) for x in nb]
 
                 color = (0, 255, 0) if d["id"] in fstate["accepted"] else (255, 165, 0)
                 if d.get("is_user_added"):
@@ -601,20 +753,30 @@ def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstat
     with c1:
         status = item.get("status", "not_processed")
         if status == "processing":
-            st.button("Processing...", disabled=True, use_container_width=True)
-        else:
-            config_path = "configs/door_rules.json"
-            current_sig = get_current_signature(config_path)
-            stored_sig = doors_data.get("analysis_signature")
-            is_out_of_date = stored_sig and current_sig and stored_sig != current_sig
-            
-            label = "Rerun" if status == "done" else "Run"
-            if is_out_of_date:
-                label = f"{label} (!)"
-            
-            if st.button(label, type="primary" if not status == "done" else "secondary", use_container_width=True):
-                run_pipeline(file_id, file_dir, config_path)
-                st.rerun()
+            # Streamlit runs the pipeline synchronously; the UI won't render mid-run.
+            # So a persisted "processing" status is stale and should not block running.
+            doors_path = file_dir / "doors.json"
+            if doors_path.exists():
+                lib.update_status(file_id, "done")
+                status = "done"
+            else:
+                lib.update_status(file_id, "not_processed")
+                status = "not_processed"
+            st.cache_data.clear()
+            st.rerun()
+
+        config_path = "configs/door_rules.json"
+        current_sig = get_current_signature(config_path)
+        stored_sig = doors_data.get("analysis_signature")
+        is_out_of_date = stored_sig and current_sig and stored_sig != current_sig
+        
+        label = "Rerun" if status == "done" else "Run"
+        if is_out_of_date:
+            label = f"{label} (!)"
+        
+        if st.button(label, type="primary" if not status == "done" else "secondary", use_container_width=True):
+            run_pipeline(file_id, file_dir, config_path)
+            st.rerun()
     with c2:
         modes = ["Highlight All", "Highlight Selected", "Off", "Add Door"]
         fstate["viewer_mode"] = st.selectbox(
@@ -622,6 +784,15 @@ def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstat
             modes,
             index=modes.index(fstate["viewer_mode"]) if fstate["viewer_mode"] in modes else 0,
             label_visibility="collapsed"
+        )
+
+    with st.expander("Layout", expanded=False):
+        st.session_state.viewer_height = st.slider(
+            "Viewer height (px)",
+            min_value=600,
+            max_value=1600,
+            value=int(st.session_state.get("viewer_height", 1000)),
+            step=50,
         )
 
     c3, c4 = st.columns(2)
@@ -696,25 +867,36 @@ def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate:
         d["id"]: f"{i+1}/{len(all_visible)}  {d['type']}  {d['confidence']:.3f}  {d['id']}"
         for i, d in enumerate(all_visible)
     }
+    # Streamlit selectbox keeps its own state keyed by `key=...`.
+    # Keep that state in sync with our fstate selection so Prev/Next works.
+    jump_key = f"jump_{file_id}"
+    if jump_key not in st.session_state or st.session_state.get(jump_key) not in door_ids:
+        st.session_state[jump_key] = fstate["selected_door_id"]
     picked = st.selectbox(
         "Jump to door",
         door_ids,
         index=selected_idx,
         format_func=lambda did: id_to_label.get(did, str(did)),
         label_visibility="collapsed",
-        key=f"jump_{file_id}",
+        key=jump_key,
     )
     fstate["selected_door_id"] = picked
     selected_idx = door_ids.index(picked) if picked in door_ids else selected_idx
 
     # Prev/Next
     col_p, col_idx, col_n = st.columns([1, 2, 1])
-    if col_p.button("Prev", disabled=selected_idx <= 0, use_container_width=True):
-        fstate["selected_door_id"] = all_visible[selected_idx - 1]["id"]
+    if col_p.button("Prev", disabled=False, use_container_width=True):
+        new_idx = (selected_idx - 1) % len(all_visible)
+        new_id = all_visible[new_idx]["id"]
+        st.session_state[jump_key] = new_id
+        fstate["selected_door_id"] = new_id
         st.rerun()
     col_idx.write(f"<div style='text-align: center; line-height: 38px;'>{selected_idx + 1} / {len(all_visible)}</div>", unsafe_allow_html=True)
-    if col_n.button("Next", disabled=selected_idx >= len(all_visible) - 1, use_container_width=True):
-        fstate["selected_door_id"] = all_visible[selected_idx + 1]["id"]
+    if col_n.button("Next", disabled=False, use_container_width=True):
+        new_idx = (selected_idx + 1) % len(all_visible)
+        new_id = all_visible[new_idx]["id"]
+        st.session_state[jump_key] = new_id
+        fstate["selected_door_id"] = new_id
         st.rerun()
 
     st.divider()
@@ -728,14 +910,20 @@ def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate:
     # Zoom
     if image:
         bbox = selected_door["bbox_xyxy"]
+        nb = _normalize_bbox_xyxy(bbox)
+        if nb is None:
+            st.warning("Selected door has an invalid bbox; preview unavailable.")
+            return
+        x0, y0, x1, y1 = nb
         pad = 100
-        crop_box = (
-            max(0, bbox[0] - pad),
-            max(0, bbox[1] - pad),
-            min(image.width, bbox[2] + pad),
-            min(image.height, bbox[3] + pad)
-        )
-        st.image(image.crop(crop_box), use_container_width=True)
+        left = max(0, int(math.floor(x0 - pad)))
+        upper = max(0, int(math.floor(y0 - pad)))
+        right = min(image.width, int(math.ceil(x1 + pad)))
+        lower = min(image.height, int(math.ceil(y1 + pad)))
+        if right <= left or lower <= upper:
+            st.warning("Selected door bbox is degenerate after clamping; preview unavailable.")
+        else:
+            st.image(image.crop((left, upper, right, lower)), use_container_width=True)
 
     # Actions
     c1, c2, c3 = st.columns(3)
@@ -774,8 +962,17 @@ def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate:
 def run_pipeline(file_id: str, file_dir: Path, config_path: str):
     lib.update_status(file_id, "processing")
     try:
-        pdf_path = file_dir / "source.pdf"
-        process_pdf(pdf_path, file_dir, dpi=400, page_index=0)
+        # If Step 1 artifacts already exist (common for imported folders),
+        # don't require `source.pdf` — just run Step 2.
+        primitives_path = file_dir / "primitives.json"
+        meta_path = file_dir / "meta.json"
+        image_path = file_dir / "page.png"
+
+        has_step1_artifacts = primitives_path.exists() and meta_path.exists() and image_path.exists()
+        if not has_step1_artifacts:
+            pdf_path = file_dir / "source.pdf"
+            process_pdf(pdf_path, file_dir, dpi=400, page_index=0)
+
         run_step2(file_dir, Path(config_path))
         lib.update_status(file_id, "done")
         st.cache_data.clear()

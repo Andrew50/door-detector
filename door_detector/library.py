@@ -131,9 +131,11 @@ class Library:
                     # Set status based on what we found
                     status = "not_processed"
                     if (file_dir / "meta.json").exists() and (file_dir / "page.png").exists():
-                        status = "done"
-                        if not (file_dir / "doors.json").exists():
-                            status = "processing" # Or some intermediate state
+                        # We have at least Step 1 artifacts. Only mark "done" if doors exist.
+                        # IMPORTANT: "processing" is used by the UI to mean "job currently running",
+                        # and the app does not run jobs in the background; using it here can
+                        # permanently disable the Run button.
+                        status = "done" if (file_dir / "doors.json").exists() else "not_processed"
 
                     self.items[file_id] = {
                         "id": file_id,
