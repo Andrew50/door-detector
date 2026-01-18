@@ -13,7 +13,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 from door_detector.step1_pipeline import process_pdf
-from tests.test_step1 import test_artifacts
+from tests.test_step1 import validate_artifacts
 
 
 def _make_rotated_pdf(path: Path) -> None:
@@ -50,7 +50,7 @@ def main() -> int:
         _make_rotated_pdf(pdf_path)
         process_pdf(pdf_path=pdf_path, output_dir=out_dir, dpi=200, page_index=0, enable_debug_overlay=False)
 
-        ok, errors = test_artifacts(out_dir)
+        ok, errors = validate_artifacts(out_dir)
         if ok:
             print("✓ Rotation transform regression test passed!")
             return 0
@@ -58,6 +58,12 @@ def main() -> int:
         for e in errors:
             print(f"  - {e}")
         return 1
+
+
+def test_transform_rotation() -> None:
+    # Ensure the script-style main logic also runs under pytest.
+    rc = main()
+    assert rc == 0
 
 
 if __name__ == "__main__":

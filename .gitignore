@@ -44,3 +44,6 @@ Thumbs.db
 
 
 
+# node.js
+node_modules/
+.npm-cache/

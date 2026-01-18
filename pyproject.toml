@@ -25,5 +25,10 @@ door-detector-reweight = "door_detector.reweight_fit:main"
 where = ["."]
 include = ["door_detector*"]
 
+[tool.setuptools.package-data]
+# Bundle the built PDF.js component so `pip install -e .` and packaged installs work
+# without requiring a node build step at runtime.
+"door_detector.ui.pdfjs_component" = ["frontend/dist/**/*"]
+
 
 

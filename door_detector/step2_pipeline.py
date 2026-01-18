@@ -10,6 +10,7 @@ from PIL import Image
 from door_detector.signatures import compute_analysis_signature
 from door_detector.doors.detect import detect_doors
 from door_detector.doors.overlay import create_door_overlay
+from door_detector.pdf.affine import apply_affine_bbox_xyxy, normalize_bbox_xyxy
 
 
 def run_step2(
@@ -40,6 +41,14 @@ def run_step2(
         meta = json.load(f)
     
     image = Image.open(image_path)
+    transform = None
+    try:
+        transform_path = artifacts_dir / "transform.json"
+        if transform_path.exists():
+            with open(transform_path) as f:
+                transform = json.load(f)
+    except Exception:
+        transform = None
 
     # 3. Detect doors
     import time
@@ -48,6 +57,29 @@ def run_step2(
     doors = list(det.get("doors", []) if isinstance(det, dict) else (det or []))
     candidates = list(det.get("candidates", []) if isinstance(det, dict) else [])
     detect_ms = (time.time() - start_time) * 1000
+
+    # 3b. Add PDF-space bboxes for UI (PDF.js) and future-proofed downstream use.
+    # These are derived from the same Step1 transform used to produce page.png.
+    pix_to_pdf_affine = None
+    try:
+        if isinstance(transform, dict):
+            m = transform.get("pix_to_pdf_affine")
+            if isinstance(m, list) and len(m) == 6:
+                pix_to_pdf_affine = [float(v) for v in m]
+    except Exception:
+        pix_to_pdf_affine = None
+
+    if pix_to_pdf_affine is not None:
+        for seq in (doors, candidates):
+            for d in seq:
+                try:
+                    bb = d.get("bbox_xyxy")
+                    if not isinstance(bb, list) or len(bb) != 4:
+                        continue
+                    bb = normalize_bbox_xyxy(bb)
+                    d["bbox_pdf_xyxy"] = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
+                except Exception:
+                    continue
 
     # 4. Save doors.json
     doors_data = {

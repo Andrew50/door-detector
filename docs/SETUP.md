@@ -164,6 +164,12 @@ add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 
 If you run Streamlit directly with `streamlit run ...` and **no** proxy, there isn’t a supported way (in Streamlit today) to change the component iframe `allow` list or suppress Chromium’s warnings from inside the app. In that case, these warnings are generally safe to ignore.
 
+## PDF.js viewer build (optional)
+
+The review UI uses a bundled **PDF.js** Streamlit component for a crisp, zoomable viewer.
+
+- **If you are just running the app** from this repo: the built component assets are already included; you do **not** need Node.\n+- **If you edit the viewer frontend** (TypeScript/React): rebuild it with Node.\n+\n+Build steps:\n+\n+```bash\n+cd door_detector/ui/pdfjs_component/frontend\n+npm install\n+npm run build\n+```\n+\n+This regenerates `door_detector/ui/pdfjs_component/frontend/dist/`.\n*** End Patch"}}]}%json"}"}"}/**
+
 **Streamlit / Drawable Canvas Compatibility (Pinned):**
 This project pins Streamlit to a compatible version because `streamlit-drawable-canvas==0.9.3` relies on Streamlit internals that changed in newer Streamlit releases.
 

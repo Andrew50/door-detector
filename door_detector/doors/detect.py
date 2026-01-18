@@ -135,6 +135,15 @@ def apply_reweighter(candidates: List[Dict[str, Any]], model_path: str) -> List[
         if means.shape != weights.shape or stds.shape != weights.shape:
             raise ValueError("scaler mean/std shapes do not match weights")
 
+        # Guard against pathological scalers (e.g. tiny std from near-constant features),
+        # which can explode z-scores and collapse probabilities to ~0 or ~1.
+        # This is especially important for very small training sets.
+        try:
+            std_floor = 1e-3
+            stds_safe = np.where(stds < std_floor, std_floor, stds)
+        except Exception:
+            stds_safe = stds
+
         for cand in candidates:
             x = []
             for feat_name in feature_order:
@@ -142,7 +151,11 @@ def apply_reweighter(candidates: List[Dict[str, Any]], model_path: str) -> List[
                 x.append(val)
 
             x = np.array(x, dtype=float)
-            x_scaled = (x - means) / (stds + 1e-8)
+            x_scaled = (x - means) / (stds_safe + 1e-8)
+            try:
+                x_scaled = np.clip(x_scaled, -10.0, 10.0)
+            except Exception:
+                pass
 
             z = np.dot(x_scaled, weights) + bias
             # Numerically-stable sigmoid (avoid overflow for large negative z).
@@ -450,6 +463,259 @@ def _extract_polyline_arcs_from_lines(
         )
 
     return out
+
+
+def _debug_polyline_arcs_from_lines_subset(
+    *,
+    lines: List[Dict[str, Any]],
+    line_indices: List[int],
+    config: Dict[str, Any],
+    max_rejected_examples: int = 25,
+) -> Dict[str, Any]:
+    """Debug-only polyline-arc extraction within a subset of line indices.
+
+    Returns a dict with:
+    - usable_short_segments: int
+    - component_sizes: List[int]
+    - rejected_components: List[Dict[str, Any]] (sampled)
+    - arc_candidates: List[Dict[str, Any]] where each item includes pts/fit metrics and fails list
+
+    This mirrors `_extract_polyline_arcs_from_lines` but keeps *global* line indices and
+    records why components/arcs were rejected, so the unmatched debug report can be
+    fully explanatory.
+    """
+    swing_conf = (config.get("swing") or {}) if isinstance(config, dict) else {}
+    arc_conf = (swing_conf.get("arc") or {}) if isinstance(swing_conf, dict) else {}
+    poly_conf = (swing_conf.get("polyline_arc") or {}) if isinstance(swing_conf, dict) else {}
+    if poly_conf.get("enabled") is False:
+        return {
+            "enabled": False,
+            "usable_short_segments": 0,
+            "component_sizes": [],
+            "rejected_components": [],
+            "arc_candidates": [],
+        }
+
+    endpoint_snap_px = float(poly_conf.get("endpoint_snap_px", 3.0) or 3.0)
+    min_segments = int(poly_conf.get("min_segments", 4) or 4)
+    max_segments = int(poly_conf.get("max_segments", 36) or 36)
+    max_seg_len = float(poly_conf.get("max_segment_length_px", 85.0) or 85.0)
+
+    # Fit/arc thresholds (same as swing.arc).
+    max_circle_fit_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
+    min_radius_px = float(arc_conf.get("min_radius_px", 0.0) or 0.0)
+    max_radius_px = float(arc_conf.get("max_radius_px", 1e9) or 1e9)
+    min_angle_deg = float(arc_conf.get("min_angle_deg", 0.0) or 0.0)
+    max_angle_deg = float(arc_conf.get("max_angle_deg", 1e9) or 1e9)
+
+    if not (endpoint_snap_px > 0):
+        endpoint_snap_px = 3.0
+    if max_seg_len <= 0:
+        max_seg_len = 85.0
+
+    def _bin_pt(p: Tuple[float, float]) -> Tuple[int, int]:
+        return (_q(p[0], step=endpoint_snap_px), _q(p[1], step=endpoint_snap_px))
+
+    usable: List[int] = []
+    ends: Dict[int, Tuple[Tuple[float, float], Tuple[float, float], Tuple[int, int], Tuple[int, int]]] = {}
+    end_to_lines: Dict[Tuple[int, int], List[int]] = {}
+    for i in list(line_indices or []):
+        try:
+            ln = lines[int(i)]
+        except Exception:
+            continue
+        if _is_dashed_primitive(ln):
+            continue
+        try:
+            p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
+            p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
+        except Exception:
+            continue
+        seg_len = float(dist_point_to_point(p0, p1))
+        if not (0.5 <= seg_len <= max_seg_len):
+            continue
+        b0 = _bin_pt(p0)
+        b1 = _bin_pt(p1)
+        ends[int(i)] = (p0, p1, b0, b1)
+        end_to_lines.setdefault(b0, []).append(int(i))
+        end_to_lines.setdefault(b1, []).append(int(i))
+        usable.append(int(i))
+
+    if not usable:
+        return {
+            "enabled": True,
+            "usable_short_segments": 0,
+            "component_sizes": [],
+            "rejected_components": [],
+            "arc_candidates": [],
+        }
+
+    # Build adjacency via shared binned endpoints.
+    adj: Dict[int, set[int]] = {i: set() for i in usable}
+    for node, inc in end_to_lines.items():
+        if len(inc) <= 1:
+            continue
+        for a in inc:
+            for b in inc:
+                if a != b:
+                    adj[a].add(b)
+
+    # Connected components (over usable short segments only).
+    seen: set[int] = set()
+    comps: List[List[int]] = []
+    for i in usable:
+        if i in seen:
+            continue
+        stack = [i]
+        seen.add(i)
+        comp: List[int] = []
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nb in adj.get(cur, set()):
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        comps.append(comp)
+
+    component_sizes = [int(len(c)) for c in comps]
+    rejected_components: List[Dict[str, Any]] = []
+    arc_candidates: List[Dict[str, Any]] = []
+
+    def _reject(*, comp: List[int], reason: str, detail: Optional[Dict[str, Any]] = None) -> None:
+        if len(rejected_components) >= int(max_rejected_examples):
+            return
+        out = {"reason": str(reason), "segments": int(len(comp))}
+        if detail and isinstance(detail, dict):
+            out.update(detail)
+        # include a small sample for reproducibility
+        out["sample_line_idxs"] = [int(x) for x in list(comp)[: min(8, len(comp))]]
+        rejected_components.append(out)
+
+    # Walk each component and attempt circle fit + arc validation, recording failures.
+    for ci, comp in enumerate(comps):
+        if not (min_segments <= len(comp) <= max_segments):
+            _reject(
+                comp=comp,
+                reason="component.size",
+                detail={"min_segments": int(min_segments), "max_segments": int(max_segments)},
+            )
+            continue
+
+        # Node degrees within this component.
+        node_deg: Dict[Tuple[int, int], int] = {}
+        for li in comp:
+            try:
+                _, _, b0, b1 = ends[li]
+            except Exception:
+                continue
+            node_deg[b0] = node_deg.get(b0, 0) + 1
+            node_deg[b1] = node_deg.get(b1, 0) + 1
+
+        end_nodes = [n for n, d in node_deg.items() if d == 1]
+        if len(end_nodes) != 2:
+            _reject(comp=comp, reason="component.topology", detail={"end_nodes": int(len(end_nodes))})
+            continue  # ignore loops/branches
+
+        # Walk the chain in order from one endpoint.
+        start_node = end_nodes[0]
+        ordered: List[int] = []
+        used_lines: set[int] = set()
+        current_node = start_node
+        prev_line: Optional[int] = None
+
+        for _ in range(len(comp)):
+            candidates = [li for li in end_to_lines.get(current_node, []) if li in comp and li not in used_lines]
+            if not candidates:
+                break
+            nxt = candidates[0]
+            if prev_line is not None and len(candidates) > 1:
+                for cand in candidates:
+                    if cand != prev_line:
+                        nxt = cand
+                        break
+            ordered.append(nxt)
+            used_lines.add(nxt)
+            p0, p1, b0, b1 = ends[nxt]
+            current_node = b1 if current_node == b0 else b0
+            prev_line = nxt
+
+        if len(ordered) != len(comp):
+            _reject(comp=comp, reason="component.walk_failed", detail={"walked": int(len(ordered)), "expected": int(len(comp))})
+            continue
+
+        # Build ordered point chain.
+        pts: List[Tuple[float, float]] = []
+        current_node = start_node
+        for li in ordered:
+            p0, p1, b0, b1 = ends[li]
+            if current_node == b0:
+                a, b = p0, p1
+                current_node = b1
+            else:
+                a, b = p1, p0
+                current_node = b0
+            if not pts:
+                pts.append(a)
+            if pts[-1] != b:
+                pts.append(b)
+
+        if len(pts) < 3:
+            _reject(comp=comp, reason="arc.too_few_points", detail={"points": int(len(pts))})
+            continue
+
+        fit = None
+        try:
+            center, radius, rmse = fit_circle(pts)
+            angle_span = get_arc_angle_span(pts, center)
+            fit = (center, float(radius), float(rmse), float(angle_span))
+        except Exception:
+            fit = None
+
+        if fit is None:
+            _reject(comp=comp, reason="arc.fit_failed")
+            continue
+
+        center, radius, rmse, angle_span = fit
+        fails: List[str] = []
+        if not (min_radius_px <= radius <= max_radius_px):
+            fails.append("arc.radius")
+        if rmse > max_circle_fit_rmse:
+            fails.append("arc.rmse")
+        if not (min_angle_deg <= angle_span <= max_angle_deg):
+            fails.append("arc.angle_span")
+
+        arc_candidates.append(
+            {
+                "source": "polyline",
+                "comp_idx": int(ci),
+                "line_idxs": [int(x) for x in ordered],
+                "radius": float(radius),
+                "rmse": float(rmse),
+                "angle_span_deg": float(angle_span),
+                "center_xy": [float(center[0]), float(center[1])],
+                "fails": fails,
+                "arc_conf": {
+                    "min_radius_px": float(min_radius_px),
+                    "max_radius_px": float(max_radius_px),
+                    "max_rmse": float(max_circle_fit_rmse),
+                    "min_angle_deg": float(min_angle_deg),
+                    "max_angle_deg": float(max_angle_deg),
+                },
+            }
+        )
+
+    return {
+        "enabled": True,
+        "endpoint_snap_px": float(endpoint_snap_px),
+        "min_segments": int(min_segments),
+        "max_segments": int(max_segments),
+        "max_segment_length_px": float(max_seg_len),
+        "usable_short_segments": int(len(usable)),
+        "component_sizes": [int(x) for x in component_sizes],
+        "rejected_components": rejected_components,
+        "arc_candidates": arc_candidates,
+    }
 
 
 def detect_swing_candidates(
@@ -1223,7 +1489,9 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     candidate_pool_all: List[Dict[str, Any]] = []
 
     # --- Swing ---
-    if bool((config.get("swing") or {}).get("enabled")) and beziers:
+    # Run swing detection whenever enabled and we have *either* beziers or lines.
+    # This is important because many PDFs approximate arcs as polylines (line chains).
+    if bool((config.get("swing") or {}).get("enabled")) and (beziers or lines):
         strict_swing, pool_swing = detect_swing_candidates(lines=lines, beziers=beziers, line_index=line_index, config=config)
         strict_candidates_all.extend(strict_swing)
         candidate_pool_all.extend(pool_swing)
@@ -1483,6 +1751,14 @@ def debug_explain_unmatched_box(
         "examples": [],
     }
 
+    # Always-verbose additions (bounded with truncation guards).
+    MAX_NEAR_LINES = 2000
+    MAX_NEAR_BEZIERS = 2000
+    MAX_PAIRINGS_VERBOSE = 20000
+    MAX_POLY_ARCS_VERBOSE = 300
+    verbose_pairings: List[Dict[str, Any]] = []
+    verbose_truncated = False
+
     # Mirror the candidate-pool looseners in detect_swing_candidates (so debug matches reality).
     pool_min_len_ratio = 0.22
     pool_max_len_ratio = 2.20
@@ -1520,6 +1796,193 @@ def debug_explain_unmatched_box(
             continue
         line_index.add(i, [x0, y0, x1, y1])
 
+    # Verbose listing of near primitives.
+    near_lines_truncated = False
+    near_beziers_truncated = False
+    near_lines_list = list(near_lines)
+    near_beziers_list = list(near_beziers)
+    if len(near_lines_list) > MAX_NEAR_LINES:
+        near_lines_list = near_lines_list[:MAX_NEAR_LINES]
+        near_lines_truncated = True
+    if len(near_beziers_list) > MAX_NEAR_BEZIERS:
+        near_beziers_list = near_beziers_list[:MAX_NEAR_BEZIERS]
+        near_beziers_truncated = True
+
+    near_primitives = {
+        "lines": [],
+        "beziers": [],
+        "truncated": bool(near_lines_truncated or near_beziers_truncated),
+        "counts": {"lines": int(len(near_lines)), "beziers": int(len(near_beziers))},
+        "limits": {"max_lines": int(MAX_NEAR_LINES), "max_beziers": int(MAX_NEAR_BEZIERS)},
+    }
+    if near_lines_truncated:
+        near_primitives["lines_truncated"] = True
+    if near_beziers_truncated:
+        near_primitives["beziers_truncated"] = True
+    for l_idx in near_lines_list:
+        ln = lines[l_idx]
+        try:
+            p0 = {"x": float(ln["p0"]["x"]), "y": float(ln["p0"]["y"])}
+            p1 = {"x": float(ln["p1"]["x"]), "y": float(ln["p1"]["y"])}
+            x0, y0 = min(p0["x"], p1["x"]), min(p0["y"], p1["y"])
+            x1, y1 = max(p0["x"], p1["x"]), max(p0["y"], p1["y"])
+            rec = {
+                "l_idx": int(l_idx),
+                "p0": p0,
+                "p1": p1,
+                "len_px": float(dist_point_to_point((p0["x"], p0["y"]), (p1["x"], p1["y"]))),
+                "bbox_xyxy": [float(x0), float(y0), float(x1), float(y1)],
+                "is_dashed": bool(_is_dashed_primitive(ln)),
+            }
+            near_primitives["lines"].append(rec)
+        except Exception:
+            continue
+
+    for b_idx in near_beziers_list:
+        bz = beziers[b_idx]
+        try:
+            p0 = {"x": float(bz["p0"]["x"]), "y": float(bz["p0"]["y"])}
+            p1 = {"x": float(bz["p1"]["x"]), "y": float(bz["p1"]["y"])}
+            p2 = {"x": float(bz["p2"]["x"]), "y": float(bz["p2"]["y"])}
+            p3 = {"x": float(bz["p3"]["x"]), "y": float(bz["p3"]["y"])}
+            xs = [p0["x"], p1["x"], p2["x"], p3["x"]]
+            ys = [p0["y"], p1["y"], p2["y"], p3["y"]]
+            rec = {
+                "b_idx": int(b_idx),
+                "p0": p0,
+                "p1": p1,
+                "p2": p2,
+                "p3": p3,
+                "bbox_xyxy": [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))],
+            }
+            near_primitives["beziers"].append(rec)
+        except Exception:
+            continue
+
+    # Polyline-arc diagnostics within the ROI subset of lines (always verbose).
+    poly_dbg = _debug_polyline_arcs_from_lines_subset(lines=lines, line_indices=near_lines, config=config)
+    poly_arc_candidates = list(poly_dbg.get("arc_candidates", []) or [])
+    if len(poly_arc_candidates) > MAX_POLY_ARCS_VERBOSE:
+        poly_dbg["arc_candidates"] = poly_arc_candidates[:MAX_POLY_ARCS_VERBOSE]
+        poly_dbg["truncated"] = True
+        poly_dbg["total_arc_candidates"] = int(len(poly_arc_candidates))
+        poly_dbg["limits"] = {"max_arc_candidates": int(MAX_POLY_ARCS_VERBOSE)}
+    else:
+        poly_dbg["truncated"] = False
+        poly_dbg["total_arc_candidates"] = int(len(poly_arc_candidates))
+        poly_dbg["limits"] = {"max_arc_candidates": int(MAX_POLY_ARCS_VERBOSE)}
+
+    # Include polyline-arc candidates (even failed) as part of arc examples for debugging.
+    # We also compute how many pass arc filters (fails == []) for quick triage.
+    poly_pass = [a for a in list(poly_dbg.get("arc_candidates", []) or []) if not (a.get("fails") or [])]
+    poly_dbg["arc_pass_near_count"] = int(len(poly_pass))
+    poly_fail_counts = {"radius": 0, "rmse": 0, "angle": 0}
+    for a in list(poly_dbg.get("arc_candidates", []) or []):
+        fails = list(a.get("fails") or [])
+        if "arc.radius" in fails:
+            poly_fail_counts["radius"] += 1
+        if "arc.rmse" in fails:
+            poly_fail_counts["rmse"] += 1
+        if "arc.angle_span" in fails:
+            poly_fail_counts["angle"] += 1
+    poly_dbg["arc_fail_counts_near"] = poly_fail_counts
+
+    # Compute circle-cluster suppression over *near* arcs (bezier + polyline) so the debug report
+    # can explain why an arc was filtered. (Scope is near-ROI; this is sufficient for label bubbles.)
+    circle_counts_all: Dict[Tuple[int, int, int], int] = {}
+    circle_sum_angle_all: Dict[Tuple[int, int, int], float] = {}
+    circle_key_for_any_arc: Dict[str, Tuple[int, int, int]] = {}
+    cbin = float(arc_conf.get("circle_cluster_center_bin_px", 4.0) or 4.0)
+    rbin = float(arc_conf.get("circle_cluster_radius_bin_px", 4.0) or 4.0)
+    cbin = cbin if cbin > 0 else 4.0
+    rbin = rbin if rbin > 0 else 4.0
+
+    def _circle_key(center_xy: Tuple[float, float], radius: float) -> Tuple[int, int, int]:
+        return (int(round(center_xy[0] / cbin)), int(round(center_xy[1] / cbin)), int(round(float(radius) / rbin)))
+
+    # Add bezier-pass arcs (already computed in arc_pass).
+    for ex in list(arc_pass):
+        try:
+            key = _circle_key((float(ex.get("center_xy")[0]), float(ex.get("center_xy")[1])), float(ex.get("radius")))
+        except Exception:
+            continue
+        arc_id = f"bezier:{int(ex.get('b_idx'))}"
+        circle_key_for_any_arc[arc_id] = key
+        circle_counts_all[key] = circle_counts_all.get(key, 0) + 1
+        circle_sum_angle_all[key] = circle_sum_angle_all.get(key, 0.0) + float(ex.get("angle_span_deg", 0.0) or 0.0)
+
+    # Add polyline-pass arcs (from poly_dbg).
+    for ex in poly_pass:
+        try:
+            key = _circle_key((float(ex.get("center_xy")[0]), float(ex.get("center_xy")[1])), float(ex.get("radius")))
+        except Exception:
+            continue
+        arc_id = f"polyline:{int(ex.get('comp_idx'))}"
+        circle_key_for_any_arc[arc_id] = key
+        circle_counts_all[key] = circle_counts_all.get(key, 0) + 1
+        circle_sum_angle_all[key] = circle_sum_angle_all.get(key, 0.0) + float(ex.get("angle_span_deg", 0.0) or 0.0)
+
+    # Update suppression examples to include both sources.
+    if bool(arc_conf.get("suppress_circle_clusters", False)):
+        min_arcs = int(arc_conf.get("circle_cluster_min_arcs", 3) or 3)
+        min_total_angle = float(arc_conf.get("circle_cluster_min_total_angle_deg", 250.0) or 250.0)
+        # Reset and rebuild near suppression details to cover both bezier and polyline.
+        arc_suppression["near_suppressed_count"] = 0
+        arc_suppression["near_examples"] = []
+        arc_suppression["scope"] = "near_roi"
+        arc_suppression["min_arcs"] = int(min_arcs)
+        arc_suppression["min_total_angle_deg"] = float(min_total_angle)
+        arc_suppression["bin_px"] = {"center": float(cbin), "radius": float(rbin)}
+
+        def _add_supp_example(*, arc_id: str, b_idx: Optional[int] = None, comp_idx: Optional[int] = None) -> None:
+            if len(arc_suppression["near_examples"]) >= int(max_examples):
+                return
+            key = circle_key_for_any_arc.get(arc_id)
+            if key is None:
+                return
+            cnt = int(circle_counts_all.get(key, 0))
+            tot = float(circle_sum_angle_all.get(key, 0.0))
+            suppressed = bool(cnt >= min_arcs and tot >= min_total_angle)
+            if suppressed:
+                arc_suppression["near_suppressed_count"] = int(arc_suppression.get("near_suppressed_count", 0) or 0) + 1
+            rec = {
+                "source": "bezier" if b_idx is not None else "polyline",
+                "circle_key": list(key),
+                "cluster_count": cnt,
+                "cluster_total_angle_deg": tot,
+                "suppressed": suppressed,
+            }
+            if b_idx is not None:
+                rec["b_idx"] = int(b_idx)
+            if comp_idx is not None:
+                rec["comp_idx"] = int(comp_idx)
+            arc_suppression["near_examples"].append(rec)
+
+        for ex in list(arc_pass):
+            try:
+                _add_supp_example(arc_id=f"bezier:{int(ex.get('b_idx'))}", b_idx=int(ex.get("b_idx")))
+            except Exception:
+                continue
+        for ex in poly_pass:
+            try:
+                _add_supp_example(arc_id=f"polyline:{int(ex.get('comp_idx'))}", comp_idx=int(ex.get("comp_idx")))
+            except Exception:
+                continue
+
+    # Augment bezier arc examples to include center_xy (needed for suppression clustering above).
+    # (Backward compatible: just adds a field.)
+    arc_pass_by_idx: Dict[int, Tuple[float, float]] = {}
+    for ex in list(arc_pass):
+        try:
+            arc_pass_by_idx[int(ex["b_idx"])] = (float(ex.get("radius")), float(ex.get("angle_span_deg")))
+        except Exception:
+            continue
+
+    # Evaluate bezier arcs near ROI.
+    arc_pass = []  # recompute pass list with center info included
+    arc_examples = []
+    arc_fail_counts = {"radius": 0, "rmse": 0, "angle": 0}
+
     for b_idx in near_beziers:
         bz = beziers[b_idx]
         try:
@@ -1545,6 +2008,7 @@ def debug_explain_unmatched_box(
             "radius": float(radius),
             "rmse": float(rmse),
             "angle_span_deg": float(angle_span),
+            "center_xy": [float(center[0]), float(center[1])],
             "fails": fails,
             "arc_conf": {"min_radius_px": min_r, "max_radius_px": max_r, "max_rmse": max_rmse, "min_angle_deg": min_a, "max_angle_deg": max_a},
         }
@@ -1554,32 +2018,6 @@ def debug_explain_unmatched_box(
         if fails:
             continue
         arc_pass.append(ex)
-
-        # Explain if this arc is likely suppressed by the circle-cluster filter.
-        if bool(arc_conf.get("suppress_circle_clusters", False)) and b_idx in circle_key_for_arc:
-            try:
-                key = circle_key_for_arc[int(b_idx)]
-                min_arcs = int(arc_conf.get("circle_cluster_min_arcs", 3) or 3)
-                min_total_angle = float(arc_conf.get("circle_cluster_min_total_angle_deg", 250.0) or 250.0)
-                cnt = int(circle_counts.get(key, 0))
-                tot = float(circle_sum_angle.get(key, 0.0))
-                suppressed = bool(cnt >= min_arcs and tot >= min_total_angle)
-                if suppressed:
-                    arc_suppression["near_suppressed_count"] = int(arc_suppression.get("near_suppressed_count", 0) or 0) + 1
-                if len(arc_suppression["near_examples"]) < max_examples:
-                    arc_suppression["near_examples"].append(
-                        {
-                            "b_idx": int(b_idx),
-                            "circle_key": list(key),
-                            "cluster_count": cnt,
-                            "cluster_total_angle_deg": tot,
-                            "min_arcs": min_arcs,
-                            "min_total_angle_deg": min_total_angle,
-                            "suppressed": suppressed,
-                        }
-                    )
-            except Exception:
-                pass
 
         # Leaf pairing checks.
         arc_bbox = get_bbox(pts)
@@ -1690,6 +2128,28 @@ def debug_explain_unmatched_box(
             if strict_ok:
                 pair_stats["strict_pass"] += 1
 
+            # Always-verbose per-pair record (bounded).
+            if len(verbose_pairings) < MAX_PAIRINGS_VERBOSE:
+                verbose_pairings.append(
+                    {
+                        "arc_source": "bezier",
+                        "b_idx": int(b_idx),
+                        "l_idx": int(l_idx),
+                        "radius": float(radius),
+                        "rmse": float(rmse),
+                        "angle_span_deg": float(angle_span),
+                        "len_ratio": float(len_ratio),
+                        "hinge_dist": float(min_hinge_dist),
+                        "center_dist": float(min(d0_center, d1_center)),
+                        "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
+                        "tip_to_arc_dist": float(tip_to_arc_dist),
+                        "pool_fail": pool_fail,
+                        "strict_fail": strict_fail,
+                    }
+                )
+            else:
+                verbose_truncated = True
+
             if len(pair_stats["examples"]) < max_examples and (not pool_ok or not strict_ok):
                 pair_stats["examples"].append(
                     {
@@ -1707,6 +2167,156 @@ def debug_explain_unmatched_box(
                         "strict_fail": strict_fail,
                     }
                 )
+
+    # Leaf pairing for polyline arcs that pass arc filters (always-verbose).
+    # We mimic detect_swing_candidates by skipping leaf lines that are part of the arc polyline itself.
+    for ex in list(poly_pass):
+        try:
+            comp_idx = int(ex.get("comp_idx"))
+            line_idxs = [int(x) for x in list(ex.get("line_idxs") or [])]
+            center_xy = ex.get("center_xy") or [0.0, 0.0]
+            center = (float(center_xy[0]), float(center_xy[1]))
+            radius = float(ex.get("radius", 0.0) or 0.0)
+        except Exception:
+            continue
+        if not (radius > 0):
+            continue
+        # Approximate arc bbox using just the endpoints of the chain (cheap) would be too weak;
+        # instead, use the bbox of all segment endpoints.
+        pts: List[Tuple[float, float]] = []
+        for li in line_idxs:
+            try:
+                ln = lines[int(li)]
+                pts.append((float(ln["p0"]["x"]), float(ln["p0"]["y"])))
+                pts.append((float(ln["p1"]["x"]), float(ln["p1"]["y"])))
+            except Exception:
+                continue
+        if not pts:
+            continue
+        arc_bbox = get_bbox(pts)
+        query_bbox = [
+            arc_bbox[0] - radius * 0.5,
+            arc_bbox[1] - radius * 0.5,
+            arc_bbox[2] + radius * 0.5,
+            arc_bbox[3] + radius * 0.5,
+        ]
+        nearby_line_indices = line_index.query(query_bbox)
+        arc_line_set = set(int(x) for x in line_idxs)
+
+        # Use first/last endpoints as arc endpoints for hinge/tip checks.
+        arc_start = pts[0]
+        arc_end = pts[-1]
+        for l_idx in nearby_line_indices:
+            if int(l_idx) in arc_line_set:
+                continue
+            ln = lines[l_idx]
+            try:
+                p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
+                p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
+            except Exception:
+                continue
+            l_len = float(dist_point_to_point(p0, p1))
+            len_ratio = (l_len / float(radius)) if float(radius) > 1e-6 else 0.0
+
+            d0_start = float(dist_point_to_point(p0, arc_start))
+            d0_end = float(dist_point_to_point(p0, arc_end))
+            d1_start = float(dist_point_to_point(p1, arc_start))
+            d1_end = float(dist_point_to_point(p1, arc_end))
+            d0_center = float(dist_point_to_point(p0, center))
+            d1_center = float(dist_point_to_point(p1, center))
+            min_hinge_dist = float(min(d0_start, d0_end, d1_start, d1_end))
+
+            hinge_pt = p0 if d0_center <= d1_center else p1
+            tip_pt = p1 if hinge_pt == p0 else p0
+            target_pt = arc_start if dist_point_to_point(tip_pt, arc_start) <= dist_point_to_point(tip_pt, arc_end) else arc_end
+            tip_to_arc_dist = float(dist_point_to_point(tip_pt, target_pt))
+
+            radial_angle_deg = None
+            lx, ly = (tip_pt[0] - hinge_pt[0], tip_pt[1] - hinge_pt[1])
+            rx, ry = (target_pt[0] - center[0], target_pt[1] - center[1])
+            lnrm = math.hypot(lx, ly)
+            rnrm = math.hypot(rx, ry)
+            if lnrm > 1e-6 and rnrm > 1e-6:
+                dot = (lx * rx + ly * ry) / (lnrm * rnrm)
+                dot = max(-1.0, min(1.0, float(dot)))
+                radial_angle_deg = float(math.degrees(math.acos(dot)))
+
+            pair_stats["pairs_tested"] += 1
+
+            pool_fail: List[str] = []
+            if not (pool_min_len_ratio <= len_ratio <= pool_max_len_ratio):
+                pool_fail.append("leaf.len_ratio")
+                pair_stats["pool_fail_counts"]["len_ratio"] += 1
+            pool_hinge_ok = True
+            if min_hinge_dist > float(radius) * pool_max_hinge_dist_ratio:
+                if min(d0_center, d1_center) > float(radius) * pool_max_hinge_dist_ratio:
+                    pool_hinge_ok = False
+            if not pool_hinge_ok:
+                pool_fail.append("leaf.hinge_dist")
+                pair_stats["pool_fail_counts"]["hinge_dist"] += 1
+            if pool_require_endpoint_near_center:
+                if min(d0_center, d1_center) > float(radius) * pool_max_center_dist_ratio:
+                    pool_fail.append("leaf.center_dist")
+                    pair_stats["pool_fail_counts"]["center_dist"] += 1
+            if radial_angle_deg is not None and pool_max_radial_angle_deg and pool_max_radial_angle_deg > 0:
+                if radial_angle_deg > pool_max_radial_angle_deg:
+                    pool_fail.append("leaf.radial_angle")
+                    pair_stats["pool_fail_counts"]["radial_angle"] += 1
+            if pool_max_tip_to_arc_ratio is not None and pool_max_tip_to_arc_ratio > 0:
+                if tip_to_arc_dist > float(radius) * pool_max_tip_to_arc_ratio:
+                    pool_fail.append("leaf.tip_to_arc")
+                    pair_stats["pool_fail_counts"]["tip_to_arc"] += 1
+
+            pool_ok = len(pool_fail) == 0
+            if pool_ok:
+                pair_stats["pool_pass"] += 1
+
+            strict_fail: List[str] = []
+            if not (strict_min_len_ratio <= len_ratio <= strict_max_len_ratio):
+                strict_fail.append("leaf.len_ratio")
+                pair_stats["strict_fail_counts"]["len_ratio"] += 1
+            strict_hinge_ok = True
+            if min_hinge_dist > float(radius) * strict_max_hinge_ratio:
+                if min(d0_center, d1_center) > float(radius) * strict_max_hinge_ratio:
+                    strict_hinge_ok = False
+            if not strict_hinge_ok:
+                strict_fail.append("leaf.hinge_dist")
+                pair_stats["strict_fail_counts"]["hinge_dist"] += 1
+            if strict_req_center:
+                if min(d0_center, d1_center) > float(radius) * strict_max_center_ratio:
+                    strict_fail.append("leaf.center_dist")
+                    pair_stats["strict_fail_counts"]["center_dist"] += 1
+            if radial_angle_deg is not None and strict_max_radial is not None and strict_max_radial > 0:
+                if radial_angle_deg > strict_max_radial:
+                    strict_fail.append("leaf.radial_angle")
+                    pair_stats["strict_fail_counts"]["radial_angle"] += 1
+            if strict_max_tip_ratio is not None and strict_max_tip_ratio > 0:
+                if tip_to_arc_dist > float(radius) * strict_max_tip_ratio:
+                    strict_fail.append("leaf.tip_to_arc")
+                    pair_stats["strict_fail_counts"]["tip_to_arc"] += 1
+
+            strict_ok = len(strict_fail) == 0
+            if strict_ok:
+                pair_stats["strict_pass"] += 1
+
+            if len(verbose_pairings) < MAX_PAIRINGS_VERBOSE:
+                verbose_pairings.append(
+                    {
+                        "arc_source": "polyline",
+                        "comp_idx": int(comp_idx),
+                        "l_idx": int(l_idx),
+                        "radius": float(radius),
+                        "len_ratio": float(len_ratio),
+                        "hinge_dist": float(min_hinge_dist),
+                        "center_dist": float(min(d0_center, d1_center)),
+                        "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
+                        "tip_to_arc_dist": float(tip_to_arc_dist),
+                        "pool_fail": pool_fail,
+                        "strict_fail": strict_fail,
+                    }
+                )
+            else:
+                verbose_truncated = True
 
     # Pocket-line quick check (useful when swing arcs are absent).
     pocket_conf = (config.get("pocket") or {}) if isinstance(config, dict) else {}
@@ -1734,8 +2344,55 @@ def debug_explain_unmatched_box(
 
     report: Dict[str, Any] = {
         "kind": "unmatched_box_debug_v1",
+        "verbose": True,
+        "truncation": {
+            "near_primitives_truncated": bool(near_primitives.get("truncated")),
+            "polyline_arc_near_truncated": bool(poly_dbg.get("truncated")),
+            "leaf_pairings_truncated": bool(verbose_truncated),
+            "limits": {
+                "max_near_lines": int(MAX_NEAR_LINES),
+                "max_near_beziers": int(MAX_NEAR_BEZIERS),
+                "max_polyline_arc_candidates": int(MAX_POLY_ARCS_VERBOSE),
+                "max_leaf_pairings": int(MAX_PAIRINGS_VERBOSE),
+            },
+        },
         "bbox_full_xyxy": [float(v) for v in nb],
         "roi_full_xyxy": [float(v) for v in roi],
+        "thresholds": {
+            "swing": {
+                "arc": {
+                    "min_radius_px": float(min_r),
+                    "max_radius_px": float(max_r),
+                    "max_circle_fit_rmse": float(max_rmse),
+                    "min_angle_deg": float(min_a),
+                    "max_angle_deg": float(max_a),
+                    "suppress_circle_clusters": bool(arc_conf.get("suppress_circle_clusters", False)),
+                    "circle_cluster_center_bin_px": float(arc_conf.get("circle_cluster_center_bin_px", 4.0) or 4.0),
+                    "circle_cluster_radius_bin_px": float(arc_conf.get("circle_cluster_radius_bin_px", 4.0) or 4.0),
+                    "circle_cluster_min_arcs": int(arc_conf.get("circle_cluster_min_arcs", 3) or 3),
+                    "circle_cluster_min_total_angle_deg": float(arc_conf.get("circle_cluster_min_total_angle_deg", 250.0) or 250.0),
+                },
+                "leaf_strict": {
+                    "min_length_ratio": float(strict_min_len_ratio),
+                    "max_length_ratio": float(strict_max_len_ratio),
+                    "max_hinge_dist_ratio": float(strict_max_hinge_ratio),
+                    "require_endpoint_near_center": bool(strict_req_center),
+                    "max_center_dist_ratio": float(strict_max_center_ratio),
+                    "max_radial_angle_deg": float(strict_max_radial) if strict_max_radial is not None else None,
+                    "max_tip_to_arc_ratio": float(strict_max_tip_ratio) if strict_max_tip_ratio is not None else None,
+                },
+                "leaf_pool": {
+                    "min_length_ratio": float(pool_min_len_ratio),
+                    "max_length_ratio": float(pool_max_len_ratio),
+                    "max_hinge_dist_ratio": float(pool_max_hinge_dist_ratio),
+                    "require_endpoint_near_center": bool(pool_require_endpoint_near_center),
+                    "max_center_dist_ratio": float(pool_max_center_dist_ratio),
+                    "max_radial_angle_deg": float(pool_max_radial_angle_deg),
+                    "max_tip_to_arc_ratio": float(pool_max_tip_to_arc_ratio),
+                },
+            }
+        },
+        "near_primitives": near_primitives,
         "counts": {
             "lines_total": int(len(lines)),
             "beziers_total": int(len(beziers)),
@@ -1749,6 +2406,13 @@ def debug_explain_unmatched_box(
             "arc_fail_counts_near": arc_fail_counts,
             "arc_circle_cluster_suppression": arc_suppression,
             "leaf_pair_stats_near": pair_stats,
+            "polyline_arc_near": poly_dbg,
+            "leaf_pairings_verbose": {
+                "count": int(len(verbose_pairings)),
+                "truncated": bool(verbose_truncated),
+                "max_records": int(MAX_PAIRINGS_VERBOSE),
+                "records": verbose_pairings,
+            },
         },
         "pocket": {
             "enabled": bool(pocket_conf.get("enabled", False)),
@@ -1756,7 +2420,7 @@ def debug_explain_unmatched_box(
             "near_hits": int(pocket_hits),
             "near_examples": pocket_examples,
         },
-        "note": "If beziers_near_roi is 0, the door swing is likely rasterized or drawn as non-bezier primitives; if arc_fail_counts are high, loosen swing.arc thresholds (especially max_radius_px).",
+        "note": "Verbose report: includes near primitives and per-(arc,line) exclusion reasons. If beziers_near_roi is 0, the door swing may be rasterized or drawn as polylines; if arc_fail_counts are high, loosen swing.arc thresholds (especially max_radius_px).",
     }
     return report
 

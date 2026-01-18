@@ -8,7 +8,7 @@ from typing import List, Tuple
 from PIL import Image
 
 
-def test_artifacts(output_dir: Path) -> Tuple[bool, List[str]]:
+def validate_artifacts(output_dir: Path) -> Tuple[bool, List[str]]:
     """
     Test that all required artifacts exist and are valid.
 
@@ -165,6 +165,12 @@ def test_artifacts(output_dir: Path) -> Tuple[bool, List[str]]:
     return len(errors) == 0, errors
 
 
+def test_step1_artifacts(output_dir: Path) -> None:
+    """Pytest wrapper around the script-style validator."""
+    ok, errors = validate_artifacts(output_dir)
+    assert ok, "Step1 artifacts validation failed:\n- " + "\n- ".join(errors)
+
+
 def main():
     """Main test function."""
     if len(sys.argv) < 2:
@@ -181,7 +187,7 @@ def main():
     print(f"Testing artifacts in: {output_dir}")
     print()
 
-    all_passed, errors = test_artifacts(output_dir)
+    all_passed, errors = validate_artifacts(output_dir)
 
     print()
     if all_passed:

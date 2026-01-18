@@ -16,6 +16,7 @@ import streamlit.components.v1 as components
 
 from door_detector.doors.geometry import compute_iou
 from door_detector.library import Library
+from door_detector.pdf.affine import apply_affine_bbox_xyxy as _apply_affine_bbox_xyxy
 from door_detector.step1_pipeline import process_pdf
 from door_detector.signatures import compute_step1_signature
 from door_detector.step2_pipeline import run_step2
@@ -66,6 +67,7 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
             "_edit_draft": None,
             "_edit_manual_confirmed_ids": set(),
             "_last_draw_event_id": None,
+            "_last_viewer_event_id": None,
             "_last_unmatched_debug": None,
             "_focus_seq": 0,
             "_focus_last_id": None,
@@ -243,8 +245,9 @@ def _process_draw_event_if_any(
         return
     event_id = evt.get("event_id")
     bbox = evt.get("bbox_xyxy")
+    bbox_pdf = evt.get("bbox_pdf_xyxy")
     snapped_candidate_id = evt.get("snapped_candidate_id")
-    if not event_id or not isinstance(bbox, list) or len(bbox) != 4:
+    if not event_id:
         return
     if str(event_id) == str(fstate.get("_last_draw_event_id")):
         return
@@ -257,25 +260,39 @@ def _process_draw_event_if_any(
     _enter_edit_mode(fstate)
     draft = _get_working_label_state(fstate)
 
-    scale_full_to_preview = float(preview_spec.get("scale", 1.0) or 1.0)
-    if not (scale_full_to_preview > 0):
-        return
+    drawn_full = None
+    # New path: PDF.js emits bbox_pdf_xyxy in PDF coords; convert PDF → pixel using Step1 transform.
+    if isinstance(bbox_pdf, list) and len(bbox_pdf) == 4:
+        try:
+            tpath = file_dir / "transform.json"
+            tob = json.loads(tpath.read_text()) if tpath.exists() else {}
+            m = tob.get("pdf_to_pix_affine") if isinstance(tob, dict) else None
+            if isinstance(m, list) and len(m) == 6:
+                drawn_full = _apply_affine_bbox_xyxy(m, bbox_pdf)
+        except Exception:
+            drawn_full = None
 
-    # Convert preview → full-res pixels.
-    try:
-        x0p, y0p, x1p, y1p = [float(v) for v in bbox]
-    except Exception:
-        return
-    drawn_full = [
-        x0p / scale_full_to_preview,
-        y0p / scale_full_to_preview,
-        x1p / scale_full_to_preview,
-        y1p / scale_full_to_preview,
-    ]
+    # Legacy path: iframe emits preview-space pixels.
+    if drawn_full is None:
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return
+        scale_full_to_preview = float(preview_spec.get("scale", 1.0) or 1.0)
+        if not (scale_full_to_preview > 0):
+            return
+        try:
+            x0p, y0p, x1p, y1p = [float(v) for v in bbox]
+        except Exception:
+            return
+        drawn_full = [
+            x0p / scale_full_to_preview,
+            y0p / scale_full_to_preview,
+            x1p / scale_full_to_preview,
+            y1p / scale_full_to_preview,
+        ]
 
     full_w = full_dims[0] if full_dims else None
     full_h = full_dims[1] if full_dims else None
-    drawn_full = _clamp_bbox_xyxy(drawn_full, w=full_w, h=full_h)
+    drawn_full = _clamp_bbox_xyxy([float(v) for v in drawn_full], w=full_w, h=full_h)
 
     candidates = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
     best = None
@@ -537,6 +554,38 @@ def main() -> None:
                     full_height=full_dims[1] if full_dims else None,
                     page_png_mtime_ns=page_png_mtime_ns,
                 )
+
+                # --- Consume PDF.js component events early (before snapping + selection sync) ---
+                # The PDF.js viewer is a Streamlit custom component keyed by `pdfjs_viewer_{file_id}`.
+                # Its value is available in session_state at the start of a rerun after user actions.
+                try:
+                    viewer_key = f"pdfjs_viewer_{file_id}"
+                    evt = st.session_state.get(viewer_key)
+                    if isinstance(evt, dict):
+                        evt_id = str(evt.get("event_id") or "")
+                        if evt_id and evt_id != str(fstate.get("_last_viewer_event_id") or ""):
+                            fstate["_last_viewer_event_id"] = evt_id
+                            et = str(evt.get("type") or "")
+                            click_sink_label = f"door_click_sink_{file_id}"
+                            if et == "door_click":
+                                did = evt.get("door_id")
+                                if did not in (None, ""):
+                                    st.session_state[click_sink_label] = str(did)
+                            elif et == "draw_rect":
+                                st.session_state[f"draw_event_sink_{file_id}"] = json.dumps(
+                                    {
+                                        "event": "draw_rect",
+                                        "event_id": evt.get("event_id"),
+                                        "bbox_pdf_xyxy": evt.get("bbox_pdf_xyxy"),
+                                        "snapped_candidate_id": evt.get("snapped_candidate_id"),
+                                        "iou": evt.get("iou"),
+                                        "snapped_bbox_pdf_xyxy": evt.get("snapped_bbox_pdf_xyxy"),
+                                        "ts": evt.get("ts"),
+                                    },
+                                    separators=(",", ":"),
+                                )
+                except Exception:
+                    pass
 
                 # Consume any Shift+drag events before computing the visible list/overlay.
                 _process_draw_event_if_any(

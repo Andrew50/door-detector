@@ -84,6 +84,9 @@ def test_step2_emits_double_candidate() -> None:
         _make_double_door_pdf(pdf_path)
         data = _run(pdf_path)
         cands = data.get("candidates") or []
+        # PDF-space bbox is required for the PDF.js viewer overlay.
+        if cands:
+            assert "bbox_pdf_xyxy" in (cands[0] or {})
         assert any(c.get("type") == "double" for c in cands), "expected a double candidate in doors.json"
 
 
@@ -93,6 +96,9 @@ def test_step2_emits_pocket_candidate_from_dashed_line() -> None:
         _make_pocket_door_pdf(pdf_path)
         data = _run(pdf_path)
         cands = data.get("candidates") or []
+        # PDF-space bbox is required for the PDF.js viewer overlay.
+        if cands:
+            assert "bbox_pdf_xyxy" in (cands[0] or {})
         assert any(c.get("type") == "pocket" for c in cands), "expected a pocket candidate in doors.json"
 
 
@@ -102,6 +108,9 @@ def test_step2_emits_bifold_candidate_from_zigzag() -> None:
         _make_bifold_door_pdf(pdf_path)
         data = _run(pdf_path)
         cands = data.get("candidates") or []
+        # PDF-space bbox is required for the PDF.js viewer overlay.
+        if cands:
+            assert "bbox_pdf_xyxy" in (cands[0] or {})
         assert any(c.get("type") == "bifold" for c in cands), "expected a bifold candidate in doors.json"
 
 

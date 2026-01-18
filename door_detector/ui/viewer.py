@@ -18,6 +18,8 @@ from PIL import Image
 
 from door_detector.ui.assets import sidebar_autopen_component_html
 from door_detector.ui.labels import flatten_confirmed_ids, get_working_label_state as _get_working_label_state
+from door_detector.ui.pdfjs_component import pdfjs_viewer
+from door_detector.pdf.affine import apply_affine_bbox_xyxy, normalize_bbox_xyxy
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -27,6 +29,16 @@ Image.MAX_IMAGE_PIXELS = None
 
 VIEWER_TARGET_WIDTH_PX = 1200
 VIEWER_ASPECT_RATIO_HW = 0.75  # height/width
+
+
+@st.cache_data(show_spinner=False)
+def _load_pdf_b64_and_hash(pdf_path: str, *, mtime_ns: int) -> tuple[str, str]:
+    """Return (sha256_hex, base64_payload) for a PDF file on disk."""
+    p = Path(pdf_path)
+    raw = p.read_bytes()
+    h = hashlib.sha256(raw).hexdigest()
+    b64 = base64.b64encode(raw).decode("ascii")
+    return h, b64
 
 
 def _debug_log(msg: str, *args: Any) -> None:
@@ -179,6 +191,97 @@ def _manual_overlay_payload_for_sink(
         )
 
     # Keep the key for backwards compatibility with the client code.
+    return {"manual_additions": out_manual, "unmatched_manual_boxes": out_unmatched}
+
+
+def _manual_overlay_payload_for_pdfjs(
+    *,
+    fstate: Dict[str, Any],
+    pix_to_pdf_affine: List[float],
+) -> Dict[str, Any]:
+    """Return PDF-space overlays for the PDF.js component.
+
+    Inputs in fstate are stored in full-res pixel space (aligned with page.png).
+    We map them to PDF coordinates using the Step1 `pix_to_pdf_affine` so the
+    frontend can convert to viewport pixels via PDF.js.
+
+    Like the legacy viewer, we only render overlays created during the *current*
+    edit session (baseline subtraction).
+    """
+    state = _get_working_label_state(fstate)
+    out_manual: List[Dict[str, Any]] = []
+    out_unmatched: List[Dict[str, Any]] = []
+
+    baseline_counts: Counter = Counter()
+    baseline_unmatched_counts: Counter = Counter()
+    baseline = fstate.get("_edit_baseline") if bool(fstate.get("edit_mode")) else None
+    if isinstance(baseline, dict):
+        for b in list(baseline.get("manual_additions", []) or []):
+            try:
+                tok = json.dumps(b, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(b)
+            baseline_counts[tok] += 1
+        for b in list(baseline.get("unmatched_manual_boxes", []) or []):
+            try:
+                tok = json.dumps(b, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(b)
+            baseline_unmatched_counts[tok] += 1
+
+    for rec in list(state.get("manual_additions", [])):
+        if baseline_counts:
+            try:
+                tok = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(rec)
+            if baseline_counts.get(tok, 0) > 0:
+                baseline_counts[tok] -= 1
+                continue
+
+        drawn_full = rec.get("drawn_bbox_xyxy")
+        if not isinstance(drawn_full, list) or len(drawn_full) != 4:
+            continue
+        try:
+            drawn_pdf = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(drawn_full))
+        except Exception:
+            continue
+
+        snapped_pdf = None
+        snapped_full = rec.get("snapped_bbox_xyxy")
+        if isinstance(snapped_full, list) and len(snapped_full) == 4:
+            try:
+                snapped_pdf = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(snapped_full))
+            except Exception:
+                snapped_pdf = None
+
+        out_manual.append(
+            {
+                "drawn_bbox_pdf_xyxy": drawn_pdf,
+                "snapped_bbox_pdf_xyxy": snapped_pdf,
+                "snapped_candidate_id": rec.get("snapped_candidate_id"),
+                "iou": rec.get("iou"),
+            }
+        )
+
+    for rec in list(state.get("unmatched_manual_boxes", [])):
+        if baseline_unmatched_counts:
+            try:
+                tok = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(rec)
+            if baseline_unmatched_counts.get(tok, 0) > 0:
+                baseline_unmatched_counts[tok] -= 1
+                continue
+        bb_full = rec.get("bbox_xyxy")
+        if not isinstance(bb_full, list) or len(bb_full) != 4:
+            continue
+        try:
+            bb_pdf = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(bb_full))
+        except Exception:
+            continue
+        out_unmatched.append({"bbox_pdf_xyxy": bb_pdf, "note": rec.get("note") or "unmatched"})
+
     return {"manual_additions": out_manual, "unmatched_manual_boxes": out_unmatched}
 
 
@@ -1729,198 +1832,6 @@ def main_viewer_canvas(
     file_dir = Path(item["path"])
 
     if preview_spec:
-        # Door click sink: JS writes the clicked door id into this hidden widget,
-        # which triggers a rerun; on rerun we sync it into the "Jump to door" control.
-        click_sink_key = click_sink_label
-        st.text_input(click_sink_label, key=click_sink_key, label_visibility="collapsed")
-
-        # Auto-focus sink: viewer polls this so toggling the checkbox doesn't remount the iframe.
-        auto_focus_key = f"auto_focus_{file_id}"
-        auto_focus_sink_label = f"auto_focus_sink_{file_id}"
-        try:
-            # Canonicalize early (main_viewer_controls may render after the viewer).
-            auto_focus_val = _coerce_bool(
-                st.session_state.get(auto_focus_key),
-                default=_coerce_bool(fstate.get("auto_focus", True), default=True),
-            )
-            fstate["auto_focus"] = auto_focus_val
-            st.session_state[auto_focus_sink_label] = "1" if auto_focus_val else "0"
-        except Exception:
-            pass
-        st.text_input(auto_focus_sink_label, key=auto_focus_sink_label, label_visibility="collapsed")
-
-        # Selection/focus sinks: the viewer polls these so selection changes don't require
-        # changing the viewer HTML (reduces iframe reload flicker).
-        selected_sink_label = f"selected_door_sink_{file_id}"
-        focus_seq_sink_label = f"focus_seq_sink_{file_id}"
-        try:
-            st.session_state[selected_sink_label] = str(fstate.get("selected_door_id") or "")
-            st.session_state[focus_seq_sink_label] = str(int(fstate.get("_focus_seq") or 0))
-        except Exception:
-            pass
-        st.text_input(selected_sink_label, key=selected_sink_label, label_visibility="collapsed")
-        st.text_input(focus_seq_sink_label, key=focus_seq_sink_label, label_visibility="collapsed")
-
-        # Edit-mode + overlay sinks: the viewer polls these so we can enable Shift+drag
-        # drawing and update styles/overlays without remounting the iframe.
-        edit_mode_sink_label = f"edit_mode_sink_{file_id}"
-        draw_event_sink_label = f"draw_event_sink_{file_id}"
-        manual_overlay_sink_label = f"manual_overlay_sink_{file_id}"
-        door_state_sink_label = f"door_state_sink_{file_id}"
-        viewer_display_sink_label = f"viewer_display_sink_{file_id}"
-        unmatched_debug_sink_label = f"unmatched_debug_sink_{file_id}"
-        candidate_pool_sink_label = f"candidate_pool_sink_{file_id}"
-
-        # Server → iframe values (updated every run).
-        try:
-            working = _get_working_label_state(fstate)
-            st.session_state[edit_mode_sink_label] = "1" if bool(fstate.get("edit_mode")) else "0"
-            st.session_state[viewer_display_sink_label] = _viewer_display_mode_to_sink_value(
-                str(fstate.get("viewer_display_mode") or "Highlight All")
-            )
-            st.session_state[door_state_sink_label] = json.dumps(
-                {
-                    "confirmed_ids": sorted(list(flatten_confirmed_ids(working.get("confirmed_by_type", {})))),
-                    "deleted_ids": sorted(list(working.get("deleted_ids", set()))),
-                },
-                separators=(",", ":"),
-            )
-            # Manual overlay data is supplied via a separate sink (preview-space bboxes).
-            # Only show these while editing so exiting Edit Doors clears the overlays.
-            if bool(fstate.get("edit_mode")):
-                manual_payload = _manual_overlay_payload_for_sink(
-                    fstate=fstate,
-                    preview_scale=float(preview_spec.get("scale", 1.0) or 1.0),
-                )
-            else:
-                manual_payload = {"manual_additions": [], "unmatched_manual_boxes": []}
-            st.session_state[manual_overlay_sink_label] = json.dumps(manual_payload, separators=(",", ":"))
-            st.session_state[unmatched_debug_sink_label] = str(fstate.get("_last_unmatched_debug") or "")
-            # Candidate pool for snapping: preview-space bboxes for a broad set of candidates.
-            # This allows snap-to-candidate even when the candidate is not in the final `doors` list.
-            try:
-                scale = float(preview_spec.get("scale", 1.0) or 1.0)
-            except Exception:
-                scale = 1.0
-            pool = list(doors_data.get("candidates", []) or [])
-
-            def _sample_pool_for_sink(
-                cands: List[Dict[str, Any]],
-                *,
-                full_w: Optional[int],
-                full_h: Optional[int],
-                max_out: int,
-                grid: int = 8,
-            ) -> List[Dict[str, Any]]:
-                """Pick a spatially-diverse subset of candidates for client snapping.
-
-                Using only top-N by confidence can omit low-confidence-but-correct
-                candidates elsewhere on the page. A coarse grid keeps coverage.
-                """
-                if not cands:
-                    return []
-                if not full_w or not full_h or full_w <= 0 or full_h <= 0:
-                    return cands[:max_out]
-                g = max(2, min(16, int(grid)))
-                per_cell = max(1, int(max_out // (g * g)))
-                buckets: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
-                seen: set[str] = set()
-
-                def _cell_for_bbox(bb: Tuple[float, float, float, float]) -> Tuple[int, int]:
-                    cx = 0.5 * (bb[0] + bb[2])
-                    cy = 0.5 * (bb[1] + bb[3])
-                    ix = int((cx / float(full_w)) * g)
-                    iy = int((cy / float(full_h)) * g)
-                    ix = max(0, min(g - 1, ix))
-                    iy = max(0, min(g - 1, iy))
-                    return (ix, iy)
-
-                # Pool is already sorted by confidence; keep each bucket in that order.
-                for cand in cands:
-                    cid = cand.get("id")
-                    bbox = cand.get("bbox_xyxy")
-                    if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
-                        continue
-                    sid = str(cid)
-                    if sid in seen:
-                        continue
-                    nb = _normalize_bbox_xyxy(bbox)
-                    if nb is None:
-                        continue
-                    cell = _cell_for_bbox(nb)
-                    buckets.setdefault(cell, []).append(cand)
-                    seen.add(sid)
-
-                out: List[Dict[str, Any]] = []
-                used: set[str] = set()
-                for ix in range(g):
-                    for iy in range(g):
-                        for cand in buckets.get((ix, iy), [])[:per_cell]:
-                            sid = str(cand.get("id"))
-                            if sid in used:
-                                continue
-                            out.append(cand)
-                            used.add(sid)
-                            if len(out) >= max_out:
-                                return out
-
-                # Fill remaining slots with highest-confidence unused candidates.
-                if len(out) < max_out:
-                    for cand in cands:
-                        sid = str(cand.get("id"))
-                        if not sid or sid in used:
-                            continue
-                        out.append(cand)
-                        used.add(sid)
-                        if len(out) >= max_out:
-                            break
-                return out[:max_out]
-
-            # Determine full-res dimensions for spatial bucketing.
-            full_w = None
-            full_h = None
-            if isinstance(full_dims, tuple) and len(full_dims) == 2:
-                try:
-                    full_w = int(full_dims[0]) if full_dims[0] is not None else None
-                    full_h = int(full_dims[1]) if full_dims[1] is not None else None
-                except Exception:
-                    full_w, full_h = None, None
-
-            picked = _sample_pool_for_sink(pool, full_w=full_w, full_h=full_h, max_out=1200, grid=8)
-            out_pool: List[Dict[str, Any]] = []
-            for cand in picked:
-                cid = cand.get("id")
-                bbox = cand.get("bbox_xyxy")
-                if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
-                    continue
-                nb = _normalize_bbox_xyxy(bbox)
-                if nb is None:
-                    continue
-                # full → preview
-                out_pool.append(
-                    {
-                        "id": str(cid),
-                        "type": str(cand.get("type") or ""),
-                        "confidence": float(cand.get("confidence", 0.0) or 0.0),
-                        "bbox_xyxy": [float(nb[0]) * scale, float(nb[1]) * scale, float(nb[2]) * scale, float(nb[3]) * scale],
-                    }
-                )
-            st.session_state[candidate_pool_sink_label] = json.dumps({"candidates": out_pool}, separators=(",", ":"))
-        except Exception:
-            pass
-
-        # Iframe → server events (do not overwrite once set by JS).
-        if draw_event_sink_label not in st.session_state:
-            st.session_state[draw_event_sink_label] = ""
-
-        st.text_input(edit_mode_sink_label, key=edit_mode_sink_label, label_visibility="collapsed")
-        st.text_input(draw_event_sink_label, key=draw_event_sink_label, label_visibility="collapsed")
-        st.text_input(manual_overlay_sink_label, key=manual_overlay_sink_label, label_visibility="collapsed")
-        st.text_input(door_state_sink_label, key=door_state_sink_label, label_visibility="collapsed")
-        st.text_input(viewer_display_sink_label, key=viewer_display_sink_label, label_visibility="collapsed")
-        st.text_input(unmatched_debug_sink_label, key=unmatched_debug_sink_label, label_visibility="collapsed")
-        st.text_input(candidate_pool_sink_label, key=candidate_pool_sink_label, label_visibility="collapsed")
-
         viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
         viewer_width_hint = max(600, min(2000, viewer_width_hint))
         aspect = float(VIEWER_ASPECT_RATIO_HW)
@@ -1930,36 +1841,175 @@ def main_viewer_canvas(
         viewer_height = int(round(viewer_width_hint * aspect))
         viewer_height = max(450, min(1400, viewer_height))
 
-        # NOTE: Don't wrap this in `st.container(height=...)` because Streamlit makes that
-        # container scrollable (adds a scrollbar) which steals scroll/drag interactions.
-        rects_svg = _rects_to_svg(
-            active_doors=active_doors,
-            fstate=fstate,
-            scale=float(preview_spec.get("scale", 1.0)),
-            img_width=int(preview_spec.get("width", 1)),
-            img_height=int(preview_spec.get("height", 1)),
-        )
+        # --- Build PDF.js props (PDF-space bboxes) ---
+        pdf_path = file_dir / "source.pdf"
+        if not pdf_path.exists():
+            st.error("Missing source.pdf; cannot render PDF viewer.")
+            return None, active_doors
 
-        img_src = _image_path_to_streamlit_url(str(preview_spec.get("path", "")))
+        try:
+            pdf_mtime = int(pdf_path.stat().st_mtime_ns)
+        except Exception:
+            pdf_mtime = 0
+        pdf_hash, pdf_b64 = _load_pdf_b64_and_hash(str(pdf_path), mtime_ns=pdf_mtime)
 
-        _panzoom_image_viewer(
-            img_src=img_src,
-            img_width=int(preview_spec.get("width", 1)),
-            img_height=int(preview_spec.get("height", 1)),
-            rects_svg=rects_svg,
-            height=viewer_height,
-            key=str(file_id),
-            click_sink_aria_label=click_sink_label,
-            selected_sink_aria_label=selected_sink_label,
-            focus_seq_sink_aria_label=focus_seq_sink_label,
-            edit_mode_sink_aria_label=edit_mode_sink_label,
-            draw_event_sink_aria_label=draw_event_sink_label,
-            manual_overlay_sink_aria_label=manual_overlay_sink_label,
-            door_state_sink_aria_label=door_state_sink_label,
-            viewer_display_sink_aria_label=viewer_display_sink_label,
-            auto_focus_sink_aria_label=auto_focus_sink_label,
-            unmatched_debug_sink_aria_label=unmatched_debug_sink_label,
-            candidate_pool_sink_aria_label=candidate_pool_sink_label,
+        # Load Step1 transform so we can compute bbox_pdf_xyxy for any legacy data.
+        pix_to_pdf_affine: Optional[List[float]] = None
+        try:
+            tpath = file_dir / "transform.json"
+            if tpath.exists():
+                obj = json.loads(tpath.read_text())
+                m = obj.get("pix_to_pdf_affine") if isinstance(obj, dict) else None
+                if isinstance(m, list) and len(m) == 6:
+                    pix_to_pdf_affine = [float(v) for v in m]
+        except Exception:
+            pix_to_pdf_affine = None
+
+        def _bbox_pdf_for_any(bbox_xyxy: Any, bbox_pdf_xyxy: Any) -> Optional[List[float]]:
+            if isinstance(bbox_pdf_xyxy, list) and len(bbox_pdf_xyxy) == 4:
+                try:
+                    return [float(v) for v in bbox_pdf_xyxy]
+                except Exception:
+                    return None
+            if pix_to_pdf_affine is not None and isinstance(bbox_xyxy, list) and len(bbox_xyxy) == 4:
+                try:
+                    bb = normalize_bbox_xyxy(bbox_xyxy)
+                    return apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
+                except Exception:
+                    return None
+            return None
+
+        overlay_doors_pdf: List[Dict[str, Any]] = []
+        for d in list(active_doors or []):
+            did = d.get("id")
+            if did is None:
+                continue
+            bb_pdf = _bbox_pdf_for_any(d.get("bbox_xyxy"), d.get("bbox_pdf_xyxy"))
+            if not bb_pdf:
+                continue
+            overlay_doors_pdf.append({"id": str(did), "bbox_pdf_xyxy": bb_pdf})
+
+        # Candidate pool for snapping (PDF-space bboxes).
+        pool = list(doors_data.get("candidates", []) or [])
+
+        def _sample_pool_for_viewer(
+            cands: List[Dict[str, Any]],
+            *,
+            full_w: Optional[int],
+            full_h: Optional[int],
+            max_out: int,
+            grid: int = 8,
+        ) -> List[Dict[str, Any]]:
+            if not cands:
+                return []
+            if not full_w or not full_h or full_w <= 0 or full_h <= 0:
+                return cands[:max_out]
+            g = max(2, min(16, int(grid)))
+            per_cell = max(1, int(max_out // (g * g)))
+            buckets: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+            seen: set[str] = set()
+
+            def _cell_for_bbox(bb: Tuple[float, float, float, float]) -> Tuple[int, int]:
+                cx = 0.5 * (bb[0] + bb[2])
+                cy = 0.5 * (bb[1] + bb[3])
+                ix = int((cx / float(full_w)) * g)
+                iy = int((cy / float(full_h)) * g)
+                ix = max(0, min(g - 1, ix))
+                iy = max(0, min(g - 1, iy))
+                return (ix, iy)
+
+            for cand in cands:
+                cid = cand.get("id")
+                bbox = cand.get("bbox_xyxy")
+                if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
+                    continue
+                sid = str(cid)
+                if sid in seen:
+                    continue
+                nb = _normalize_bbox_xyxy(bbox)
+                if nb is None:
+                    continue
+                buckets.setdefault(_cell_for_bbox(nb), []).append(cand)
+                seen.add(sid)
+
+            out: List[Dict[str, Any]] = []
+            used: set[str] = set()
+            for ix in range(g):
+                for iy in range(g):
+                    for cand in buckets.get((ix, iy), [])[:per_cell]:
+                        sid = str(cand.get("id"))
+                        if sid in used:
+                            continue
+                        out.append(cand)
+                        used.add(sid)
+                        if len(out) >= max_out:
+                            return out
+
+            if len(out) < max_out:
+                for cand in cands:
+                    sid = str(cand.get("id"))
+                    if not sid or sid in used:
+                        continue
+                    out.append(cand)
+                    used.add(sid)
+                    if len(out) >= max_out:
+                        break
+            return out[:max_out]
+
+        full_w = None
+        full_h = None
+        if isinstance(full_dims, tuple) and len(full_dims) == 2:
+            try:
+                full_w = int(full_dims[0]) if full_dims[0] is not None else None
+                full_h = int(full_dims[1]) if full_dims[1] is not None else None
+            except Exception:
+                full_w, full_h = None, None
+
+        picked = _sample_pool_for_viewer(pool, full_w=full_w, full_h=full_h, max_out=1200, grid=8)
+        out_pool: List[Dict[str, Any]] = []
+        for cand in picked:
+            cid = cand.get("id")
+            if cid is None:
+                continue
+            bb_pdf = _bbox_pdf_for_any(cand.get("bbox_xyxy"), cand.get("bbox_pdf_xyxy"))
+            if not bb_pdf:
+                continue
+            out_pool.append({"id": str(cid), "bbox_pdf_xyxy": bb_pdf})
+
+        # Door state for styling.
+        working = _get_working_label_state(fstate)
+        door_state = {
+            "confirmed_ids": sorted(list(flatten_confirmed_ids(working.get("confirmed_by_type", {})))),
+            "deleted_ids": sorted(list(working.get("deleted_ids", set()))),
+        }
+
+        # Manual overlays: show only the current edit-session records.
+        if bool(fstate.get("edit_mode")) and pix_to_pdf_affine is not None:
+            manual_payload = _manual_overlay_payload_for_pdfjs(fstate=fstate, pix_to_pdf_affine=pix_to_pdf_affine)
+        else:
+            manual_payload = {"manual_additions": [], "unmatched_manual_boxes": []}
+
+        unmatched_debug_raw = str(fstate.get("_last_unmatched_debug") or "")
+        viewer_display = _viewer_display_mode_to_sink_value(str(fstate.get("viewer_display_mode") or "Highlight All"))
+        viewer_key = f"pdfjs_viewer_{file_id}"
+
+        # NOTE: component value is stored in session_state under this key.
+        pdfjs_viewer(
+            file_id=str(file_id),
+            height=int(viewer_height),
+            pdf_hash=str(pdf_hash),
+            pdf_data_b64=str(pdf_b64),
+            page_number=1,
+            overlay_doors=overlay_doors_pdf,
+            candidate_pool=out_pool,
+            selected_door_id=str(fstate.get("selected_door_id") or ""),
+            focus_seq=int(fstate.get("_focus_seq") or 0),
+            edit_mode=bool(fstate.get("edit_mode")),
+            viewer_display_mode=str(viewer_display),
+            door_state=door_state,
+            manual_overlays=manual_payload,
+            unmatched_debug_raw=unmatched_debug_raw,
+            key=viewer_key,
         )
         return None, active_doors
 

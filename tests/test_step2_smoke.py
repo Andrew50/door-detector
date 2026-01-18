@@ -69,6 +69,8 @@ def test_step2_smoke() -> None:
             c0 = data["candidates"][0]
             assert "id" in c0
             assert "bbox_xyxy" in c0
+            # PDF-space bbox is required for the PDF.js viewer overlay.
+            assert "bbox_pdf_xyxy" in c0
             assert "confidence" in c0
             assert "features" in c0
         # This PDF is constructed to satisfy the strict swing-door thresholds.
