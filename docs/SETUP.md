@@ -132,6 +132,38 @@ virtualenv venv
 python3 --version  # Must be 3.8 or higher
 ```
 
+### Browser console warnings (Permissions-Policy / iframe sandbox)
+
+You may see browser console warnings like:
+
+- `Unrecognized feature: 'ambient-light-sensor'` (and similar)
+- `An iframe which has both allow-scripts and allow-same-origin for its sandbox attribute can escape its sandboxing.`
+
+**What they mean**
+
+- The **"Unrecognized feature"** messages can come from either:
+  - **A reverse proxy / hosting layer** injecting an outdated `Permissions-Policy` (or legacy `Feature-Policy`) HTTP response header, or
+  - **Streamlit’s own component iframe implementation**, which sets an `iframe allow="..."` list that includes some deprecated/unknown tokens in modern Chromium.
+- The **iframe sandbox** message is a Chromium warning about Streamlit **component iframes**. Door Detector’s viewer uses `streamlit.components.v1.html` for pan/zoom and overlay interactivity, which relies on the Streamlit component iframe model.
+
+**How to actually eliminate the “Unrecognized feature” warnings**
+
+If you’re running Streamlit behind a reverse proxy (Nginx/Traefik/Caddy/Cloudflare), remove or replace the header there.
+
+Example Nginx snippet (in your `location /` block):
+
+```nginx
+# Strip legacy / noisy policies coming from upstream or defaults
+proxy_hide_header Permissions-Policy;
+proxy_hide_header Feature-Policy;
+
+# Optional: add a minimal, modern policy (only if you want one)
+# (Keep this list small to avoid deprecated directives causing warnings.)
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+```
+
+If you run Streamlit directly with `streamlit run ...` and **no** proxy, there isn’t a supported way (in Streamlit today) to change the component iframe `allow` list or suppress Chromium’s warnings from inside the app. In that case, these warnings are generally safe to ignore.
+
 **Streamlit / Drawable Canvas Compatibility (Pinned):**
 This project pins Streamlit to a compatible version because `streamlit-drawable-canvas==0.9.3` relies on Streamlit internals that changed in newer Streamlit releases.
 

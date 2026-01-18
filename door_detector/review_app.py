@@ -16,7 +16,14 @@ import streamlit.components.v1 as components
 from PIL import Image
 
 from door_detector.analysis_signature import compute_analysis_signature
-from door_detector.door_features import compute_iou
+from door_detector.door_features import (
+    compute_iou,
+    dist_point_to_point,
+    fit_circle,
+    get_arc_angle_span,
+    get_bbox,
+    sample_bezier,
+)
 
 from door_detector.library import Library
 from door_detector.step1_pipeline import process_pdf
@@ -421,16 +428,30 @@ st.markdown("""
 
     /* Hide internal "sink" widgets (used for box click selection + JS sync) */
     div[data-testid="stTextInput"]:has(input[aria-label^="door_click_sink_"]) {
-        display: none !important;
-        height: 0 !important;
+        /* IMPORTANT: don't use display:none; Streamlit/React may ignore programmatic
+           input events on elements that are not rendered. Keep it off-screen. */
+        position: fixed !important;
+        left: -10000px !important;
+        top: -10000px !important;
+        width: 1px !important;
+        height: 1px !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
         margin: 0 !important;
         padding: 0 !important;
+        pointer-events: none !important;
     }
     div[data-testid="stTextInput"] input[aria-label^="door_click_sink_"] {
-        display: none !important;
-        height: 0 !important;
+        position: fixed !important;
+        left: -10000px !important;
+        top: -10000px !important;
+        width: 1px !important;
+        height: 1px !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
         margin: 0 !important;
         padding: 0 !important;
+        pointer-events: none !important;
     }
     div[data-testid="stTextInput"]:has(input[aria-label^="selected_door_sink_"]) {
         display: none !important;
@@ -457,6 +478,19 @@ st.markdown("""
         padding: 0 !important;
     }
 
+    div[data-testid="stTextInput"]:has(input[aria-label^="auto_focus_sink_"]) {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stTextInput"] input[aria-label^="auto_focus_sink_"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
     div[data-testid="stTextInput"]:has(input[aria-label^="edit_mode_sink_"]),
     div[data-testid="stTextInput"]:has(input[aria-label^="draw_event_sink_"]),
     div[data-testid="stTextInput"]:has(input[aria-label^="manual_overlay_sink_"]),
@@ -476,6 +510,17 @@ st.markdown("""
         height: 0 !important;
         margin: 0 !important;
         padding: 0 !important;
+    }
+
+    /* Door navigation: make the index input look obviously editable */
+    div[data-testid="stNumberInput"]:has(input[aria-label^="door_jump_idx_"]) input {
+        text-align: center !important;
+        font-weight: 650 !important;
+        background: rgba(17, 25, 40, 0.70) !important;
+        border: 1px solid rgba(255, 255, 255, 0.22) !important;
+        border-radius: 10px !important;
+        height: 38px !important;
+        padding: 0px 10px !important;
     }
 
     /* Prevent Delete/Confirm/Cancel labels from wrapping (even in narrow columns)
@@ -565,10 +610,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Some browsers persist a collapsed sidebar state. Since we remove the visible
-# toggle UI, auto-open the sidebar once on load if needed.
-components.html(
+def _sidebar_autopen_component_html() -> str:
+    """JS that force-opens Streamlit's sidebar if a prior session left it collapsed.
+
+    NOTE: This must run inside a Streamlit component iframe so it can access `window.parent`.
     """
+    return """
 <script>
 (function () {
   try {
@@ -614,10 +661,7 @@ components.html(
   } catch (_) {}
 })();
 </script>
-""",
-    height=0,
-    scrolling=False,
-)
+"""
 
 # --- Initialize Library ---
 if "library" not in st.session_state:
@@ -641,6 +685,10 @@ if "upload_widget_seq" not in st.session_state:
 if "door_detector_pipeline_task" not in st.session_state:
     # { file_id, file_dir, config_path, label, _started }
     st.session_state.door_detector_pipeline_task = None
+
+# Debug logging toggle (server console). Used by `_debug_log(...)`.
+if "debug_perf" not in st.session_state:
+    st.session_state.debug_perf = False
 
 VIEWER_TARGET_WIDTH_PX = 1200
 VIEWER_ASPECT_RATIO_HW = 0.75  # height/width
@@ -689,6 +737,27 @@ def _debug_log(msg: str, *args: Any) -> None:
     except Exception:
         return
 
+
+def _coerce_bool(v: Any, *, default: bool = False) -> bool:
+    """Best-effort boolean coercion for values coming from Streamlit/session_state."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            return bool(int(v) != 0)
+        except Exception:
+            return default
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "f", "no", "n", "off", ""):
+            return False
+        return default
+    return default
+
 def _delete_library_item_and_reset_ui(file_id: str) -> None:
     lib.delete_item(file_id)
     # Clear selection + per-file UI state to avoid dangling widget keys.
@@ -698,6 +767,7 @@ def _delete_library_item_and_reset_ui(file_id: str) -> None:
         pass
     for k in [
         f"auto_focus_{file_id}",
+        f"auto_focus_sink_{file_id}",
         f"jump_{file_id}",
         f"door_click_sink_{file_id}",
         f"selected_door_sink_{file_id}",
@@ -914,10 +984,13 @@ def _snap_to_candidate(
     dh = max(1.0, y1 - y0)
     dcenter = _bbox_center_xy(drawn)
 
+    # Only consider candidates that overlap the selection box (IoU>0). This matches the
+    # “selector rectangle” UX and prevents snapping to nearby doors outside the box.
     best_iou = -1.0
     best_by_iou: Optional[Dict[str, Any]] = None
-    centers_inside: List[Tuple[float, float, Dict[str, Any]]] = []  # (dist, iou, cand)
-    centers_all: List[Tuple[float, float, Dict[str, Any]]] = []
+    best_inter = -1.0
+    best_by_inter: Optional[Dict[str, Any]] = None
+    any_overlap = False
 
     for cand in candidates:
         cid = cand.get("id")
@@ -927,35 +1000,38 @@ def _snap_to_candidate(
         cx0, cy0, cx1, cy1 = cb
         cbox = [cx0, cy0, cx1, cy1]
         iou = float(compute_iou(drawn, cbox))
+        if iou <= 0.0:
+            continue
+        any_overlap = True
         if iou > best_iou:
             best_iou = iou
             best_by_iou = cand
-        ccenter = _bbox_center_xy(cbox)
-        dist = math.hypot(ccenter[0] - dcenter[0], ccenter[1] - dcenter[1])
-        centers_all.append((dist, iou, cand))
-        if _point_in_bbox(ccenter, drawn):
-            centers_inside.append((dist, iou, cand))
+        # Track maximum intersection area as a robust fallback (IoU can be low when
+        # the selector rectangle is larger than the candidate).
+        inter_x0 = max(drawn[0], cbox[0])
+        inter_y0 = max(drawn[1], cbox[1])
+        inter_x1 = min(drawn[2], cbox[2])
+        inter_y1 = min(drawn[3], cbox[3])
+        inter_w = max(0.0, inter_x1 - inter_x0)
+        inter_h = max(0.0, inter_y1 - inter_y0)
+        inter = inter_w * inter_h
+        if inter > best_inter:
+            best_inter = inter
+            best_by_inter = cand
 
-    if not centers_all:
+    if not any_overlap:
         return None, 0.0
 
     # Primary: max IoU.
-    MIN_SNAP_IOU = 0.10
+    MIN_SNAP_IOU = 0.02
     if best_by_iou is not None and best_iou >= MIN_SNAP_IOU:
         return best_by_iou, max(0.0, float(best_iou))
 
-    # Fallback 1: candidate center inside the drawn box.
-    if centers_inside:
-        centers_inside.sort(key=lambda t: (-t[1], t[0]))  # prefer higher IoU, then closer
-        cand = centers_inside[0][2]
-        return cand, max(0.0, float(centers_inside[0][1]))
-
-    # Fallback 2: closest center, with a sanity threshold.
-    centers_all.sort(key=lambda t: (t[0], -t[1]))
-    dist, iou, cand = centers_all[0]
-    max_dist = 0.75 * max(dw, dh)
-    if dist <= max_dist:
-        return cand, max(0.0, float(iou))
+    # Fallback: max intersection area among overlapping candidates.
+    if best_by_inter is not None and best_inter > 0.0:
+        cb = _normalize_bbox_xyxy(best_by_inter.get("bbox_xyxy"))
+        if cb is not None:
+            return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
 
     return None, 0.0
 
@@ -982,6 +1058,344 @@ def _clamp_bbox_xyxy(bbox_xyxy: List[float], *, w: Optional[int], h: Optional[in
     return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
 
 
+def _bbox_intersects(a: List[float], b: List[float]) -> bool:
+    return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+
+
+def _expand_bbox(b: List[float], pad: float) -> List[float]:
+    nb = _normalize_bbox_xyxy(b)
+    if nb is None:
+        return [0.0, 0.0, 0.0, 0.0]
+    x0, y0, x1, y1 = nb
+    p = float(pad or 0.0)
+    return [x0 - p, y0 - p, x1 + p, y1 + p]
+
+
+def _debug_unmatched_region(
+    *,
+    file_dir: Path,
+    drawn_bbox_full_xyxy: List[float],
+    config_path: str,
+) -> Optional[str]:
+    """Explain why a clearly-boxed door produced no candidate overlap.
+
+    This runs only when Debug logs is enabled and prints to the server console.
+    """
+    try:
+        if not st.session_state.get("debug_perf"):
+            return None
+    except Exception:
+        return None
+
+    primitives_path = file_dir / "primitives.json"
+    meta_path = file_dir / "meta.json"
+    if not primitives_path.exists() or not meta_path.exists():
+        _debug_log("unmatched_debug missing primitives/meta in %s", str(file_dir))
+        return None
+
+    try:
+        primitives = json.loads(primitives_path.read_text(encoding="utf-8"))
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _debug_log("unmatched_debug failed to read primitives/meta: %s", str(e))
+        return None
+
+    try:
+        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except Exception as e:
+        _debug_log("unmatched_debug failed to read config %s: %s", str(config_path), str(e))
+        return None
+
+    if (meta or {}).get("mode") == "scan":
+        _debug_log("unmatched_debug meta.mode=scan (no vector candidates).")
+        return None
+
+    swing_conf = (cfg.get("swing") or {}) if isinstance(cfg, dict) else {}
+    if not bool(swing_conf.get("enabled", False)):
+        _debug_log("unmatched_debug swing.enabled=false (no swing candidates).")
+        return None
+
+    arc_conf = swing_conf.get("arc") or {}
+    leaf_conf = swing_conf.get("leaf") or {}
+    score_conf = swing_conf.get("scoring") or {}
+    out_conf = cfg.get("output") or {}
+
+    min_confidence = float(out_conf.get("min_confidence", 0.55) or 0.55)
+    bezier_pts = int(swing_conf.get("bezier_sampling_points", 17) or 17)
+
+    nb = _normalize_bbox_xyxy(drawn_bbox_full_xyxy)
+    if nb is None:
+        return None
+    drawn = [nb[0], nb[1], nb[2], nb[3]]
+    roi = _expand_bbox(drawn, pad=250.0)
+
+    lines = list((primitives.get("lines") or []))
+    beziers = list((primitives.get("beziers") or []))
+
+    # Pre-filter lines by ROI for speed.
+    line_infos: List[Dict[str, Any]] = []
+    for i, line in enumerate(lines):
+        try:
+            p0 = (float(line["p0"]["x"]), float(line["p0"]["y"]))
+            p1 = (float(line["p1"]["x"]), float(line["p1"]["y"]))
+        except Exception:
+            continue
+        lb = [min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1])]
+        if _bbox_intersects(lb, roi):
+            line_infos.append({"idx": i, "p0": p0, "p1": p1, "bbox": lb})
+
+    # Bezier quick bbox from control points.
+    def _bez_bbox(bez: Dict[str, Any]) -> Optional[List[float]]:
+        try:
+            xs = [float(bez[k]["x"]) for k in ("p0", "p1", "p2", "p3")]
+            ys = [float(bez[k]["y"]) for k in ("p0", "p1", "p2", "p3")]
+            return [min(xs), min(ys), max(xs), max(ys)]
+        except Exception:
+            return None
+
+    # Counters for why arcs/leaf matches fail.
+    arc_total = 0
+    arc_near = 0
+    arc_fail_radius = 0
+    arc_fail_rmse = 0
+    arc_fail_angle = 0
+    arc_pass = 0
+
+    leaf_tested = 0
+    leaf_fail_len_ratio = 0
+    leaf_fail_hinge = 0
+    leaf_fail_center = 0
+    leaf_fail_radial = 0
+    leaf_fail_tip = 0
+    leaf_pass = 0
+    cand_below_conf = 0
+
+    best_candidate: Optional[Dict[str, Any]] = None
+    best_candidate_below: Optional[Dict[str, Any]] = None
+
+    # Config thresholds (mirror door_detection).
+    min_radius = float(arc_conf.get("min_radius_px", 8) or 8)
+    max_radius = float(arc_conf.get("max_radius_px", 220) or 220)
+    max_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
+    min_angle = float(arc_conf.get("min_angle_deg", 20) or 20)
+    max_angle = float(arc_conf.get("max_angle_deg", 125) or 125)
+
+    min_len_ratio = float(leaf_conf.get("min_length_ratio", 0.45) or 0.45)
+    max_len_ratio = float(leaf_conf.get("max_length_ratio", 1.25) or 1.25)
+    max_hinge_ratio = float(leaf_conf.get("max_hinge_dist_ratio", 0.25) or 0.25)
+    require_center = bool(leaf_conf.get("require_endpoint_near_center", False))
+    max_center_ratio = float(leaf_conf.get("max_center_dist_ratio", max_hinge_ratio) or max_hinge_ratio)
+    max_radial_angle = leaf_conf.get("max_radial_angle_deg", None)
+    max_tip_ratio = leaf_conf.get("max_tip_to_arc_ratio", None)
+    try:
+        max_radial_angle = float(max_radial_angle) if max_radial_angle is not None else None
+    except Exception:
+        max_radial_angle = None
+    try:
+        max_tip_ratio = float(max_tip_ratio) if max_tip_ratio is not None else None
+    except Exception:
+        max_tip_ratio = None
+
+    w_fit = float(score_conf.get("w_fit", 0.45) or 0.45)
+    w_angle = float(score_conf.get("w_angle", 0.25) or 0.25)
+    w_prox = float(score_conf.get("w_proximity", 0.30) or 0.30)
+
+    for b_idx, bez in enumerate(beziers):
+        arc_total += 1
+        bb = _bez_bbox(bez)
+        if bb is None or not _bbox_intersects(bb, roi):
+            continue
+        arc_near += 1
+
+        # Sample and fit circle.
+        try:
+            pts = sample_bezier(bez["p0"], bez["p1"], bez["p2"], bez["p3"], num_points=bezier_pts)
+            center, radius, rmse = fit_circle(pts)
+            angle_span = float(get_arc_angle_span(pts, center))
+        except Exception:
+            continue
+
+        # Arc gates.
+        if not (min_radius <= float(radius) <= max_radius):
+            arc_fail_radius += 1
+            continue
+        if float(rmse) > max_rmse:
+            arc_fail_rmse += 1
+            continue
+        if not (min_angle <= float(angle_span) <= max_angle):
+            arc_fail_angle += 1
+            continue
+        arc_pass += 1
+
+        arc_bbox = get_bbox(pts)
+        query_bbox = [
+            arc_bbox[0] - float(radius) * 0.5,
+            arc_bbox[1] - float(radius) * 0.5,
+            arc_bbox[2] + float(radius) * 0.5,
+            arc_bbox[3] + float(radius) * 0.5,
+        ]
+
+        # Consider only nearby lines (already ROI-filtered) that intersect the arc query region.
+        for li in line_infos:
+            if not _bbox_intersects(li["bbox"], query_bbox):
+                continue
+            leaf_tested += 1
+            p0 = li["p0"]
+            p1 = li["p1"]
+            l_len = dist_point_to_point(p0, p1)
+            if float(radius) <= 1e-6:
+                continue
+            len_ratio = float(l_len) / float(radius)
+            if not (min_len_ratio <= len_ratio <= max_len_ratio):
+                leaf_fail_len_ratio += 1
+                continue
+
+            arc_start = pts[0]
+            arc_end = pts[-1]
+            d0_start = dist_point_to_point(p0, arc_start)
+            d0_end = dist_point_to_point(p0, arc_end)
+            d1_start = dist_point_to_point(p1, arc_start)
+            d1_end = dist_point_to_point(p1, arc_end)
+            d0_center = dist_point_to_point(p0, center)
+            d1_center = dist_point_to_point(p1, center)
+
+            min_hinge_dist = min(d0_start, d0_end, d1_start, d1_end)
+            if float(min_hinge_dist) > float(radius) * max_hinge_ratio:
+                if min(d0_center, d1_center) > float(radius) * max_hinge_ratio:
+                    leaf_fail_hinge += 1
+                    continue
+
+            if require_center and min(d0_center, d1_center) > float(radius) * max_center_ratio:
+                leaf_fail_center += 1
+                continue
+
+            radial_angle_deg = None
+            tip_to_arc_dist = None
+            if max_radial_angle is not None and max_radial_angle > 0:
+                hinge_pt = p0 if d0_center <= d1_center else p1
+                tip_pt = p1 if hinge_pt == p0 else p0
+                if dist_point_to_point(tip_pt, arc_start) <= dist_point_to_point(tip_pt, arc_end):
+                    target_pt = arc_start
+                else:
+                    target_pt = arc_end
+                tip_to_arc_dist = dist_point_to_point(tip_pt, target_pt)
+                lx, ly = (tip_pt[0] - hinge_pt[0], tip_pt[1] - hinge_pt[1])
+                rx, ry = (target_pt[0] - center[0], target_pt[1] - center[1])
+                ln = math.hypot(lx, ly)
+                rn = math.hypot(rx, ry)
+                if ln > 1e-6 and rn > 1e-6:
+                    dot = (lx * rx + ly * ry) / (ln * rn)
+                    dot = max(-1.0, min(1.0, dot))
+                    radial_angle_deg = math.degrees(math.acos(dot))
+                    if radial_angle_deg > max_radial_angle:
+                        leaf_fail_radial += 1
+                        continue
+                if max_tip_ratio is not None and max_tip_ratio > 0 and tip_to_arc_dist is not None:
+                    if tip_to_arc_dist > float(radius) * max_tip_ratio:
+                        leaf_fail_tip += 1
+                        continue
+
+            # Candidate confidence (mirror door_detection).
+            fit_score = max(0.0, 1.0 - (float(rmse) / max_rmse)) if max_rmse > 0 else 0.0
+            min_a = float(arc_conf.get("min_angle_deg", 55.0) or 55.0)
+            denom = max(1.0, 90.0 - min_a)
+            angle_score = (float(angle_span) - min_a) / denom
+            angle_score = max(0.0, min(1.0, angle_score))
+            prox_score = max(0.0, 1.0 - (float(min_hinge_dist) / (float(radius) * max_hinge_ratio))) if max_hinge_ratio > 0 else 0.0
+            conf = w_fit * fit_score + w_angle * angle_score + w_prox * prox_score
+
+            leaf_pass += 1
+            cand = {
+                "b_idx": int(b_idx),
+                "l_idx": int(li["idx"]),
+                "confidence": float(conf),
+                "radius": float(radius),
+                "rmse": float(rmse),
+                "angle_span": float(angle_span),
+                "min_hinge_dist": float(min_hinge_dist),
+                "len_ratio": float(len_ratio),
+                "center_dist": float(min(d0_center, d1_center)),
+                "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
+                "tip_to_arc_dist": float(tip_to_arc_dist) if tip_to_arc_dist is not None else None,
+                "arc_bbox": arc_bbox,
+                "line_bbox": li["bbox"],
+            }
+            if best_candidate is None or cand["confidence"] > float(best_candidate.get("confidence", 0.0)):
+                best_candidate = cand
+            if conf < min_confidence:
+                cand_below_conf += 1
+                if best_candidate_below is None or cand["confidence"] > float(best_candidate_below.get("confidence", 0.0)):
+                    best_candidate_below = cand
+
+    _debug_log(
+        "unmatched_debug roi=%s drawn=%s lines_near=%d beziers_total=%d beziers_near=%d arcs_pass=%d arc_fail(radius=%d rmse=%d angle=%d)",
+        str([round(v, 1) for v in roi]),
+        str([round(v, 1) for v in drawn]),
+        len(line_infos),
+        int(arc_total),
+        int(arc_near),
+        int(arc_pass),
+        int(arc_fail_radius),
+        int(arc_fail_rmse),
+        int(arc_fail_angle),
+    )
+    _debug_log(
+        "unmatched_debug leaf tested=%d pass=%d fail(len=%d hinge=%d center=%d radial=%d tip=%d) min_conf=%.3f below_conf=%d",
+        int(leaf_tested),
+        int(leaf_pass),
+        int(leaf_fail_len_ratio),
+        int(leaf_fail_hinge),
+        int(leaf_fail_center),
+        int(leaf_fail_radial),
+        int(leaf_fail_tip),
+        float(min_confidence),
+        int(cand_below_conf),
+    )
+    if best_candidate is not None:
+        _debug_log("unmatched_debug best_candidate=%s", json.dumps(best_candidate, indent=2))
+        if float(best_candidate.get("confidence", 0.0)) < min_confidence:
+            _debug_log("unmatched_debug NOTE best_candidate below min_confidence=%.3f", float(min_confidence))
+    elif arc_near == 0:
+        _debug_log("unmatched_debug NOTE: no beziers near selection (no swing arcs to match).")
+    elif arc_pass == 0:
+        _debug_log("unmatched_debug NOTE: beziers near selection, but none pass arc thresholds.")
+    elif leaf_pass == 0:
+        _debug_log("unmatched_debug NOTE: arcs pass, but no leaf line matched leaf thresholds.")
+
+    # Also return a compact report for UI display.
+    try:
+        report = {
+            "roi": [round(v, 1) for v in roi],
+            "drawn": [round(v, 1) for v in drawn],
+            "lines_near": int(len(line_infos)),
+            "beziers_total": int(arc_total),
+            "beziers_near": int(arc_near),
+            "arc_pass": int(arc_pass),
+            "arc_fail": {
+                "radius": int(arc_fail_radius),
+                "rmse": int(arc_fail_rmse),
+                "angle": int(arc_fail_angle),
+            },
+            "leaf": {
+                "tested": int(leaf_tested),
+                "pass": int(leaf_pass),
+                "fail": {
+                    "len_ratio": int(leaf_fail_len_ratio),
+                    "hinge": int(leaf_fail_hinge),
+                    "center": int(leaf_fail_center),
+                    "radial": int(leaf_fail_radial),
+                    "tip": int(leaf_fail_tip),
+                },
+            },
+            "min_confidence": float(min_confidence),
+            "below_conf": int(cand_below_conf),
+            "best_candidate": best_candidate,
+        }
+        return json.dumps(report, indent=2)
+    except Exception:
+        return None
+
+
 def _process_draw_event_if_any(
     *,
     file_id: str,
@@ -990,6 +1404,7 @@ def _process_draw_event_if_any(
     doors_data: Dict[str, Any],
     preview_spec: Optional[Dict[str, Any]],
     full_dims: Optional[Tuple[int, int]],
+    config_path: str,
 ) -> None:
     """Consume a Shift+drag draw event from the iframe (if present)."""
     if not preview_spec:
@@ -1008,14 +1423,23 @@ def _process_draw_event_if_any(
         return
     event_id = evt.get("event_id")
     bbox = evt.get("bbox_xyxy")
+    snapped_candidate_id = evt.get("snapped_candidate_id")
     if not event_id or not isinstance(bbox, list) or len(bbox) != 4:
         return
     if str(event_id) == str(fstate.get("_last_draw_event_id")):
         return
     fstate["_last_draw_event_id"] = str(event_id)
+    _debug_log(
+        "draw_event file_id=%s event_id=%s snapped_candidate_id=%s bbox_preview=%s",
+        str(file_id),
+        str(event_id),
+        str(snapped_candidate_id),
+        str(bbox),
+    )
 
     # JS only emits in edit mode, but guard anyway.
     if not bool(fstate.get("edit_mode")):
+        _debug_log("draw_event ignored (not in edit_mode) file_id=%s", str(file_id))
         return
 
     _enter_edit_mode(fstate)
@@ -1037,9 +1461,25 @@ def _process_draw_event_if_any(
     drawn_full = _clamp_bbox_xyxy(drawn_full, w=full_w, h=full_h)
 
     candidates = list(doors_data.get("doors", []) or [])
-    best, iou = _snap_to_candidate(drawn_full, candidates=candidates)
+    best = None
+    iou = 0.0
+
+    if snapped_candidate_id:
+        sid = str(snapped_candidate_id)
+        best = next((c for c in candidates if str(c.get("id") or "") == sid), None)
+        if best is not None:
+            cb = _normalize_bbox_xyxy(best.get("bbox_xyxy"))
+            if cb is not None:
+                iou = float(compute_iou(drawn_full, [cb[0], cb[1], cb[2], cb[3]]))
+                # Reject client-proposed snaps that don't actually overlap the selection.
+                if iou <= 0.0:
+                    best = None
+    if best is None:
+        best, iou = _snap_to_candidate(drawn_full, candidates=candidates)
+
     if best is not None and best.get("id") is not None:
         cid = str(best["id"])
+        _debug_log("draw_event snap matched file_id=%s cid=%s iou=%.4f", str(file_id), cid, float(iou))
         snapped_full = _normalize_bbox_xyxy(best.get("bbox_xyxy")) or _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
         rec = {
             "drawn_bbox_xyxy": drawn_full,
@@ -1061,12 +1501,24 @@ def _process_draw_event_if_any(
         except Exception:
             pass
     else:
+        _debug_log("draw_event snap unmatched file_id=%s", str(file_id))
         draft["unmatched_manual_boxes"].append(
             {
                 "bbox_xyxy": drawn_full,
                 "note": "No candidate match",
             }
         )
+        fstate["_last_unmatched_debug"] = _debug_unmatched_region(
+            file_dir=file_dir,
+            drawn_bbox_full_xyxy=drawn_full,
+            config_path=str(config_path),
+        )
+
+    # Consume the sink value so it doesn't grow / re-trigger on reconnects.
+    try:
+        st.session_state[draw_key] = ""
+    except Exception:
+        pass
 
 
 def _manual_overlay_payload_for_sink(
@@ -1132,6 +1584,7 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
             "_edit_draft": None,
             "_edit_manual_confirmed_ids": set(),
             "_last_draw_event_id": None,
+            "_last_unmatched_debug": None,
             "_focus_seq": 0,
             "_focus_last_id": None,
             "_last_clicked_door_id": None,
@@ -1390,7 +1843,7 @@ def _panzoom_image_viewer(
     manual_overlay_sink_aria_label: str,
     door_state_sink_aria_label: str,
     viewer_display_sink_aria_label: str,
-    auto_focus: bool,
+    auto_focus_sink_aria_label: str,
 ) -> None:
     # This viewer provides:
     # - scrollwheel zoom (centered at cursor)
@@ -1404,7 +1857,9 @@ def _panzoom_image_viewer(
     manual_overlay_sink_aria_label_esc = html.escape(manual_overlay_sink_aria_label, quote=True)
     door_state_sink_aria_label_esc = html.escape(door_state_sink_aria_label, quote=True)
     viewer_display_sink_aria_label_esc = html.escape(viewer_display_sink_aria_label, quote=True)
+    auto_focus_sink_aria_label_esc = html.escape(auto_focus_sink_aria_label, quote=True)
     viewer_html = f"""
+{_sidebar_autopen_component_html()}
 <div id="pz_root_{key}" style="width: 100%; height: {height}px; overflow: hidden; background: #0e1117; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);">
   <style>
     html, body {{
@@ -1482,7 +1937,6 @@ def _panzoom_image_viewer(
   if (!root || !stage || !content || !img) return;
 
   const persistKey = "door_detector_pz_state_{html.escape(str(key), quote=True)}";
-  const autoFocus = {json.dumps(bool(auto_focus))};
   const clickSinkLabel = "{click_sink_aria_label_esc}";
   const selectedSinkLabel = "{selected_sink_aria_label_esc}";
   const focusSeqSinkLabel = "{focus_seq_sink_aria_label_esc}";
@@ -1491,6 +1945,21 @@ def _panzoom_image_viewer(
   const manualOverlaySinkLabel = "{manual_overlay_sink_aria_label_esc}";
   const doorStateSinkLabel = "{door_state_sink_aria_label_esc}";
   const viewerDisplaySinkLabel = "{viewer_display_sink_aria_label_esc}";
+
+  const autoFocusSinkLabel = "{auto_focus_sink_aria_label_esc}";
+  function parseBool(v, defaultValue) {{
+    if (v === true) return true;
+    if (v === false) return false;
+    const s = String(v ?? "").trim().toLowerCase();
+    if (s === "1" || s === "true" || s === "t" || s === "yes" || s === "y" || s === "on") return true;
+    if (s === "0" || s === "false" || s === "f" || s === "no" || s === "n" || s === "off" || s === "") return false;
+    return !!defaultValue;
+  }}
+  function getAutoFocus() {{
+    return parseBool(readParentInputValue(autoFocusSinkLabel), true);
+  }}
+  let autoFocus = getAutoFocus();
+
   try {{
     console.log("[door_detector] pz init", {{
       key: {json.dumps(str(key))},
@@ -1504,6 +1973,7 @@ def _panzoom_image_viewer(
       manualOverlaySinkLabel,
       doorStateSinkLabel,
       viewerDisplaySinkLabel,
+      autoFocusSinkLabel,
       ts: Date.now(),
     }});
   }} catch (_) {{}}
@@ -1604,13 +2074,87 @@ def _panzoom_image_viewer(
 
   function setParentInputValue(label, value) {{
     try {{
-      const input = window.parent?.document?.querySelector(`input[aria-label="${{label}}"]`);
+      const doc = window.parent?.document;
+      if (!doc || !label) return false;
+      let input = null;
+      try {{
+        input = doc.querySelector(`input[aria-label="${{label}}"]`);
+      }} catch (_) {{
+        input = null;
+      }}
+      if (!input) {{
+        // Fallback: Streamlit sometimes mutates aria-label; allow prefix match.
+        try {{
+          input = doc.querySelector(`input[aria-label^="${{label}}"]`);
+        }} catch (_) {{
+          input = null;
+        }}
+      }}
       if (!input) return false;
-      input.value = String(value);
-      input.dispatchEvent(new Event("input", {{ bubbles: true }}));
-      input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+
+      // Use the native setter so React/Streamlit observe the change.
+      const v = String(value);
+      const prev = String(input.value || "");
+      // Some Streamlit builds may only commit widget state on focused inputs.
+      try {{ input.focus({{ preventScroll: true }}); }} catch (_) {{}}
+      // Streamlit's frontend is React; resetting the value tracker makes "input"
+      // events reliably propagate widget state updates.
+      let hadTracker = false;
+      try {{
+        const tracker = input._valueTracker;
+        if (tracker && tracker.setValue) {{
+          hadTracker = true;
+          tracker.setValue(prev);
+        }}
+      }} catch (_) {{}}
+      try {{
+        // IMPORTANT: dispatch events created from the *parent realm* so React's
+        // event system sees them (cross-iframe Event instances can be ignored).
+        const evWin = input.ownerDocument && input.ownerDocument.defaultView ? input.ownerDocument.defaultView : (window.parent || window);
+        const setter = Object.getOwnPropertyDescriptor(evWin.HTMLInputElement.prototype, "value")?.set;
+        if (setter) setter.call(input, v);
+        else input.value = v;
+      }} catch (_) {{
+        input.value = v;
+      }}
+
+      // Dispatch events from the parent realm (see note above).
+      let inputEvtOk = false;
+      let changeEvtOk = false;
+      try {{
+        const evWin = input.ownerDocument && input.ownerDocument.defaultView ? input.ownerDocument.defaultView : (window.parent || window);
+        const InputEv = evWin.InputEvent || evWin.Event;
+        const inputEvt = evWin.InputEvent
+          ? new evWin.InputEvent("input", {{ bubbles: true, cancelable: true, data: v, inputType: "insertReplacementText" }})
+          : new InputEv("input", {{ bubbles: true, cancelable: true }});
+        inputEvtOk = !!input.dispatchEvent(inputEvt);
+        const changeEvt = new evWin.Event("change", {{ bubbles: true, cancelable: true }});
+        changeEvtOk = !!input.dispatchEvent(changeEvt);
+      }} catch (_) {{
+        // Fallback (same-realm) if the above fails for any reason.
+        try {{ inputEvtOk = !!input.dispatchEvent(new Event("input", {{ bubbles: true }})); }} catch (_) {{}}
+        try {{ changeEvtOk = !!input.dispatchEvent(new Event("change", {{ bubbles: true }})); }} catch (_) {{}}
+      }}
+      try {{
+        window.__door_detectorLastSinkWrite = {{
+          ok: true,
+          label,
+          ariaLabel: input.getAttribute ? input.getAttribute("aria-label") : null,
+          prev,
+          next: v,
+          after: String(input.value || ""),
+          hadTracker,
+          inputEvtOk,
+          changeEvtOk,
+          ts: Date.now(),
+        }};
+      }} catch (_) {{}}
+      try {{ input.blur(); }} catch (_) {{}}
       return true;
     }} catch (_) {{
+      try {{
+        window.__door_detectorLastSinkWrite = {{ ok: false, label, ts: Date.now(), err: "exception" }};
+      }} catch (_) {{}}
       return false;
     }}
   }}
@@ -1675,10 +2219,46 @@ def _panzoom_image_viewer(
 
   function applyDoorStyles() {{
     if (!svg) return;
-    const selectedId = getSelectedId() || localSelectedId;
+    // Prefer local selection for immediate feedback; Streamlit selection takes over after rerun.
+    const selectedId = localSelectedId || getSelectedId();
     const viewMode = getViewerDisplayMode();
 
     const rects = svg.querySelectorAll("rect[data-door-id]");
+    try {{
+      if (!applyDoorStyles._loggedOnce) {{
+        applyDoorStyles._loggedOnce = true;
+        const first = rects && rects.length ? rects[0] : null;
+        let bb = null;
+        try {{ bb = first ? first.getBBox() : null; }} catch (_) {{ bb = null; }}
+
+        // Compute bbox range across all candidates (helps spot coord mismatches).
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        if (rects) {{
+          for (const rr of rects) {{
+            let b = null;
+            try {{ b = rr.getBBox(); }} catch (_) {{ b = null; }}
+            if (!b) continue;
+            const x0 = Number(b.x), y0 = Number(b.y);
+            const x1 = x0 + Number(b.width), y1 = y0 + Number(b.height);
+            if (!Number.isFinite(x0) || !Number.isFinite(y0) || !Number.isFinite(x1) || !Number.isFinite(y1)) continue;
+            minX = Math.min(minX, x0);
+            minY = Math.min(minY, y0);
+            maxX = Math.max(maxX, x1);
+            maxY = Math.max(maxY, y1);
+          }}
+        }}
+
+        const payload = {{
+          count: rects ? rects.length : 0,
+          firstId: first ? first.getAttribute("data-door-id") : null,
+          firstBBox: bb ? {{ x: Number(bb.x), y: Number(bb.y), w: Number(bb.width), h: Number(bb.height) }} : null,
+          candRange: (minX !== Infinity) ? [minX, minY, maxX, maxY] : null,
+          svgViewBox: svg ? svg.getAttribute("viewBox") : null,
+        }};
+        console.log("[door_detector] applyDoorStyles rects", payload);
+        console.log("[door_detector] applyDoorStyles rects json", JSON.stringify(payload));
+      }}
+    }} catch (_) {{}}
     for (const r of rects) {{
       const did = r.getAttribute("data-door-id");
       if (!did) continue;
@@ -1953,10 +2533,247 @@ def _panzoom_image_viewer(
     }} catch (_) {{}}
   }}
 
+  function computeIoU(a, b) {{
+    if (!a || !b || a.length !== 4 || b.length !== 4) return 0;
+    const ax0 = Math.min(a[0], a[2]), ay0 = Math.min(a[1], a[3]);
+    const ax1 = Math.max(a[0], a[2]), ay1 = Math.max(a[1], a[3]);
+    const bx0 = Math.min(b[0], b[2]), by0 = Math.min(b[1], b[3]);
+    const bx1 = Math.max(b[0], b[2]), by1 = Math.max(b[1], b[3]);
+    const ix0 = Math.max(ax0, bx0);
+    const iy0 = Math.max(ay0, by0);
+    const ix1 = Math.min(ax1, bx1);
+    const iy1 = Math.min(ay1, by1);
+    const iw = Math.max(0, ix1 - ix0);
+    const ih = Math.max(0, iy1 - iy0);
+    const inter = iw * ih;
+    const aa = Math.max(0, ax1 - ax0) * Math.max(0, ay1 - ay0);
+    const ba = Math.max(0, bx1 - bx0) * Math.max(0, by1 - by0);
+    const denom = aa + ba - inter;
+    if (!(denom > 0)) return 0;
+    return inter / denom;
+  }}
+
+  function computeIntersectionArea(a, b) {{
+    if (!a || !b || a.length !== 4 || b.length !== 4) return 0;
+    const ax0 = Math.min(a[0], a[2]), ay0 = Math.min(a[1], a[3]);
+    const ax1 = Math.max(a[0], a[2]), ay1 = Math.max(a[1], a[3]);
+    const bx0 = Math.min(b[0], b[2]), by0 = Math.min(b[1], b[3]);
+    const bx1 = Math.max(b[0], b[2]), by1 = Math.max(b[1], b[3]);
+    const ix0 = Math.max(ax0, bx0);
+    const iy0 = Math.max(ay0, by0);
+    const ix1 = Math.min(ax1, bx1);
+    const iy1 = Math.min(ay1, by1);
+    const iw = Math.max(0, ix1 - ix0);
+    const ih = Math.max(0, iy1 - iy0);
+    return iw * ih;
+  }}
+
+  function bboxCenter(b) {{
+    return {{ x: (b[0] + b[2]) / 2, y: (b[1] + b[3]) / 2 }};
+  }}
+
+  function snapCandidateForDraw(drawn) {{
+    if (!svg) return null;
+    const rects = svg.querySelectorAll("rect[data-door-id]");
+    if (!rects || rects.length === 0) return null;
+
+    const x0 = Math.min(drawn[0], drawn[2]);
+    const y0 = Math.min(drawn[1], drawn[3]);
+    const x1 = Math.max(drawn[0], drawn[2]);
+    const y1 = Math.max(drawn[1], drawn[3]);
+    const norm = [x0, y0, x1, y1];
+    const dw = Math.max(1, x1 - x0);
+    const dh = Math.max(1, y1 - y0);
+    const dc = bboxCenter(norm);
+
+    let best = null;
+    let bestIou = -1;
+    const centersInside = [];
+    const centersAll = [];
+    const overlap = []; // candidates with inter > 0 (i.e. actually inside selection)
+    let bestCoverage = -1;
+    let bestByCoverage = null;
+    let bestInter = -1;
+    let bestByInter = null;
+
+    for (const r of rects) {{
+      const did = r.getAttribute("data-door-id");
+      if (!did) continue;
+      // Use SVG geometry instead of relying on attributes (which can be missing/NaN).
+      let bb = null;
+      try {{ bb = r.getBBox(); }} catch (_) {{ bb = null; }}
+      if (!bb) continue;
+      const rw = Number(bb.width);
+      const rh = Number(bb.height);
+      const rx = Number(bb.x);
+      const ry = Number(bb.y);
+      if (!(rw > 0) || !(rh > 0) || !Number.isFinite(rx) || !Number.isFinite(ry)) continue;
+      const cand = [rx, ry, rx + rw, ry + rh];
+      const iou = computeIoU(norm, cand);
+      const inter = computeIntersectionArea(norm, cand);
+      const candArea = Math.max(0, (cand[2] - cand[0])) * Math.max(0, (cand[3] - cand[1]));
+      const coverage = candArea > 0 ? (inter / candArea) : 0; // how much of candidate is inside drawn
+      // Only consider candidates that overlap the selection for snapping.
+      // This prevents snapping to a nearby candidate outside the drawn box.
+      if (inter > 0) {{
+        overlap.push({{ id: did, bbox: cand, iou: iou, inter: inter, coverage: coverage }});
+        if (iou > bestIou) {{
+          bestIou = iou;
+          best = {{ id: did, bbox: cand, iou: iou }};
+        }}
+        if (coverage > bestCoverage) {{
+          bestCoverage = coverage;
+          bestByCoverage = {{ id: did, bbox: cand, iou: iou, inter: inter, coverage: coverage }};
+        }}
+        if (inter > bestInter) {{
+          bestInter = inter;
+          bestByInter = {{ id: did, bbox: cand, iou: iou, inter: inter, coverage: coverage }};
+        }}
+      }}
+      const cc = bboxCenter(cand);
+      const dist = Math.hypot(cc.x - dc.x, cc.y - dc.y);
+      const rec = {{ id: did, bbox: cand, iou: iou, dist: dist }};
+      centersAll.push(rec);
+      if (cc.x >= x0 && cc.x <= x1 && cc.y >= y0 && cc.y <= y1) centersInside.push(rec);
+    }}
+
+    // Snapping only considers candidates that overlap the selection.
+    const MIN_SNAP_IOU = 0.02; // selector rectangles can be larger than candidates
+    const MIN_CAND_COVERAGE = 0.20;
+    try {{
+      const closest = centersAll.length ? centersAll.slice().sort((a, b) => (a.dist - b.dist) || (b.iou - a.iou))[0] : null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let sample = [];
+      for (let i = 0; i < Math.min(3, overlap.length); i++) {{
+        const o = overlap[i];
+        sample.push({{ id: o.id, bbox: o.bbox, iou: o.iou, inter: o.inter, coverage: o.coverage }});
+      }}
+      // Compute candidate coordinate range (using bbox geometry).
+      for (const rr of rects) {{
+        let bb = null;
+        try {{ bb = rr.getBBox(); }} catch (_) {{ bb = null; }}
+        if (!bb) continue;
+        const rx0 = Number(bb.x), ry0 = Number(bb.y);
+        const rx1 = rx0 + Number(bb.width), ry1 = ry0 + Number(bb.height);
+        if (!Number.isFinite(rx0) || !Number.isFinite(ry0) || !Number.isFinite(rx1) || !Number.isFinite(ry1)) continue;
+        minX = Math.min(minX, rx0);
+        minY = Math.min(minY, ry0);
+        maxX = Math.max(maxX, rx1);
+        maxY = Math.max(maxY, ry1);
+      }}
+
+      // Also compute the nearest candidate to the drawn box (even if no overlap).
+      let nearest = null;
+      let bestDist = Infinity;
+      for (const rr of rects) {{
+        const did = rr.getAttribute("data-door-id");
+        if (!did) continue;
+        let bb = null;
+        try {{ bb = rr.getBBox(); }} catch (_) {{ bb = null; }}
+        if (!bb) continue;
+        const rx0 = Number(bb.x), ry0 = Number(bb.y);
+        const rx1 = rx0 + Number(bb.width), ry1 = ry0 + Number(bb.height);
+        if (!Number.isFinite(rx0) || !Number.isFinite(ry0) || !Number.isFinite(rx1) || !Number.isFinite(ry1)) continue;
+        const cand = [rx0, ry0, rx1, ry1];
+        const cc = bboxCenter(cand);
+        const dist = Math.hypot(cc.x - dc.x, cc.y - dc.y);
+        if (dist < bestDist) {{
+          bestDist = dist;
+          nearest = {{ id: did, bbox: cand, dist }};
+        }}
+      }}
+
+      // Compute max intersection among all candidates (diagnostic).
+      let maxInterAny = 0;
+      let maxInterAnyId = null;
+      let maxInterAnyBBox = null;
+      for (const rr of rects) {{
+        const did = rr.getAttribute("data-door-id");
+        if (!did) continue;
+        let bb = null;
+        try {{ bb = rr.getBBox(); }} catch (_) {{ bb = null; }}
+        if (!bb) continue;
+        const rx0 = Number(bb.x), ry0 = Number(bb.y);
+        const rx1 = rx0 + Number(bb.width), ry1 = ry0 + Number(bb.height);
+        if (!Number.isFinite(rx0) || !Number.isFinite(ry0) || !Number.isFinite(rx1) || !Number.isFinite(ry1)) continue;
+        const cand = [rx0, ry0, rx1, ry1];
+        const inter = computeIntersectionArea(norm, cand);
+        if (inter > maxInterAny) {{
+          maxInterAny = inter;
+          maxInterAnyId = did;
+          maxInterAnyBBox = cand;
+        }}
+      }}
+
+      console.log("[door_detector] snapCandidateForDraw", {{
+        drawn: norm,
+        drawnWH: [dw, dh],
+        candRange: (minX !== Infinity) ? [minX, minY, maxX, maxY] : null,
+        candidates: rects.length,
+        overlapCandidates: overlap.length,
+        bestByIoU: best ? {{ id: best.id, iou: best.iou }} : null,
+        bestByCoverage: bestByCoverage ? {{ id: bestByCoverage.id, coverage: bestByCoverage.coverage, iou: bestByCoverage.iou, inter: bestByCoverage.inter }} : null,
+        bestByInter: bestByInter ? {{ id: bestByInter.id, inter: bestByInter.inter, coverage: bestByInter.coverage, iou: bestByInter.iou }} : null,
+        centersInside: centersInside.length,
+        closest: closest ? {{ id: closest.id, dist: closest.dist, iou: closest.iou }} : null,
+        thresholds: {{ MIN_SNAP_IOU, MIN_CAND_COVERAGE }},
+        overlapSample: sample,
+        nearestCandidate: nearest,
+        maxInterAny: {{ id: maxInterAnyId, inter: maxInterAny, bbox: maxInterAnyBBox }},
+      }});
+      console.log(
+        "[door_detector] snapCandidateForDraw json",
+        JSON.stringify(
+          {{
+            drawn: norm,
+            drawnWH: [dw, dh],
+            candRange: (minX !== Infinity) ? [minX, minY, maxX, maxY] : null,
+            candidates: rects.length,
+            overlapCandidates: overlap.length,
+            bestByIoU: best ? {{ id: best.id, iou: best.iou }} : null,
+            bestByCoverage: bestByCoverage ? {{ id: bestByCoverage.id, coverage: bestByCoverage.coverage, iou: bestByCoverage.iou, inter: bestByCoverage.inter }} : null,
+            bestByInter: bestByInter ? {{ id: bestByInter.id, inter: bestByInter.inter, coverage: bestByInter.coverage, iou: bestByInter.iou }} : null,
+            closest: closest ? {{ id: closest.id, dist: closest.dist, iou: closest.iou }} : null,
+            thresholds: {{ MIN_SNAP_IOU, MIN_CAND_COVERAGE }},
+            nearestCandidate: nearest,
+            maxInterAny: {{ id: maxInterAnyId, inter: maxInterAny, bbox: maxInterAnyBBox }},
+          }}
+        )
+      );
+    }} catch (_) {{}}
+
+    if (!overlap.length) {{
+      try {{ console.log("[door_detector] snapCandidateForDraw no match (no overlap)"); }} catch (_) {{}}
+      return null;
+    }}
+
+    if (best && best.iou >= MIN_SNAP_IOU) {{
+      try {{ console.log("[door_detector] snapCandidateForDraw chosen", {{ reason: "iou", id: best.id, iou: best.iou }}); }} catch (_) {{}}
+      return best;
+    }}
+
+    // If IoU is too low, fall back to maximum overlap (intersection area).
+    if (bestByInter) {{
+      try {{ console.log("[door_detector] snapCandidateForDraw chosen", {{ reason: "max_intersection", id: bestByInter.id, inter: bestByInter.inter, iou: bestByInter.iou }}); }} catch (_) {{}}
+      return bestByInter;
+    }}
+
+    // Fallback: if the drawn rectangle covers a substantial fraction of a candidate,
+    // treat it as a match even when IoU is low.
+    if (bestByCoverage && bestByCoverage.coverage >= MIN_CAND_COVERAGE) {{
+      try {{ console.log("[door_detector] snapCandidateForDraw chosen", {{ reason: "coverage", id: bestByCoverage.id, coverage: bestByCoverage.coverage, iou: bestByCoverage.iou }}); }} catch (_) {{}}
+      return bestByCoverage;
+    }}
+
+    try {{ console.log("[door_detector] snapCandidateForDraw no match (overlap too weak)", {{ bestByIoU: best ? {{ id: best.id, iou: best.iou }} : null, bestByInter: bestByInter ? {{ id: bestByInter.id, inter: bestByInter.inter }} : null }}); }} catch (_) {{}}
+    return null;
+  }}
+
   function renderManualOverlays() {{
     const raw = readParentInputValue(manualOverlaySinkLabel);
     if (raw === lastManualOverlayRaw) return false;
     lastManualOverlayRaw = raw;
+    try {{ console.log("[door_detector] renderManualOverlays update", {{ bytes: raw ? raw.length : 0 }}); }} catch (_) {{}}
 
     const obj = readParentJson(manualOverlaySinkLabel) || {{}};
     const manual = Array.isArray(obj.manual_additions) ? obj.manual_additions : [];
@@ -1967,6 +2784,7 @@ def _panzoom_image_viewer(
     clearLayer(manualLayer);
     // Once server overlays update, drop any client-only temp boxes to avoid duplicates.
     clearLayer(tempLayer);
+    try {{ console.log("[door_detector] renderManualOverlays cleared temp layer"); }} catch (_) {{}}
 
     for (const m of manual) {{
       const drawn = m.drawn_bbox_xyxy;
@@ -2004,12 +2822,27 @@ def _panzoom_image_viewer(
   }}
 
   function clientToImage(clientX, clientY) {{
-    const rect = root.getBoundingClientRect();
-    const px = clientX - rect.left;
-    const py = clientY - rect.top;
-    const qx = (px - tx) / scale;
-    const qy = (py - ty) / scale;
-    return {{ x: qx, y: qy }};
+    // Robust mapping based on the transformed content element’s DOM rect.
+    // This avoids subtle drift/mismatch if tx/ty/scale bookkeeping ever diverges.
+    try {{
+      const cr = content.getBoundingClientRect();
+      if (!(cr.width > 0) || !(cr.height > 0)) throw new Error("bad content rect");
+      const iw = {int(img_width)};
+      const ih = {int(img_height)};
+      const qx = (clientX - cr.left) * (iw / cr.width);
+      const qy = (clientY - cr.top) * (ih / cr.height);
+      clientToImage._lastMethod = "domRect";
+      return {{ x: qx, y: qy }};
+    }} catch (_) {{
+      // Fallback to internal transform math.
+      const rect = root.getBoundingClientRect();
+      const px = clientX - rect.left;
+      const py = clientY - rect.top;
+      const qx = (px - tx) / scale;
+      const qy = (py - ty) / scale;
+      clientToImage._lastMethod = "txScale";
+      return {{ x: qx, y: qy }};
+    }}
   }}
 
   let drawing = false;
@@ -2103,14 +2936,84 @@ def _panzoom_image_viewer(
       const w = Math.abs(x1 - x0);
       const h = Math.abs(y1 - y0);
       if (w >= 2 && h >= 2) {{
+        const drawn = [x0, y0, x1, y1];
+        const snap = snapCandidateForDraw(drawn);
+        try {{
+          const n = svg ? svg.querySelectorAll("rect[data-door-id]").length : 0;
+          const rr = root ? root.getBoundingClientRect() : null;
+          const cr = content ? content.getBoundingClientRect() : null;
+          const used = clientToImage._lastMethod || "unknown";
+          // Compare the two mapping methods at the end point (diagnostic).
+          const rect = rr || {{ left: 0, top: 0 }};
+          const px = e.clientX - rect.left;
+          const py = e.clientY - rect.top;
+          const qx_math = (px - tx) / scale;
+          const qy_math = (py - ty) / scale;
+          const qx_dom = cr && cr.width ? ((e.clientX - cr.left) * ({int(img_width)} / cr.width)) : null;
+          const qy_dom = cr && cr.height ? ((e.clientY - cr.top) * ({int(img_height)} / cr.height)) : null;
+          console.log("[door_detector] draw_rect endDrag", {{
+            drawn,
+            drawnRounded: drawn.map((v) => Math.round(v)),
+            drawnJson: JSON.stringify(drawn),
+            candidates: n,
+            snap: snap ? {{ id: snap.id, iou: snap.iou, bbox: snap.bbox }} : null,
+            editEnabled: getEditEnabled(),
+            viewMode: getViewerDisplayMode(),
+            tx, ty, scale,
+            rootRect: rr ? {{ left: rr.left, top: rr.top, w: rr.width, h: rr.height }} : null,
+            contentRect: cr ? {{ left: cr.left, top: cr.top, w: cr.width, h: cr.height }} : null,
+            mapCompare: {{ used, math: [qx_math, qy_math], dom: [qx_dom, qy_dom] }},
+          }});
+        }} catch (_) {{}}
+        if (snap && tempLayer) {{
+          try {{
+            drawBox(
+              tempLayer,
+              snap.bbox,
+              "rgba(0,255,0,0.9)",
+              3,
+              "4,3",
+              0.85,
+              `snapped (${{snap.id}}, iou=${{snap.iou}})`
+            );
+            try {{ console.log("[door_detector] draw_rect drew snap overlay", {{ id: snap.id }}); }} catch (_) {{}}
+          }} catch (_) {{}}
+        }} else {{
+          try {{ console.log("[door_detector] draw_rect no snap overlay drawn", {{ hasSnap: !!snap, hasTempLayer: !!tempLayer }}); }} catch (_) {{}}
+          // Show an explicit unmatched marker immediately so the user isn't left
+          // wondering if anything happened.
+          if (tempLayer) {{
+            try {{
+              drawBox(
+                tempLayer,
+                drawn,
+                "rgba(255,0,255,0.9)",
+                2,
+                "6,4",
+                0.75,
+                "unmatched (no overlapping candidate)"
+              );
+              console.log("[door_detector] draw_rect drew unmatched overlay");
+            }} catch (_) {{}}
+          }}
+        }}
         const payload = {{
           event: "draw_rect",
           event_id: `${{Date.now()}}_${{Math.random().toString(16).slice(2)}}`,
-          bbox_xyxy: [x0, y0, x1, y1],
+          bbox_xyxy: drawn,
+          snapped_candidate_id: snap ? snap.id : null,
+          iou: snap ? snap.iou : null,
+          snapped_bbox_xyxy: snap ? snap.bbox : null,
           ts: Date.now(),
         }};
         try {{
-          setParentInputValue(drawEventSinkLabel, JSON.stringify(payload));
+          const ok = setParentInputValue(drawEventSinkLabel, JSON.stringify(payload));
+          // Some Streamlit builds don't rerun reliably on a hidden text_input change.
+          // As a robust fallback, also poke the existing click sink with a sentinel
+          // value that will not match any door id, solely to trigger the rerun.
+          if (ok) {{
+            setParentInputValue(clickSinkLabel, `__draw_event__${{payload.event_id}}`);
+          }}
         }} catch (_) {{}}
       }}
       return;
@@ -2127,7 +3030,35 @@ def _panzoom_image_viewer(
 
   function setSelectedDoorId(doorId) {{
     if (!doorId) return;
-    setParentInputValue(clickSinkLabel, String(doorId));
+    const ok = setParentInputValue(clickSinkLabel, String(doorId));
+    try {{
+      console.log("[door_detector] click->sink", {{
+        doorId,
+        ok,
+        clickSinkLabel,
+        parentValueAfter: readParentInputValue(clickSinkLabel),
+        lastSinkWrite: window.__door_detectorLastSinkWrite || null,
+        ts: Date.now(),
+      }});
+    }} catch (_) {{}}
+    // Diagnostic: if Streamlit ingests the sink update, it should rerun and either:
+    // - clear the click sink (we consume it server-side), and/or
+    // - update selectedSinkLabel / focusSeqSinkLabel.
+    try {{
+      const t0 = Date.now();
+      setTimeout(() => {{
+        try {{
+          console.log("[door_detector] click->sink followup", {{
+            doorId,
+            dtMs: Date.now() - t0,
+            clickSinkNow: readParentInputValue(clickSinkLabel),
+            selectedSinkNow: readParentInputValue(selectedSinkLabel),
+            focusSeqNow: readParentInputValue(focusSeqSinkLabel),
+            ts: Date.now(),
+          }});
+        }} catch (_) {{}}
+      }}, 450);
+    }} catch (_) {{}}
   }}
 
   // Watch selection changes coming from Streamlit (right panel).
@@ -2140,6 +3071,16 @@ def _panzoom_image_viewer(
     const editEnabled = getEditEnabled();
     const doorStateChanged = updateDoorStateFromSinks();
     renderManualOverlays();
+
+    const newAutoFocus = getAutoFocus();
+    if (newAutoFocus !== autoFocus) {{
+      autoFocus = newAutoFocus;
+      // If the user just enabled auto-focus, focus immediately to the current selection.
+      if (autoFocus && did) {{
+        try {{ focusToDoorId(did); }} catch (_) {{}}
+        lastFocusSeq = seq;
+      }}
+    }}
 
     let needsStyle = false;
     if (did !== lastSelectedId) {{
@@ -2192,7 +3133,7 @@ def _panzoom_image_viewer(
       // Immediate UX: highlight/focus locally without waiting for the rerun.
       localSelectedId = did;
       applyDoorStyles();
-      if (autoFocus) focusToDoorId(did);
+      if (getAutoFocus()) focusToDoorId(did);
       setSelectedDoorId(did);
     }});
   }}
@@ -2208,6 +3149,12 @@ def _panzoom_image_viewer(
 
 def sidebar_library():
     st.sidebar.title("Library")
+
+    # Server-console debug logs (selection sync, timing, etc.)
+    try:
+        st.sidebar.checkbox("Debug logs", key="debug_perf", help="Log selection sync + perf to the server console.")
+    except Exception:
+        pass
 
     # Manage actions removed (Import existing artifacts / Clear library).
     # If a prior run left the confirm flag around, clear it so it doesn't linger.
@@ -2297,6 +3244,21 @@ def main_viewer_canvas(
         # which triggers a rerun; on rerun we sync it into the "Jump to door" control.
         click_sink_key = click_sink_label
         st.text_input(click_sink_label, key=click_sink_key, label_visibility="collapsed")
+
+        # Auto-focus sink: viewer polls this so toggling the checkbox doesn't remount the iframe.
+        auto_focus_key = f"auto_focus_{file_id}"
+        auto_focus_sink_label = f"auto_focus_sink_{file_id}"
+        try:
+            # Canonicalize early (main_viewer_controls may render after the viewer).
+            auto_focus_val = _coerce_bool(
+                st.session_state.get(auto_focus_key),
+                default=_coerce_bool(fstate.get("auto_focus", True), default=True),
+            )
+            fstate["auto_focus"] = auto_focus_val
+            st.session_state[auto_focus_sink_label] = "1" if auto_focus_val else "0"
+        except Exception:
+            pass
+        st.text_input(auto_focus_sink_label, key=auto_focus_sink_label, label_visibility="collapsed")
 
         # Selection/focus sinks: the viewer polls these so selection changes don't require
         # changing the viewer HTML (reduces iframe reload flicker).
@@ -2389,10 +3351,12 @@ def main_viewer_canvas(
             manual_overlay_sink_aria_label=manual_overlay_sink_label,
             door_state_sink_aria_label=door_state_sink_label,
             viewer_display_sink_aria_label=viewer_display_sink_label,
-            auto_focus=bool(fstate.get("auto_focus", True)),
+            auto_focus_sink_aria_label=auto_focus_sink_label,
         )
         return None, active_doors
     else:
+        # Still run the sidebar auto-open logic even when the viewer isn't mounted.
+        components.html(_sidebar_autopen_component_html(), height=0, scrolling=False)
         st.info("Analyze to see results.")
         return None, []
 
@@ -2534,39 +3498,89 @@ def _sync_selected_door_for_run(
         return
 
     jump_key = f"jump_{file_id}"
-    prev_key = f"{jump_key}__prev"
-    next_key = f"{jump_key}__next"
+    idx_key = f"{jump_key}__idx"
     click_sink_key = f"door_click_sink_{file_id}"
+    _debug_log(
+        "sync_select file_id=%s start click_raw=%r jump_raw=%r idx_raw=%r fstate_sel=%r n_visible=%d",
+        str(file_id),
+        st.session_state.get(click_sink_key),
+        st.session_state.get(jump_key),
+        st.session_state.get(idx_key),
+        fstate.get("selected_door_id"),
+        len(door_ids),
+    )
 
-    # Establish current selection (priority: clicked bbox → jump selector → fstate → first).
-    current_id = None
+    def _coerce_idx(v: Any) -> Optional[int]:
+        try:
+            # st.number_input is usually int, but can be float depending on args.
+            n = int(v)
+        except Exception:
+            return None
+        return n
+
+    # Establish current selection.
+    # Priority: clicked bbox → explicit index → previous selection → first.
+    current_id: Optional[Any] = None
     clicked_id = st.session_state.get(click_sink_key)
-    if clicked_id in door_ids and clicked_id != fstate.get("_last_clicked_door_id"):
+    # Consume internal sentinel events (used to force reruns from the viewer).
+    if isinstance(clicked_id, str) and clicked_id.startswith("__draw_event__"):
+        try:
+            st.session_state[click_sink_key] = ""
+        except Exception:
+            pass
+        clicked_id = ""
+    if clicked_id in door_ids:
+        # Treat the click sink as an event: consume once, then clear so it doesn't
+        # keep overriding other controls on subsequent runs.
         fstate["_last_clicked_door_id"] = clicked_id
         current_id = clicked_id
-    elif st.session_state.get(jump_key) in door_ids:
-        current_id = st.session_state[jump_key]
-    elif fstate.get("selected_door_id") in door_ids:
-        current_id = fstate["selected_door_id"]
-    else:
-        current_id = door_ids[0]
-
-    # Apply Prev/Next navigation. The button widget values are posted into session_state
-    # before the script runs, even if the widgets are instantiated later in the run.
-    prev_clicked = bool(st.session_state.get(prev_key))
-    next_clicked = bool(st.session_state.get(next_key))
-    if prev_clicked or next_clicked:
-        delta = -1 if prev_clicked else 1
+        _debug_log("sync_select file_id=%s click_match clicked_id=%r", str(file_id), clicked_id)
         try:
-            idx = door_ids.index(current_id)
-        except ValueError:
-            idx = 0
-        current_id = door_ids[(idx + delta) % len(door_ids)]
+            st.session_state[click_sink_key] = ""
+        except Exception:
+            pass
+    else:
+        if clicked_id not in (None, ""):
+            _debug_log("sync_select file_id=%s click_ignored clicked_id=%r", str(file_id), clicked_id)
+        # If the user typed an index, treat it as the requested selection.
+        idx_req = _coerce_idx(st.session_state.get(idx_key))
+        if isinstance(idx_req, int):
+            # Wrap-around navigation:
+            # - minus at 1 -> 0 -> last
+            # - plus at last -> N+1 -> first
+            if idx_req <= 0:
+                current_id = door_ids[-1]
+            elif idx_req > len(door_ids):
+                current_id = door_ids[0]
+            else:
+                current_id = door_ids[idx_req - 1]
+            _debug_log("sync_select file_id=%s idx_select idx=%r id=%r", str(file_id), idx_req, current_id)
+        elif st.session_state.get(jump_key) in door_ids:
+            current_id = st.session_state[jump_key]
+            _debug_log("sync_select file_id=%s jump_select id=%r", str(file_id), current_id)
+        elif fstate.get("selected_door_id") in door_ids:
+            current_id = fstate["selected_door_id"]
+            _debug_log("sync_select file_id=%s fstate_select id=%r", str(file_id), current_id)
+        else:
+            current_id = door_ids[0]
+            _debug_log("sync_select file_id=%s default_select id=%r", str(file_id), current_id)
 
     # Make selection canonical for the rest of this run.
     if st.session_state.get(jump_key) != current_id:
         st.session_state[jump_key] = current_id
+    try:
+        st.session_state[idx_key] = door_ids.index(current_id) + 1
+    except Exception:
+        # If anything is off, fall back to 1 so the widget doesn't break.
+        st.session_state[idx_key] = 1
     fstate["selected_door_id"] = current_id
+    _debug_log(
+        "sync_select file_id=%s final current_id=%r jump_now=%r idx_now=%r",
+        str(file_id),
+        current_id,
+        st.session_state.get(jump_key),
+        st.session_state.get(idx_key),
+    )
 
     # Bump focus sequence when selection changes (so the viewer auto-focuses only on changes).
     if current_id != fstate.get("_focus_last_id"):
@@ -2583,6 +3597,7 @@ def right_panel_review(
     doors_data: Dict,
     fstate: Dict,
     active_doors: List,
+    all_active_doors: Optional[List] = None,
 ):
     file_id = item["id"]
     file_dir = Path(item["path"])
@@ -2598,57 +3613,81 @@ def right_panel_review(
     all_visible = active_doors.copy()
     all_visible.sort(key=lambda x: x["confidence"], reverse=True)
     
-    st.subheader(f"Doors ({len(all_visible)})")
+    total_doors = len(all_active_doors) if isinstance(all_active_doors, list) else len(all_visible)
+    door_type_filter_key = f"door_type_filter_{file_id}"
+    current_filter = str(st.session_state.get(door_type_filter_key) or "All")
+    if current_filter and current_filter != "All":
+        st.subheader(f"Doors ({len(all_visible)} of {total_doors})")
+    else:
+        st.subheader(f"Doors ({len(all_visible)})")
     
     if not all_visible:
         return
 
-    # Jump-to selector (replaces click-to-select in the main viewer)
-    door_ids = [d["id"] for d in all_visible]
-    id_to_label = {
-        d["id"]: f"{i+1}/{len(all_visible)}  {d['type']}  {d['confidence']:.3f}  {d['id']}"
-        for i, d in enumerate(all_visible)
-    }
+    # Filter panel (stored in session_state; applied before rendering the viewer).
+    all_for_filter = (all_active_doors if isinstance(all_active_doors, list) else active_doors) or []
+    type_values = sorted(
+        {
+            str(d.get("type")).strip()
+            for d in all_for_filter
+            if d.get("type") is not None and str(d.get("type")).strip()
+        }
+    )
+    type_options = ["All"] + type_values
+    if door_type_filter_key not in st.session_state:
+        st.session_state[door_type_filter_key] = "All"
+    if str(st.session_state.get(door_type_filter_key) or "All") not in type_options:
+        st.session_state[door_type_filter_key] = "All"
 
-    # Streamlit selectbox keeps its own state keyed by `key=...`.
-    # Treat that as canonical, but keep it in sync with our per-file fstate.
+    f_lbl, f_sel = st.columns([1, 3])
+    f_lbl.markdown("<div style='line-height: 38px; opacity: 0.85;'>Type</div>", unsafe_allow_html=True)
+    f_sel.selectbox("Door type", type_options, key=door_type_filter_key, label_visibility="collapsed")
+
+    # Door navigation (index input + Prev/Next).
+    door_ids = [d["id"] for d in all_visible if d.get("id") is not None]
+    if not door_ids:
+        return
+
     jump_key = f"jump_{file_id}"
+    idx_key = f"{jump_key}__idx"
+    idx_label = f"door_jump_idx_{file_id}"
+
     current_id = st.session_state.get(jump_key) if st.session_state.get(jump_key) in door_ids else door_ids[0]
+    selected_idx = door_ids.index(current_id) if current_id in door_ids else 0
+    # Keep the editable index input in sync with selection (must happen before widget instantiation).
+    if st.session_state.get(idx_key) != (selected_idx + 1):
+        st.session_state[idx_key] = selected_idx + 1
 
     # Prev/Next (wrap-around).
     #
     # Avoid callbacks: Streamlit may run callbacks after widget instantiation,
     # which can trigger "cannot be modified..." if we touch `st.session_state[jump_key]`.
-    col_p, col_idx, col_n = st.columns([1, 2, 1])
-    # NOTE: Navigation behavior is applied at the start of the run by
-    # `_sync_selected_door_for_run(...)` so the main viewer can render first.
-    col_p.button("Prev", use_container_width=True, key=f"{jump_key}__prev")
-    col_n.button("Next", use_container_width=True, key=f"{jump_key}__next")
-
-    # Must happen before the selectbox is instantiated.
-    if st.session_state.get(jump_key) != current_id:
-        st.session_state[jump_key] = current_id
-    fstate["selected_door_id"] = current_id
-    selected_idx = door_ids.index(current_id)
-
-    picked = st.selectbox(
-        "Jump to door",
-        door_ids,
-        index=selected_idx,
-        format_func=lambda did: id_to_label.get(did, str(did)),
-        label_visibility="collapsed",
-        key=jump_key,
-    )
-    fstate["selected_door_id"] = picked
-    selected_idx = door_ids.index(picked) if picked in door_ids else selected_idx
+    col_idx = st.container()
+    with col_idx:
+        c_in, c_total = st.columns([1, 1])
+        c_in.number_input(
+            idx_label,
+            min_value=0,
+            max_value=len(door_ids) + 1,
+            step=1,
+            key=idx_key,
+            label_visibility="collapsed",
+        )
+        c_total.markdown(
+            f"<div style='text-align: left; line-height: 38px; padding-left: 6px;'>/ {len(all_visible)}</div>",
+            unsafe_allow_html=True,
+        )
     # NOTE: Focus sequence is bumped in `_sync_selected_door_for_run(...)` earlier in the run,
     # so the main viewer highlight/focus stays in sync.
-
-    col_idx.write(f"<div style='text-align: center; line-height: 38px;'>{selected_idx + 1} / {len(all_visible)}</div>", unsafe_allow_html=True)
 
     st.divider()
     
     # Details of selected
+    # Selection is canonicalized earlier by `_sync_selected_door_for_run(...)`.
+    current_id = fstate.get("selected_door_id")
+    if current_id not in door_ids:
+        current_id = door_ids[0]
+    selected_idx = door_ids.index(current_id) if current_id in door_ids else 0
     selected_door = all_visible[selected_idx]
     did = selected_door["id"]
     door_type = html.escape(str(selected_door.get("type", "")))
@@ -2818,6 +3857,11 @@ def right_panel_review(
                     st.rerun()
         else:
             st.markdown("**Unmatched manual boxes (0)**")
+
+        # Show the most recent unmatched-debug report in the UI (when enabled).
+        if st.session_state.get("debug_perf") and fstate.get("_last_unmatched_debug"):
+            with st.expander("Why was this unmatched?", expanded=False):
+                st.code(str(fstate.get("_last_unmatched_debug")), language="json")
     
     # Train badge
     total_overrides = len(working.get("confirmed_ids", set())) + len(working.get("deleted_ids", set()))
@@ -2973,6 +4017,7 @@ with col_app:
                 doors_data=doors_data,
                 preview_spec=preview_spec,
                 full_dims=full_dims,
+                config_path=str(doors_data.get("config_path") or "configs/door_rules.json"),
             )
 
             title = html.escape(str(selected_item.get("original_name", "")))
@@ -2985,7 +4030,35 @@ with col_app:
             deleted_ids = _get_working_label_state(fstate).get("deleted_ids", set())
             overlay_doors: List[Dict[str, Any]] = [d for d in detections if d.get("id") is not None]
             # Right panel / navigation list excludes deleted; overlay hides deleted via JS state sink.
-            active_doors: List[Dict[str, Any]] = [d for d in overlay_doors if d.get("id") not in deleted_ids]
+            active_doors_all: List[Dict[str, Any]] = [d for d in overlay_doors if d.get("id") not in deleted_ids]
+
+            # Door type filter (affects navigation list + right panel; overlay still includes all).
+            door_type_filter_key = f"door_type_filter_{file_id}"
+            if door_type_filter_key not in st.session_state:
+                st.session_state[door_type_filter_key] = "All"
+            selected_type = str(st.session_state.get(door_type_filter_key) or "All")
+            id_to_type = {
+                str(d.get("id")): str(d.get("type") or "").strip()
+                for d in active_doors_all
+                if d.get("id") is not None
+            }
+
+            # If the user clicked a door of a different type, switch filter to that type so
+            # the click "works" while keeping filter semantics.
+            click_sink_label = f"door_click_sink_{file_id}"
+            clicked_id = st.session_state.get(click_sink_label)
+            if clicked_id is not None:
+                clicked_type = id_to_type.get(str(clicked_id))
+                if clicked_type and selected_type != "All" and clicked_type != selected_type:
+                    st.session_state[door_type_filter_key] = clicked_type
+                    selected_type = clicked_type
+
+            if selected_type and selected_type != "All":
+                active_doors: List[Dict[str, Any]] = [
+                    d for d in active_doors_all if str(d.get("type") or "").strip() == selected_type
+                ]
+            else:
+                active_doors = active_doors_all
 
             click_sink_label = f"door_click_sink_{file_id}"
 
@@ -3001,14 +4074,13 @@ with col_app:
             all_visible = active_doors.copy()
             all_visible.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
             _debug_log(
-                "run=%d file_id=%s mode=%s pre_sync selected=%s focus_seq=%s prev=%s next=%s",
+                "run=%d file_id=%s mode=%s pre_sync selected=%s focus_seq=%s filter=%s",
                 run_seq,
                 file_id,
                 fstate.get("viewer_display_mode"),
                 fstate.get("selected_door_id"),
                 fstate.get("_focus_seq"),
-                bool(st.session_state.get(f"jump_{file_id}__prev")),
-                bool(st.session_state.get(f"jump_{file_id}__next")),
+                str(st.session_state.get(door_type_filter_key) or "All"),
             )
             _sync_selected_door_for_run(file_id=file_id, fstate=fstate, all_visible=all_visible)
             _debug_log(
@@ -3057,6 +4129,7 @@ with col_app:
                     doors_data=doors_data,
                     fstate=fstate,
                     active_doors=active_doors,
+                    all_active_doors=active_doors_all,
                 )
                 perf["render_right_panel_ms"] = (time.perf_counter() - t3) * 1000.0
                 _debug_log(
@@ -3066,6 +4139,10 @@ with col_app:
                     perf["render_right_panel_ms"],
                 )
         else:
+            # Keep sidebar accessible even if a prior session persisted a collapsed state.
+            components.html(_sidebar_autopen_component_html(), height=0, scrolling=False)
             st.info("Select a file from the library to begin.")
     else:
+        # Keep sidebar accessible even if a prior session persisted a collapsed state.
+        components.html(_sidebar_autopen_component_html(), height=0, scrolling=False)
         st.info("Select a file from the library to begin.")

@@ -49,6 +49,10 @@ Door Detector supports a multi-step pipeline with feedback-driven improvement, a
 ./venv/bin/streamlit run door_detector/review_app.py
 ```
 
+#### Browser console warnings
+
+If you see console warnings like `Unrecognized feature: 'battery'` / `ambient-light-sensor` coming from `index.*.js`, it’s either a reverse proxy injecting an outdated `Permissions-Policy`/`Feature-Policy` header **or** Streamlit’s component iframe implementation. See `docs/SETUP.md` → “Browser console warnings (Permissions-Policy / iframe sandbox)” for details.
+
 The UI is a single-page app with a sidebar library and a main viewer + review panel:
 
 - **Upload & run**: Upload PDFs to the library and run the pipeline (Step 1 + Step 2).
