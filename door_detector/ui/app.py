@@ -25,8 +25,10 @@ from door_detector.ui.artifacts_io import get_full_page_dims, load_file_artifact
 from door_detector.doors.types import normalize_door_type
 from door_detector.ui.labels import (
     coerce_confirmed_by_type,
+    coerce_rejected_by_type,
     coerce_id_set,
     flatten_confirmed_ids,
+    flatten_rejected_ids,
     enter_edit_mode as _enter_edit_mode,
     get_working_label_state as _get_working_label_state,
 )
@@ -55,6 +57,7 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
     if file_id not in st.session_state.files:
         st.session_state.files[file_id] = {
             "confirmed_by_type": coerce_confirmed_by_type(labels_data.get("confirmed_by_type", {})),
+            "rejected_by_type": coerce_rejected_by_type(labels_data.get("rejected_by_type", {})),
             "deleted_ids": coerce_id_set(labels_data.get("deleted_ids", [])),
             "manual_additions": list(labels_data.get("manual_additions", [])),
             "unmatched_manual_boxes": list(labels_data.get("unmatched_manual_boxes", [])),
@@ -70,6 +73,12 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
             "_last_unmatched_debug": None,
             "_focus_seq": 0,
             "_focus_last_id": None,
+            # Manual focus requests (via a button in the right panel). This should
+            # trigger a one-shot focus in the viewer regardless of auto-focus toggle.
+            "_focus_request_seq": 0,
+            # Best-effort record of which door we've most recently focused. This is
+            # UI-only (used to decide whether to show the Focus button).
+            "_focused_door_id": None,
             "_last_clicked_door_id": None,
         }
 
@@ -99,7 +108,6 @@ def _snap_to_candidate(
         return None, 0.0
     x0, y0, x1, y1 = nb
     drawn = [x0, y0, x1, y1]
-
     # Only consider candidates that overlap the selection box (IoU>0).
     best_iou = -1.0
     best_by_iou: Optional[Dict[str, Any]] = None
@@ -107,6 +115,10 @@ def _snap_to_candidate(
     best_inter = -1.0
     best_by_inter: Optional[Dict[str, Any]] = None
     any_overlap = False
+
+    # Conservative anti-symbol heuristics (circles often appear near doors).
+    SQUARE_AR_MAX = 1.28
+    MIN_SNAP_IOU_FOR_SQUARE = 0.10
 
     for cand in candidates:
         cid = cand.get("id")
@@ -128,6 +140,30 @@ def _snap_to_candidate(
         inter_w = max(0.0, inter_x1 - inter_x0)
         inter_h = max(0.0, inter_y1 - inter_y0)
         inter = inter_w * inter_h
+
+        # Penalize near-square candidates (often circles/symbols) unless match is strong.
+        # Exception: `swing_arc` candidates (door arcs) are naturally square-ish; allow them.
+        cw = max(0.0, cx1 - cx0)
+        ch = max(0.0, cy1 - cy0)
+        if cw > 0.0 and ch > 0.0:
+            ar = max(cw / ch, ch / cw)
+            if ar <= SQUARE_AR_MAX:
+                ctype = str(cand.get("type") or "")
+                feats = cand.get("features") if isinstance(cand, dict) else None
+                arc_only = False
+                angle_span = None
+                if isinstance(feats, dict):
+                    try:
+                        arc_only = float(feats.get("arc_only", 0.0) or 0.0) >= 0.5
+                    except Exception:
+                        arc_only = False
+                    try:
+                        angle_span = float(feats.get("angle_span")) if feats.get("angle_span") is not None else None
+                    except Exception:
+                        angle_span = None
+                is_swing_arc_like = ctype == "swing_arc" and arc_only and (angle_span is not None) and (20.0 <= angle_span <= 125.0)
+                if (not is_swing_arc_like) and iou < MIN_SNAP_IOU_FOR_SQUARE:
+                    continue
 
         if iou > best_iou:
             best_iou = iou
@@ -368,7 +404,17 @@ def _process_draw_event_if_any(
             cbt.setdefault(label_type, set()).add(cid)
         except Exception:
             pass
+        # A confirmed candidate must not be marked as rejected/deleted.
         draft["deleted_ids"].discard(cid)
+        try:
+            rbt = draft.get("rejected_by_type")
+            if isinstance(rbt, dict):
+                for t in list(rbt.keys()):
+                    ids = rbt.get(t)
+                    if isinstance(ids, set):
+                        ids.discard(cid)
+        except Exception:
+            pass
         try:
             fstate["_edit_manual_confirmed_ids"].add(cid)
         except Exception:
@@ -577,6 +623,17 @@ def main() -> None:
                                     },
                                     separators=(",", ":"),
                                 )
+                            elif et == "focus_state":
+                                did = evt.get("door_id")
+                                in_focus = bool(evt.get("in_focus"))
+                                did_s = str(did) if did not in (None, "") else ""
+                                cur_s = str(fstate.get("selected_door_id") or "")
+                                if did_s and did_s == cur_s:
+                                    if in_focus:
+                                        fstate["_focused_door_id"] = did_s
+                                    else:
+                                        if str(fstate.get("_focused_door_id") or "") == did_s:
+                                            fstate["_focused_door_id"] = None
                 except Exception:
                     pass
 
@@ -592,21 +649,46 @@ def main() -> None:
 
                 # Compute active doors once so the main viewer + right panel stay in perfect sync.
                 detections = doors_data.get("doors", [])
-                deleted_ids = coerce_id_set(_get_working_label_state(fstate).get("deleted_ids", set()))
+                working = _get_working_label_state(fstate)
+                deleted_ids = coerce_id_set(working.get("deleted_ids", set()))
+                rejected_ids = flatten_rejected_ids(working.get("rejected_by_type", {}))
+                hidden_ids = set(deleted_ids) | set(rejected_ids)
                 overlay_doors: List[Dict[str, Any]] = [d for d in detections if d.get("id") is not None]
 
                 # Ensure any confirmed snapped candidates are also rendered (even if they were
                 # not in the strict output doors list).
                 try:
-                    working = _get_working_label_state(fstate)
                     extra_ids = flatten_confirmed_ids(working.get("confirmed_by_type", {}))
                     for rec in list(working.get("manual_additions", [])):
                         cid = rec.get("snapped_candidate_id")
                         if cid:
                             extra_ids.add(str(cid))
-                    existing_ids = {str(d.get("id")) for d in overlay_doors if d.get("id") is not None}
+
+                    # If a double candidate was rejected (e.g. it was actually two swings),
+                    # reveal its component swing candidates so the reviewer can label them.
                     pool = list(doors_data.get("candidates", []) or [])
                     pool_map = {str(c.get("id")): c for c in pool if c.get("id") is not None}
+                    try:
+                        rbt = working.get("rejected_by_type", {})
+                        double_rej = set()
+                        if isinstance(rbt, dict):
+                            ids = rbt.get("double")
+                            if isinstance(ids, set):
+                                double_rej = set(ids)
+                        for rid in list(double_rej):
+                            dc = pool_map.get(str(rid))
+                            comps = (dc.get("components") or {}) if isinstance(dc, dict) else {}
+                            if not isinstance(comps, dict):
+                                continue
+                            swing_ids = comps.get("swing_ids") or []
+                            if isinstance(swing_ids, list):
+                                for sid in swing_ids:
+                                    if sid not in (None, ""):
+                                        extra_ids.add(str(sid))
+                    except Exception:
+                        pass
+
+                    existing_ids = {str(d.get("id")) for d in overlay_doors if d.get("id") is not None}
                     for cid in sorted(extra_ids - existing_ids):
                         cand = pool_map.get(str(cid))
                         if not cand:
@@ -626,7 +708,7 @@ def main() -> None:
                 except Exception:
                     pass
 
-                active_doors_all: List[Dict[str, Any]] = [d for d in overlay_doors if str(d.get("id")) not in deleted_ids]
+                active_doors_all: List[Dict[str, Any]] = [d for d in overlay_doors if str(d.get("id")) not in hidden_ids]
 
                 # Door type filter (affects navigation list + right panel; overlay still includes all).
                 door_type_filter_key = f"door_type_filter_{file_id}"

@@ -19,6 +19,7 @@ from door_detector.ui.labels import (
     cancel_edit_mode as _cancel_edit_mode,
     enter_edit_mode as _enter_edit_mode,
     flatten_confirmed_ids,
+    flatten_rejected_ids,
     get_working_label_state as _get_working_label_state,
     make_labels_payload_from_fstate,
     save_edit_mode as _save_edit_mode,
@@ -28,6 +29,25 @@ from door_detector.doors.types import DOOR_TYPES, normalize_door_type
 
 
 logger = logging.getLogger("door_detector.review_app")
+
+
+def _nav_intent_key(file_id: str) -> str:
+    # Flag set in session_state to indicate the user explicitly navigated to a new door
+    # (e.g. by typing an index). Used to control autofocus behavior.
+    return f"_door_detector_nav_intent__{file_id}"
+
+
+def _suppress_autofocus_key(file_id: str) -> str:
+    # One-shot suppression flag for autofocus on the *next* selection sync.
+    # Used for cases like Delete/Not-a-door where selection advances automatically.
+    return f"_door_detector_suppress_autofocus_once__{file_id}"
+
+
+def _mark_nav_intent(file_id: str) -> None:
+    try:
+        st.session_state[_nav_intent_key(str(file_id))] = True
+    except Exception:
+        return
 
 
 def _queue_pipeline_run(file_id: str, file_dir_str: str, config_path: str, label: str) -> None:
@@ -249,6 +269,24 @@ def _sync_selected_door_for_run(
     idx_key = f"{jump_key}__idx"
     click_sink_key = f"door_click_sink_{file_id}"
 
+    # Determine whether this rerun should be allowed to autofocus if selection changes.
+    # Principle:
+    # - Autofocus ONLY when the user explicitly selected/navigated (click in viewer,
+    #   or explicit navigation controls in the right panel).
+    # - Do NOT autofocus for automatic selection changes (initial load, delete-driven
+    #   move-to-next, filter-driven reshuffles, etc.).
+    allow_autofocus = False
+    try:
+        allow_autofocus = bool(st.session_state.pop(_nav_intent_key(file_id), False))
+    except Exception:
+        allow_autofocus = False
+
+    suppress_autofocus = False
+    try:
+        suppress_autofocus = bool(st.session_state.pop(_suppress_autofocus_key(file_id), False))
+    except Exception:
+        suppress_autofocus = False
+
     def _coerce_idx(v: Any) -> Optional[int]:
         try:
             return int(v)
@@ -273,6 +311,7 @@ def _sync_selected_door_for_run(
         # keep overriding other controls on subsequent runs.
         fstate["_last_clicked_door_id"] = clicked_id
         current_id = clicked_id
+        allow_autofocus = True
         try:
             st.session_state[click_sink_key] = ""
         except Exception:
@@ -313,10 +352,22 @@ def _sync_selected_door_for_run(
     # Bump focus sequence when selection changes (so the viewer auto-focuses only on changes).
     if current_id != fstate.get("_focus_last_id"):
         fstate["_focus_last_id"] = current_id
-        try:
-            fstate["_focus_seq"] = int(fstate.get("_focus_seq") or 0) + 1
-        except Exception:
-            fstate["_focus_seq"] = 1
+        auto_focus_key = f"auto_focus_{file_id}"
+        if auto_focus_key in st.session_state:
+            auto_focus_enabled = bool(st.session_state.get(auto_focus_key))
+        else:
+            auto_focus_enabled = bool(fstate.get("auto_focus", True))
+
+        if allow_autofocus and (not suppress_autofocus) and auto_focus_enabled:
+            try:
+                fstate["_focus_seq"] = int(fstate.get("_focus_seq") or 0) + 1
+            except Exception:
+                fstate["_focus_seq"] = 1
+            # Record that we intentionally focused this door (for Focus button visibility).
+            try:
+                fstate["_focused_door_id"] = str(current_id) if current_id not in (None, "") else None
+            except Exception:
+                pass
 
 
 def right_panel_review(
@@ -403,6 +454,8 @@ def right_panel_review(
             max_value=len(door_ids) + 1,
             step=1,
             key=idx_key,
+            on_change=_mark_nav_intent,
+            args=(str(file_id),),
             label_visibility="collapsed",
         )
         c_total.markdown(
@@ -427,6 +480,14 @@ def right_panel_review(
     conf = max(0.0, min(1.0, conf))
     conf_pct = int(round(conf * 100))
 
+    # Use the *current working* label state so this reflects draft changes in edit mode.
+    working = _get_working_label_state(fstate)
+    try:
+        is_confirmed = did in flatten_confirmed_ids(working.get("confirmed_by_type", {}))
+    except Exception:
+        is_confirmed = False
+    confirmed_html = '<span class="door_detector-door-meta-confirmed">Confirmed</span>' if is_confirmed else ""
+
     st.markdown(
         f"""
 <div class="door_detector-door-meta">
@@ -437,16 +498,30 @@ def right_panel_review(
   <div class="door_detector-door-meta-item">
     <span class="door_detector-door-meta-label">Confidence</span>
     <span class="door_detector-door-meta-confidence">{conf_pct}%</span>
+    {confirmed_html}
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
+    # Manual focus: shown only when this door wasn't focused via an explicit focus action.
+    is_focused = str(fstate.get("_focused_door_id") or "") == str(did)
+    if not is_focused:
+        if st.button("Focus", use_container_width=True, type="secondary"):
+            try:
+                fstate["_focus_request_seq"] = int(fstate.get("_focus_request_seq") or 0) + 1
+            except Exception:
+                fstate["_focus_request_seq"] = 1
+            try:
+                fstate["_focused_door_id"] = str(did)
+            except Exception:
+                pass
+            st.rerun()
+
     # Typed label control (what the reviewer says this door *is*).
     # This is separate from the model-predicted door type (displayed above).
     label_type_key = f"label_type_{file_id}"
-    working = _get_working_label_state(fstate)
     # Compute current labeled type (if confirmed), else default to predicted type.
     labeled_type = None
     try:
@@ -460,15 +535,28 @@ def right_panel_review(
     except Exception:
         labeled_type = None
     default_label_type = labeled_type or normalize_door_type(selected_door.get("type"), default="swing")
+
+    # UX: default "Label as" to the *currently selected door's* detected type.
+    # The widget key is per-file, so we explicitly reset it when selection changes.
+    if str(fstate.get("_label_type_last_door_id") or "") != str(did):
+        st.session_state[label_type_key] = default_label_type
+        fstate["_label_type_last_door_id"] = str(did)
+
     if label_type_key not in st.session_state:
         st.session_state[label_type_key] = default_label_type
     if str(st.session_state.get(label_type_key) or "") not in DOOR_TYPES:
         st.session_state[label_type_key] = default_label_type
-    st.selectbox("Label as", list(DOOR_TYPES), key=label_type_key)
+
+    st.selectbox(
+        "Label as",
+        list(DOOR_TYPES),
+        key=label_type_key,
+        format_func=lambda t: str(t).capitalize(),
+    )
 
     # Actions
     is_editing = bool(fstate.get("edit_mode"))
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     if c1.button("Confirm door", use_container_width=True):
         # Ensure confirmed_by_type exists.
         try:
@@ -490,7 +578,17 @@ def right_panel_review(
             except Exception:
                 continue
         cbt.setdefault(label_type, set()).add(did)
+        # A confirmed candidate must not be marked as rejected/deleted.
         working["deleted_ids"].discard(did)
+        try:
+            rbt = working.get("rejected_by_type")
+            if isinstance(rbt, dict):
+                for t in DOOR_TYPES:
+                    ids = rbt.get(t)
+                    if isinstance(ids, set):
+                        ids.discard(did)
+        except Exception:
+            pass
         # Treat as explicit confirmation (so removing a manual-add record won't unconfirm).
         if is_editing:
             try:
@@ -500,8 +598,28 @@ def right_panel_review(
         else:
             save_current_labels(str(file_id), file_dir)
         st.rerun()
-    if c2.button("Delete / Not a door", use_container_width=True):
-        working["deleted_ids"].add(did)
+    if c2.button("Delete / Not a door", use_container_width=True, help="Reject this candidate as its detected door type (e.g. 'not a double')."):
+        detected_type = normalize_door_type(selected_door.get("type"), default="swing")
+        # Ensure rejected_by_type exists.
+        try:
+            rbt = working.get("rejected_by_type")
+            if not isinstance(rbt, dict):
+                rbt = {t: set() for t in DOOR_TYPES}
+                working["rejected_by_type"] = rbt
+        except Exception:
+            rbt = {t: set() for t in DOOR_TYPES}
+            working["rejected_by_type"] = rbt
+
+        rbt.setdefault(detected_type, set()).add(did)
+        # This is not a global "not-a-door" label.
+        working["deleted_ids"].discard(did)
+        # UX: if the user rejects a double, it is commonly because it's actually two swings.
+        # Auto-switch the filter so the revealed swing candidates are immediately visible.
+        if detected_type == "double":
+            try:
+                st.session_state[door_type_filter_key] = "swing"
+            except Exception:
+                pass
         try:
             cbt = working.get("confirmed_by_type")
             if isinstance(cbt, dict):
@@ -525,21 +643,66 @@ def right_panel_review(
             ]
         else:
             save_current_labels(str(file_id), file_dir)
+        # Selection will advance automatically; do not autofocus the next door.
+        try:
+            st.session_state[_suppress_autofocus_key(str(file_id))] = True
+        except Exception:
+            pass
         fstate["selected_door_id"] = None  # Move to next
         st.rerun()
-    if c3.button("Skip", use_container_width=True):
-        if selected_idx < len(all_visible) - 1:
-            next_id = all_visible[selected_idx + 1]["id"]
-            fstate["selected_door_id"] = next_id
-            st.session_state[jump_key] = next_id
-            st.rerun()
+
+    # Optional global negative (rare): truly "not a door at all".
+    if st.button(
+        "Not a door at all",
+        use_container_width=True,
+        type="secondary",
+        help="Use this only when the highlighted item is truly not any door type (global negative).",
+    ):
+        working["deleted_ids"].add(did)
+        try:
+            cbt = working.get("confirmed_by_type")
+            if isinstance(cbt, dict):
+                for t in DOOR_TYPES:
+                    ids = cbt.get(t)
+                    if isinstance(ids, set):
+                        ids.discard(did)
+        except Exception:
+            pass
+        try:
+            rbt = working.get("rejected_by_type")
+            if isinstance(rbt, dict):
+                for t in DOOR_TYPES:
+                    ids = rbt.get(t)
+                    if isinstance(ids, set):
+                        ids.discard(did)
+        except Exception:
+            pass
+        if is_editing:
+            try:
+                fstate["_edit_manual_confirmed_ids"].discard(did)
+            except Exception:
+                pass
+            working["manual_additions"] = [
+                r
+                for r in list(working.get("manual_additions", []))
+                if str(r.get("snapped_candidate_id") or "") != str(did)
+            ]
+        else:
+            save_current_labels(str(file_id), file_dir)
+        try:
+            st.session_state[_suppress_autofocus_key(str(file_id))] = True
+        except Exception:
+            pass
+        fstate["selected_door_id"] = None
+        st.rerun()
 
     st.divider()
     # Show stats for the currently active label state (draft while editing).
     st.write(
         f"**Stats:** "
         f"{len(flatten_confirmed_ids(working.get('confirmed_by_type', {})))} confirmed, "
-        f"{len(working.get('deleted_ids', set()))} deleted, "
+        f"{len(flatten_rejected_ids(working.get('rejected_by_type', {})))} rejected-type, "
+        f"{len(working.get('deleted_ids', set()))} not-a-door, "
         f"{len(working.get('manual_additions', []))} manual-added, "
         f"{len(working.get('unmatched_manual_boxes', []))} unmatched"
     )
@@ -549,7 +712,11 @@ def right_panel_review(
         st.subheader("Edit Doors")
 
     # Train badge
-    total_overrides = len(flatten_confirmed_ids(working.get("confirmed_by_type", {}))) + len(working.get("deleted_ids", set()))
+    total_overrides = (
+        len(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
+        + len(flatten_rejected_ids(working.get("rejected_by_type", {})))
+        + len(working.get("deleted_ids", set()))
+    )
     if (not is_editing) and total_overrides >= 5:
         if st.button("Train Model", use_container_width=True):
             with st.spinner("Training..."):

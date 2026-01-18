@@ -11,7 +11,13 @@ from typing import Any, Dict, Optional, Tuple
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
-from door_detector.ui.labels import LABELS_SCHEMA_VERSION, labels_v3_default, migrate_labels_v2_to_v3, validate_labels_v3_or_raise
+from door_detector.ui.labels import (
+    LABELS_SCHEMA_VERSION,
+    labels_v4_default,
+    migrate_labels_v2_to_v4,
+    migrate_labels_v3_to_v4,
+    validate_labels_v4_or_raise,
+)
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -75,6 +81,13 @@ def _remap_labels_ids_in_place(labels_data: Dict[str, Any], doors_data: Dict[str
                 if isinstance(v, list):
                     cbt[k] = _remap_list(v)
             labels_data["confirmed_by_type"] = cbt
+        # v4: rejected_by_type
+        if isinstance(labels_data.get("rejected_by_type"), dict):
+            rbt = labels_data.get("rejected_by_type") or {}
+            for k, v in list(rbt.items()):
+                if isinstance(v, list):
+                    rbt[k] = _remap_list(v)
+            labels_data["rejected_by_type"] = rbt
         if isinstance(labels_data.get("deleted_ids"), list):
             labels_data["deleted_ids"] = _remap_list(labels_data.get("deleted_ids") or [])
         if isinstance(labels_data.get("manual_additions"), list):
@@ -102,7 +115,7 @@ def load_file_artifacts(file_dir_str: str) -> tuple[Dict[str, Any], Dict[str, An
         with open(doors_path) as f:
             doors_data = json.load(f)
 
-    labels_data: Dict[str, Any] = labels_v3_default()
+    labels_data: Dict[str, Any] = labels_v4_default()
     if labels_path.exists():
         with open(labels_path) as f:
             labels_data = json.load(f)
@@ -110,11 +123,13 @@ def load_file_artifacts(file_dir_str: str) -> tuple[Dict[str, Any], Dict[str, An
         # candidate ids (without changing the UX).
         _remap_labels_ids_in_place(labels_data, doors_data)
 
-        # Migrate v2 -> v3 on load (UI uses v3 internally).
+        # Migrate older schemas on load (UI uses v4 internally).
         if isinstance(labels_data, dict) and labels_data.get("schema_version") == 2:
-            labels_data = migrate_labels_v2_to_v3(labels_data)
+            labels_data = migrate_labels_v2_to_v4(labels_data)
+        if isinstance(labels_data, dict) and labels_data.get("schema_version") == 3:
+            labels_data = migrate_labels_v3_to_v4(labels_data)
 
-        validate_labels_v3_or_raise(labels_data, labels_path=labels_path)
+        validate_labels_v4_or_raise(labels_data, labels_path=labels_path)
 
     meta_data: Dict[str, Any] = {}
     if meta_path.exists():

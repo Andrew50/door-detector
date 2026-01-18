@@ -17,7 +17,7 @@ import streamlit.components.v1 as components
 from PIL import Image
 
 from door_detector.ui.assets import sidebar_autopen_component_html
-from door_detector.ui.labels import flatten_confirmed_ids, get_working_label_state as _get_working_label_state
+from door_detector.ui.labels import flatten_confirmed_ids, flatten_rejected_ids, get_working_label_state as _get_working_label_state
 from door_detector.ui.pdfjs_component import pdfjs_viewer
 from door_detector.pdf.affine import apply_affine_bbox_xyxy, flip_bbox_y_xyxy, normalize_bbox_xyxy
 
@@ -2001,13 +2001,33 @@ def main_viewer_canvas(
         bb_pdf = _bbox_pdf_for_any(cand.get("bbox_xyxy"), cand.get("bbox_pdf_xyxy"))
         if not bb_pdf:
             continue
-        out_pool.append({"id": str(cid), "bbox_pdf_xyxy": bb_pdf})
+        # Include minimal metadata to allow the frontend to apply conservative
+        # snap filters (e.g. distinguish swing arcs vs generic near-square symbols).
+        feats = cand.get("features") if isinstance(cand, dict) else None
+        slim_feats: Dict[str, Any] = {}
+        if isinstance(feats, dict):
+            for k in ("arc_only", "angle_span", "radius", "rmse"):
+                if k in feats:
+                    try:
+                        slim_feats[k] = float(feats.get(k))
+                    except Exception:
+                        continue
+        out_pool.append(
+            {
+                "id": str(cid),
+                "type": str(cand.get("type") or ""),
+                "bbox_pdf_xyxy": bb_pdf,
+                "features": slim_feats,
+            }
+        )
 
     # Door state for styling.
     working = _get_working_label_state(fstate)
+    hidden_ids = set(working.get("deleted_ids", set())) | set(flatten_rejected_ids(working.get("rejected_by_type", {})))
     door_state = {
         "confirmed_ids": sorted(list(flatten_confirmed_ids(working.get("confirmed_by_type", {})))),
-        "deleted_ids": sorted(list(working.get("deleted_ids", set()))),
+        # Client uses this list as "hidden ids" (it hides them entirely).
+        "deleted_ids": sorted(list(hidden_ids)),
     }
 
     # Manual overlays: show only the current edit-session records.
@@ -2036,6 +2056,7 @@ def main_viewer_canvas(
         candidate_pool=out_pool,
         selected_door_id=str(fstate.get("selected_door_id") or ""),
         focus_seq=int(fstate.get("_focus_seq") or 0),
+        focus_request_seq=int(fstate.get("_focus_request_seq") or 0),
         auto_focus=bool(fstate.get("auto_focus", True)),
         edit_mode=bool(fstate.get("edit_mode")),
         viewer_display_mode=str(viewer_display),

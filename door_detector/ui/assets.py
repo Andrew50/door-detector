@@ -556,6 +556,20 @@ GLOBAL_STYLE_HTML = r"""
         font-weight: 800;
         letter-spacing: 0.2px;
     }
+    .door_detector-door-meta-confirmed {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.2px;
+        line-height: 1.2;
+        white-space: nowrap;
+        color: rgba(135, 255, 190, 0.95);
+        background: rgba(0, 200, 83, 0.18);
+        border: 1px solid rgba(0, 200, 83, 0.35);
+    }
 
     /* Viewer loading state (replaces the PDF viewer during analysis/re-analysis) */
     .door_detector-viewer-loading {

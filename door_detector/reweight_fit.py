@@ -160,6 +160,7 @@ def fit_reweighter(
         schema_v = labels_data.get("schema_version")
         confirmed_by_type: Dict[str, set[str]] = {t: set() for t in DOOR_TYPES}
         deleted: set[str] = set()
+        rejected_by_type: Dict[str, set[str]] = {t: set() for t in DOOR_TYPES}
 
         if schema_v == 2:
             # Legacy: untyped confirmations are treated as swing.
@@ -170,6 +171,16 @@ def fit_reweighter(
             if isinstance(cbt, dict):
                 for t in DOOR_TYPES:
                     confirmed_by_type[t] = {str(x) for x in (cbt.get(t) or []) if x is not None}
+            deleted = {str(x) for x in (labels_data.get("deleted_ids") or []) if x is not None}
+        elif schema_v == 4:
+            cbt = labels_data.get("confirmed_by_type") or {}
+            if isinstance(cbt, dict):
+                for t in DOOR_TYPES:
+                    confirmed_by_type[t] = {str(x) for x in (cbt.get(t) or []) if x is not None}
+            rbt = labels_data.get("rejected_by_type") or {}
+            if isinstance(rbt, dict):
+                for t in DOOR_TYPES:
+                    rejected_by_type[t] = {str(x) for x in (rbt.get(t) or []) if x is not None}
             deleted = {str(x) for x in (labels_data.get("deleted_ids") or []) if x is not None}
         else:
             # Ignore unknown schema versions.
@@ -203,7 +214,7 @@ def fit_reweighter(
                 legacy_ids = set()
 
             pos_ids = confirmed_by_type.get(cand_type, set())
-            neg_ids = set(deleted) | (confirmed_any - set(pos_ids))
+            neg_ids = set(deleted) | set(rejected_by_type.get(cand_type, set())) | (confirmed_any - set(pos_ids))
 
             is_pos = (did in pos_ids) or bool(legacy_ids & pos_ids)
             is_neg = (did in neg_ids) or bool(legacy_ids & neg_ids)

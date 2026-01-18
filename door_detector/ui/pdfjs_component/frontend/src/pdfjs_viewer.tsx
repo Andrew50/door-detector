@@ -40,6 +40,8 @@ type OverlayDoor = {
 type Candidate = {
   id: string;
   bbox_pdf_xyxy: BBox;
+  type?: string;
+  features?: Record<string, unknown>;
 };
 
 type DoorState = {
@@ -70,7 +72,8 @@ type ViewerEvent =
       iou: number | null;
       snapped_bbox_pdf_xyxy: BBox | null;
       ts: number;
-    };
+    }
+  | { type: "focus_state"; event_id: string; door_id: string; in_focus: boolean; ts: number };
 
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
@@ -82,6 +85,11 @@ function easeInOut(t: number) {
 
 function bboxCenter(b: BBox) {
   return { x: (b[0] + b[2]) / 2, y: (b[1] + b[3]) / 2 };
+}
+
+function bboxWidthHeight(b: BBox) {
+  const [x0, y0, x1, y1] = normalizeBBox(b);
+  return { w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
 }
 
 function normalizeBBox(b: BBox): BBox {
@@ -164,6 +172,7 @@ export function PdfJsViewer(props: ComponentProps) {
 
   const selectedDoorId = String(args.selectedDoorId ?? "");
   const focusSeq = Number(args.focusSeq ?? 0);
+  const focusRequestSeq = Number(args.focusRequestSeq ?? 0);
   const autoFocus = Boolean(args.autoFocus ?? true);
   const editMode = Boolean(args.editMode ?? false);
   const viewerDisplayMode = String(args.viewerDisplayMode ?? "all");
@@ -210,9 +219,18 @@ export function PdfJsViewer(props: ComponentProps) {
   const baseTxRef = useRef(0);
   const baseTyRef = useRef(0);
   const focusSeqRef = useRef(0);
+  const focusRequestSeqRef = useRef(0);
   const resetBtnRef = useRef<HTMLButtonElement | null>(null);
   const [resetVisible, setResetVisible] = useState(false);
   const resetVisibleRef = useRef(false);
+
+  // Track when the view is still at the last "focused" pose for the currently selected door.
+  // This lets the right panel show a Focus button when the user pans/zooms away.
+  const focusedPoseRef = useRef<{ doorId: string; tx: number; ty: number; scale: number } | null>(null);
+  const inFocusRef = useRef<boolean>(false);
+  const isFocusingRef = useRef<boolean>(false);
+  const pendingFocusDoorIdRef = useRef<string | null>(null);
+  const focusStateTimerRef = useRef<number | null>(null);
 
   // Selection for immediate feedback (server catches up on rerun).
   const localSelectedIdRef = useRef<string | null>(null);
@@ -220,8 +238,12 @@ export function PdfJsViewer(props: ComponentProps) {
   const lastViewerDisplayRef = useRef<string | null>(null);
   const lastEditModeRef = useRef<boolean | null>(null);
 
-  const confirmedSet = useMemo(() => new Set((doorState.confirmed_ids ?? []).map(String)), [doorState]);
-  const deletedSet = useMemo(() => new Set((doorState.deleted_ids ?? []).map(String)), [doorState]);
+  // IMPORTANT: Streamlit can sometimes reuse/mutate nested args objects in-place.
+  // Depend on a stable string key so we still react when the ID lists change.
+  const confirmedKey = Array.isArray(doorState.confirmed_ids) ? doorState.confirmed_ids.map(String).join("\n") : "";
+  const deletedKey = Array.isArray(doorState.deleted_ids) ? doorState.deleted_ids.map(String).join("\n") : "";
+  const confirmedSet = useMemo(() => new Set((doorState.confirmed_ids ?? []).map(String)), [confirmedKey]);
+  const deletedSet = useMemo(() => new Set((doorState.deleted_ids ?? []).map(String)), [deletedKey]);
 
   const emitEvent = useCallback((evt: ViewerEvent) => {
     Streamlit.setComponentValue(evt);
@@ -361,7 +383,7 @@ export function PdfJsViewer(props: ComponentProps) {
     try {
       sessionStorage.setItem(
         stateKey,
-        JSON.stringify({ tx, ty, scale: s, focusSeq: focusSeqRef.current })
+        JSON.stringify({ tx, ty, scale: s, focusSeq: focusSeqRef.current, focusRequestSeq: focusRequestSeqRef.current })
       );
     } catch {
       // ignore
@@ -414,7 +436,7 @@ export function PdfJsViewer(props: ComponentProps) {
       const obj = JSON.parse(raw);
       if (!obj) return null;
       if (!Number.isFinite(obj.tx) || !Number.isFinite(obj.ty) || !Number.isFinite(obj.scale)) return null;
-      return obj as { tx: number; ty: number; scale: number; focusSeq?: number };
+      return obj as { tx: number; ty: number; scale: number; focusSeq?: number; focusRequestSeq?: number };
     } catch {
       return null;
     }
@@ -790,6 +812,16 @@ export function PdfJsViewer(props: ComponentProps) {
     }
   }, [confirmedSet, deletedSet, selectedDoorId, viewerDisplayMode]);
 
+  // If the server marks the currently locally-selected door as deleted, clear the
+  // local selection so the UI doesn't keep "sticking" to a removed candidate.
+  useEffect(() => {
+    const local = localSelectedIdRef.current;
+    if (local && deletedSet.has(local)) {
+      localSelectedIdRef.current = null;
+      applyDoorStyles();
+    }
+  }, [applyDoorStyles, deletedSet]);
+
   const renderOverlays = useCallback(() => {
     const svg = svgRef.current;
     if (!svg || !pageSize) return;
@@ -873,6 +905,12 @@ export function PdfJsViewer(props: ComponentProps) {
       const MIN_SNAP_IOU = 0.02;
       const MIN_CAND_COVERAGE = 0.2;
       const MIN_IOU_INTER_FRAC_OF_MAX_INTER = 0.72;
+      // Conservative anti-false-positive rules:
+      // - Treat near-square candidates as "symbol-like" and require stronger evidence,
+      //   except for swing arcs (door quarter-circle arcs) which are inherently square-ish.
+      const SQUARE_AR_MAX = 1.28;
+      const MIN_SNAP_IOU_FOR_SQUARE = 0.10;
+
       const norm = normalizeBBox(drawnPdf);
       const overlap: Array<{ id: string; bbox: BBox; iou: number; inter: number; coverage: number }> = [];
 
@@ -883,6 +921,8 @@ export function PdfJsViewer(props: ComponentProps) {
       let bestCoverage = -1;
       let bestByCoverage: { id: string; bbox: BBox; iou: number; coverage: number; inter: number } | null = null;
 
+      let skippedSquareWeak = 0;
+
       for (const r of candidatePool) {
         const did = r?.id ? String(r.id) : null;
         const cand = r?.bbox_pdf_xyxy && Array.isArray(r.bbox_pdf_xyxy) ? (r.bbox_pdf_xyxy as BBox) : null;
@@ -892,6 +932,20 @@ export function PdfJsViewer(props: ComponentProps) {
         const candArea = Math.max(0, (cand[2] - cand[0])) * Math.max(0, (cand[3] - cand[1]));
         const coverage = candArea > 0 ? inter / candArea : 0;
         if (inter > 0) {
+          // Penalize near-square candidates unless the match is strong.
+          const wh = bboxWidthHeight(cand);
+          const ar = wh.w > 0 && wh.h > 0 ? Math.max(wh.w / wh.h, wh.h / wh.w) : Infinity;
+          const isSquareLike = Number.isFinite(ar) && ar <= SQUARE_AR_MAX;
+          const rType = String((r as any)?.type ?? "");
+          const feats = ((r as any)?.features ?? {}) as Record<string, any>;
+          const arcOnly = Number(feats?.arc_only ?? 0) >= 0.5;
+          const angleSpan = Number(feats?.angle_span ?? NaN);
+          const isSwingArcLike = rType === "swing_arc" && arcOnly && Number.isFinite(angleSpan) && angleSpan >= 20 && angleSpan <= 125;
+
+          if (isSquareLike && !isSwingArcLike && iou < MIN_SNAP_IOU_FOR_SQUARE) {
+            skippedSquareWeak += 1;
+            continue;
+          }
           overlap.push({ id: did, bbox: cand, iou, inter, coverage });
           if (iou > bestIou) {
             bestIou = iou;
@@ -914,7 +968,14 @@ export function PdfJsViewer(props: ComponentProps) {
         drawn: norm,
         candidates: candidatePool.length,
         overlapCandidates: overlap.length,
-        thresholds: { MIN_SNAP_IOU, MIN_CAND_COVERAGE, MIN_IOU_INTER_FRAC_OF_MAX_INTER },
+        thresholds: {
+          MIN_SNAP_IOU,
+          MIN_CAND_COVERAGE,
+          MIN_IOU_INTER_FRAC_OF_MAX_INTER,
+          SQUARE_AR_MAX,
+          MIN_SNAP_IOU_FOR_SQUARE,
+        },
+        skipped: { squareWeak: skippedSquareWeak },
         bestByIoU: bestByIou ? { id: bestByIou.id, iou: bestByIou.iou } : null,
         bestByInter: bestByInter ? { id: bestByInter.id, inter: bestByInter.inter, iou: bestByInter.iou } : null,
         bestByCoverage: bestByCoverage
@@ -1017,14 +1078,57 @@ export function PdfJsViewer(props: ComponentProps) {
         tyRef.current = sTy + dTy * e;
         scaleRef.current = sScale + dScale * e;
         applyTransform();
-        if (t < 1) requestAnimationFrame(step);
-        else scheduleQualityRender();
+        if (t < 1) {
+          requestAnimationFrame(step);
+        } else {
+          scheduleQualityRender();
+          isFocusingRef.current = false;
+          const pendingDoorId = pendingFocusDoorIdRef.current;
+          if (pendingDoorId) {
+            focusedPoseRef.current = {
+              doorId: pendingDoorId,
+              tx: txRef.current,
+              ty: tyRef.current,
+              scale: scaleRef.current,
+            };
+            pendingFocusDoorIdRef.current = null;
+            inFocusRef.current = true;
+          }
+        }
       }
 
+      isFocusingRef.current = true;
       requestAnimationFrame(step);
     },
     [applyTransform, pageSize, scheduleQualityRender]
   );
+
+  const checkAndEmitFocusState = useCallback(() => {
+    if (isFocusingRef.current) return;
+    const doorId = selectedDoorId ? String(selectedDoorId) : "";
+    if (!doorId) return;
+    const fp = focusedPoseRef.current;
+    if (!fp || fp.doorId !== doorId) return;
+
+    const epsPx = 0.5;
+    const epsScale = 0.0005;
+    const atFocus =
+      Math.abs(scaleRef.current - fp.scale) < epsScale &&
+      Math.abs(txRef.current - fp.tx) < epsPx &&
+      Math.abs(tyRef.current - fp.ty) < epsPx;
+
+    if (atFocus === inFocusRef.current) return;
+    inFocusRef.current = atFocus;
+    emitEvent({ type: "focus_state", event_id: randEventId(), door_id: doorId, in_focus: atFocus, ts: Date.now() });
+  }, [emitEvent, selectedDoorId]);
+
+  const scheduleFocusStateCheck = useCallback(() => {
+    if (focusStateTimerRef.current) window.clearTimeout(focusStateTimerRef.current);
+    focusStateTimerRef.current = window.setTimeout(() => {
+      focusStateTimerRef.current = null;
+      checkAndEmitFocusState();
+    }, 120);
+  }, [checkAndEmitFocusState]);
 
   const focusToDoorId = useCallback(
     (doorId: string) => {
@@ -1047,10 +1151,26 @@ export function PdfJsViewer(props: ComponentProps) {
     if (!autoFocus) return;
     if (editMode) return;
     if (!selectedDoorId) return;
-    const lastApplied = loadState()?.focusSeq ?? null;
-    if (lastApplied !== null && lastApplied === focusSeq) return;
+    // `focusSeq` is treated as an explicit "please autofocus now" counter.
+    // Keep it at 0 for automatic selections (initial load, delete-driven advance, etc.).
+    if (!(focusSeq > 0)) return;
+    const lastApplied = loadState()?.focusSeq ?? 0;
+    if (lastApplied === focusSeq) return;
+    pendingFocusDoorIdRef.current = selectedDoorId;
     focusToDoorId(selectedDoorId);
   }, [autoFocus, editMode, focusSeq, focusToDoorId, loadState, selectedDoorId]);
+
+  // Manual focus requests (e.g. a "Focus" button in the right panel). This is
+  // NOT gated by autoFocus and is allowed even in edit mode.
+  useEffect(() => {
+    focusRequestSeqRef.current = focusRequestSeq;
+    if (!selectedDoorId) return;
+    if (!(focusRequestSeq > 0)) return;
+    const lastApplied = loadState()?.focusRequestSeq ?? 0;
+    if (lastApplied === focusRequestSeq) return;
+    pendingFocusDoorIdRef.current = selectedDoorId;
+    focusToDoorId(selectedDoorId);
+  }, [focusRequestSeq, focusToDoorId, loadState, selectedDoorId]);
 
   // Wheel zoom + drag pan + shift+drag drawing.
   useEffect(() => {
@@ -1097,6 +1217,7 @@ export function PdfJsViewer(props: ComponentProps) {
       scaleRef.current = nextScale;
       applyTransform();
       scheduleQualityRender();
+      scheduleFocusStateCheck();
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -1253,6 +1374,7 @@ export function PdfJsViewer(props: ComponentProps) {
       dragging = false;
       stage.style.cursor = "grab";
       scheduleQualityRender();
+      scheduleFocusStateCheck();
     };
 
     const onSvgPointerDownCapture = (e: PointerEvent) => {
@@ -1264,17 +1386,75 @@ export function PdfJsViewer(props: ComponentProps) {
       }
     };
 
+    const pickDoorIdAtClientPoint = (clientX: number, clientY: number): string | null => {
+      const svgEl = svgRef.current;
+      if (!svgEl) return null;
+      try {
+        // Transform the client-space point into the SVG's coordinate system.
+        const ctm = svgEl.getScreenCTM();
+        if (!ctm) return null;
+        const inv = ctm.inverse();
+        const pt = svgEl.createSVGPoint();
+        pt.x = clientX;
+        pt.y = clientY;
+        const p = pt.matrixTransform(inv);
+        const px = Number(p.x);
+        const py = Number(p.y);
+        if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+
+        const rects = svgEl.querySelectorAll<SVGRectElement>("rect[data-door-id]");
+        let bestId: string | null = null;
+        let bestArea = Infinity;
+        let bestDist = Infinity;
+        for (const r of rects) {
+          const did = r.getAttribute("data-door-id");
+          if (!did) continue;
+          // Skip hidden (deleted / view mode filtered) rects.
+          if ((r.style as any).display === "none") continue;
+
+          const x = parseFloat(r.getAttribute("data-x") || r.getAttribute("x") || "NaN");
+          const y = parseFloat(r.getAttribute("data-y") || r.getAttribute("y") || "NaN");
+          const w = parseFloat(r.getAttribute("data-w") || r.getAttribute("width") || "NaN");
+          const h = parseFloat(r.getAttribute("data-h") || r.getAttribute("height") || "NaN");
+          if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h))) continue;
+          if (!(w > 0) || !(h > 0)) continue;
+
+          if (px < x || px > x + w || py < y || py > y + h) continue;
+
+          // Prefer the most specific (smallest) bbox under the cursor.
+          // Tie-break by distance from click to center.
+          const area = w * h;
+          const cx = x + 0.5 * w;
+          const cy = y + 0.5 * h;
+          const dist = Math.hypot(px - cx, py - cy);
+          if (area < bestArea - 1e-9 || (Math.abs(area - bestArea) <= 1e-9 && dist < bestDist)) {
+            bestArea = area;
+            bestDist = dist;
+            bestId = did;
+          }
+        }
+        return bestId;
+      } catch {
+        return null;
+      }
+    };
+
     const onSvgClick = (e: MouseEvent) => {
       if (performance.now && performance.now() < suppressSvgClickUntil) return;
-      const t = e.target as any;
-      if (!t || !t.getAttribute) return;
-      const did = t.getAttribute("data-door-id");
+      // Don't rely on the DOM event target: when boxes overlap we want the "best"
+      // match under the cursor (usually the smallest bbox), even if a larger box
+      // is currently on top / selected.
+      const picked = pickDoorIdAtClientPoint(e.clientX, e.clientY);
+      const did = picked || ((e.target as any)?.getAttribute ? (e.target as any).getAttribute("data-door-id") : null);
       if (!did) return;
       e.preventDefault();
       e.stopPropagation();
       localSelectedIdRef.current = String(did);
       applyDoorStyles();
-      if (!editMode && autoFocus) focusToDoorId(String(did));
+      if (!editMode && autoFocus) {
+        pendingFocusDoorIdRef.current = String(did);
+        focusToDoorId(String(did));
+      }
       emitEvent({ type: "door_click", event_id: randEventId(), door_id: String(did), ts: Date.now() });
     };
 
@@ -1302,6 +1482,7 @@ export function PdfJsViewer(props: ComponentProps) {
     applyDoorStyles,
     applyTransform,
     autoFocus,
+    checkAndEmitFocusState,
     drawBox,
     editMode,
     emitEvent,
@@ -1309,6 +1490,7 @@ export function PdfJsViewer(props: ComponentProps) {
     focusToDoorId,
     pageSize,
     scheduleQualityRender,
+    scheduleFocusStateCheck,
     snapCandidateForDrawPdf,
   ]);
 
