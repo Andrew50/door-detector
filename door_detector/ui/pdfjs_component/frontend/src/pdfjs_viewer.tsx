@@ -174,6 +174,7 @@ export function PdfJsViewer(props: ComponentProps) {
   const focusSeq = Number(args.focusSeq ?? 0);
   const focusRequestSeq = Number(args.focusRequestSeq ?? 0);
   const autoFocus = Boolean(args.autoFocus ?? true);
+  const cycleCandidateId = String(args.cycleCandidateId ?? "");
   const editMode = Boolean(args.editMode ?? false);
   const viewerDisplayMode = String(args.viewerDisplayMode ?? "all");
 
@@ -871,6 +872,19 @@ export function PdfJsViewer(props: ComponentProps) {
     // Once server overlays update, drop any client-only temp boxes to avoid duplicates.
     clearSvgLayer(tempLayer);
 
+    // Highlight the currently-cycled candidate (Prev/Next) as a "snap" box.
+    if (cycleCandidateId) {
+      try {
+        const cand = candidatePool.find((c) => String((c as any)?.id ?? "") === cycleCandidateId) as any;
+        const bb = cand?.bbox_pdf_xyxy && Array.isArray(cand.bbox_pdf_xyxy) ? (cand.bbox_pdf_xyxy as BBox) : null;
+        if (bb) {
+          drawBox(tempLayer, pdfBBoxToViewportBBox(vp, bb), "rgb(0,255,0)", 3, "4,3", 0.9);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     const manual = manualOverlays.manual_additions ?? [];
     const unmatched = manualOverlays.unmatched_manual_boxes ?? [];
     for (const m of manual) {
@@ -896,7 +910,7 @@ export function PdfJsViewer(props: ComponentProps) {
       ty: tyRef.current,
       ts: Date.now(),
     });
-  }, [candidatePool, clearSvgLayer, drawBox, editMode, ensureLayer, manualOverlays, overlayDoors, pageSize]);
+  }, [candidatePool, clearSvgLayer, cycleCandidateId, drawBox, editMode, ensureLayer, manualOverlays, overlayDoors, pageSize]);
 
   const snapCandidateForDrawPdf = useCallback(
     (drawnPdf: BBox) => {

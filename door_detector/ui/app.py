@@ -323,6 +323,128 @@ def _process_draw_event_if_any(
     drawn_full = _clamp_bbox_xyxy([float(v) for v in drawn_full], w=full_w, h=full_h)
 
     candidates = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
+
+    # --- Build a ranked suggestion list for cycling (UI) ---
+    # Users often need to cycle through overlapping candidates (e.g. double vs two swings,
+    # arc-only vs full swing). We compute a ranked list here so the right panel can
+    # offer Prev/Next selection without rerunning geometry detection.
+    try:
+        bx0, by0, bx1, by1 = _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
+        bcx = 0.5 * (bx0 + bx1)
+        bcy = 0.5 * (by0 + by1)
+
+        scored: List[Tuple[Tuple[float, float, float], Dict[str, Any]]] = []
+        for cand in candidates:
+            cid = cand.get("id")
+            cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
+            if cid is None or cb is None:
+                continue
+            cx0, cy0, cx1, cy1 = cb
+            ix0 = max(bx0, cx0)
+            iy0 = max(by0, cy0)
+            ix1 = min(bx1, cx1)
+            iy1 = min(by1, cy1)
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            if inter <= 0.0:
+                continue
+            iou_c = float(compute_iou([bx0, by0, bx1, by1], [cx0, cy0, cx1, cy1]))
+            conf = float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)
+            scored.append(((iou_c, inter, conf), cand))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        pool_map = {str(c.get("id")): c for c in candidates if c.get("id") is not None}
+
+        suggestions: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for (iou_c, inter, conf), cand in scored[:40]:
+            cid = str(cand.get("id") or "")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            suggestions.append(
+                {
+                    "id": cid,
+                    "type": str(cand.get("type") or ""),
+                    "iou": float(iou_c),
+                    "inter": float(inter),
+                    "confidence": float(conf),
+                    "source": "overlap",
+                }
+            )
+
+            # Expand doubles into component swings so the reviewer can cycle to them.
+            if str(cand.get("type") or "") == "double":
+                try:
+                    comps = (cand.get("components") or {}) if isinstance(cand, dict) else {}
+                    swing_ids = comps.get("swing_ids") or []
+                    if isinstance(swing_ids, list):
+                        for sid in swing_ids:
+                            ssid = str(sid) if sid not in (None, "") else ""
+                            if not ssid or ssid in seen:
+                                continue
+                            sc = pool_map.get(ssid)
+                            if not sc:
+                                continue
+                            scb = _normalize_bbox_xyxy(sc.get("bbox_xyxy"))
+                            if scb is None:
+                                continue
+                            siou = float(compute_iou([bx0, by0, bx1, by1], [scb[0], scb[1], scb[2], scb[3]]))
+                            seen.add(ssid)
+                            suggestions.append(
+                                {
+                                    "id": ssid,
+                                    "type": str(sc.get("type") or "swing"),
+                                    "iou": float(siou),
+                                    "inter": 0.0,
+                                    "confidence": float(sc.get("confidence", sc.get("heuristic_confidence", 0.0)) or 0.0),
+                                    "source": "double_component",
+                                    "parent_double_id": cid,
+                                }
+                            )
+                except Exception:
+                    pass
+
+        # If nothing overlaps, still offer nearby candidates by center distance.
+        if not suggestions:
+            near: List[Tuple[float, Dict[str, Any]]] = []
+            for cand in candidates:
+                cid = cand.get("id")
+                cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
+                if cid is None or cb is None:
+                    continue
+                ccx = 0.5 * (cb[0] + cb[2])
+                ccy = 0.5 * (cb[1] + cb[3])
+                dist = float(((ccx - bcx) ** 2 + (ccy - bcy) ** 2) ** 0.5)
+                near.append((dist, cand))
+            near.sort(key=lambda x: x[0])
+            for dist, cand in near[:25]:
+                cid = str(cand.get("id") or "")
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                conf = float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)
+                suggestions.append(
+                    {
+                        "id": cid,
+                        "type": str(cand.get("type") or ""),
+                        "iou": 0.0,
+                        "inter": 0.0,
+                        "confidence": float(conf),
+                        "source": "nearest",
+                        "dist_px": float(dist),
+                    }
+                )
+
+        fstate["_last_draw_suggestions"] = {
+            "event_id": str(event_id),
+            "drawn_bbox_xyxy": [float(v) for v in drawn_full],
+            "suggestions": suggestions[:50],
+        }
+    except Exception:
+        fstate["_last_draw_suggestions"] = {"event_id": str(event_id), "suggestions": []}
+
     # Server-side snap is the source of truth (uses full candidate list).
     best_server, iou_server = _snap_to_candidate(drawn_full, candidates=candidates)
 
@@ -382,6 +504,15 @@ def _process_draw_event_if_any(
 
     if best is not None and best.get("id") is not None:
         cid = str(best["id"])
+        # Align the cycling index to the chosen id (best effort).
+        try:
+            srec = fstate.get("_last_draw_suggestions") or {}
+            sugg = list(srec.get("suggestions") or [])
+            idx = next((i for i, r in enumerate(sugg) if str(r.get("id") or "") == cid), None)
+            if isinstance(idx, int) and idx >= 0:
+                st.session_state[f"_draw_suggest_idx_{file_id}"] = int(idx)
+        except Exception:
+            pass
         snapped_full = _normalize_bbox_xyxy(best.get("bbox_xyxy")) or _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
         label_type = normalize_door_type(best.get("type"), default="swing")
         rec = {
@@ -754,6 +885,38 @@ def main() -> None:
                 viewer_display_key = f"viewer_display_mode_{file_id}"
                 if viewer_display_key in st.session_state:
                     fstate["viewer_display_mode"] = str(st.session_state.get(viewer_display_key) or "Highlight All")
+
+                # --- Sync draw-suggestion cycling state BEFORE rendering the viewer ---
+                # Right panel writes these widget states; we compute the currently-cycled
+                # candidate id here so the viewer can draw the snap highlight immediately.
+                try:
+                    srec = fstate.get("_last_draw_suggestions") or {}
+                    suggestions = list(srec.get("suggestions") or [])
+                except Exception:
+                    suggestions = []
+                idx_key = f"_draw_suggest_idx_{file_id}"
+                type_key = f"_draw_suggest_type_{file_id}"
+                type_touched_key = f"_draw_suggest_type_touched_{file_id}"
+                try:
+                    idx = int(st.session_state.get(idx_key) or 0)
+                except Exception:
+                    idx = 0
+                chosen_type = str(st.session_state.get(type_key) or "All types")
+                use_filter = bool(st.session_state.get(type_touched_key, False)) and (chosen_type != "All types")
+                filtered = [s for s in suggestions if (not use_filter) or (str(s.get("type") or "") == chosen_type)]
+                if not filtered and suggestions:
+                    filtered = suggestions
+                if idx < 0:
+                    idx = 0
+                if filtered and idx >= len(filtered):
+                    idx = 0
+                cycle_id = ""
+                if filtered:
+                    try:
+                        cycle_id = str(filtered[idx].get("id") or "")
+                    except Exception:
+                        cycle_id = ""
+                fstate["_cycle_candidate_id"] = cycle_id
 
                 with viewer_slot:
                     # Scan-mode UX: be explicit that vector-first detection cannot run.

@@ -1993,6 +1993,21 @@ def main_viewer_canvas(
             full_w, full_h = None, None
 
     picked = _sample_pool_for_viewer(pool, full_w=full_w, full_h=full_h, max_out=1200, grid=8)
+    # Ensure the currently-cycled candidate (from the right panel Prev/Next) is
+    # present in the frontend pool so the viewer can draw its highlight bbox.
+    try:
+        cycle_id = str(fstate.get("_cycle_candidate_id") or "")
+    except Exception:
+        cycle_id = ""
+    if cycle_id:
+        try:
+            by_id = {str(c.get("id")): c for c in pool if isinstance(c, dict) and c.get("id") is not None}
+            cobj = by_id.get(cycle_id)
+            if cobj is not None:
+                # Prepend so it is guaranteed included even if we hit max_out.
+                picked = [cobj] + [c for c in picked if str(c.get("id")) != cycle_id]
+        except Exception:
+            pass
     out_pool: List[Dict[str, Any]] = []
     for cand in picked:
         cid = cand.get("id")
@@ -2058,6 +2073,7 @@ def main_viewer_canvas(
         focus_seq=int(fstate.get("_focus_seq") or 0),
         focus_request_seq=int(fstate.get("_focus_request_seq") or 0),
         auto_focus=bool(fstate.get("auto_focus", True)),
+        cycle_candidate_id=str(fstate.get("_cycle_candidate_id") or ""),
         edit_mode=bool(fstate.get("edit_mode")),
         viewer_display_mode=str(viewer_display),
         door_state=door_state,

@@ -528,6 +528,32 @@ GLOBAL_STYLE_HTML = r"""
         text-overflow: ellipsis !important;
     }
 
+    /* Review panel action buttons (typed confirm/reject) */
+    button[id^="confirm_btn_"] {
+        background: rgba(0, 200, 83, 0.14) !important;
+        border: 1px solid rgba(0, 200, 83, 0.30) !important;
+    }
+    button[id^="confirm_btn_"]:hover {
+        background: rgba(0, 200, 83, 0.20) !important;
+        border-color: rgba(0, 200, 83, 0.45) !important;
+    }
+    button[id^="reject_btn_"] {
+        background: rgba(255, 75, 75, 0.12) !important;
+        border: 1px solid rgba(255, 75, 75, 0.28) !important;
+    }
+    button[id^="reject_btn_"]:hover {
+        background: rgba(255, 75, 75, 0.18) !important;
+        border-color: rgba(255, 75, 75, 0.40) !important;
+    }
+    /* Keep these button labels on one line like the library delete buttons. */
+    button[id^="confirm_btn_"] div[data-testid="stMarkdownContainer"] p,
+    button[id^="reject_btn_"] div[data-testid="stMarkdownContainer"] p,
+    button[id^="not_door_btn_"] div[data-testid="stMarkdownContainer"] p {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+    }
+
     /* Selected door details */
     .door_detector-door-meta {
         display: flex;

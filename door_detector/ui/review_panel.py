@@ -240,6 +240,84 @@ def main_viewer_controls(
                 _cancel_edit_mode(fstate)
                 st.rerun()
             st.caption("Shift+drag to add rectangles (snap-to-candidate).")
+
+            # After a Shift+drag, allow cycling through candidate matches under that selection.
+            # This addresses the core UX issue: snapping can only pick *one* candidate, but
+            # the correct label may be a different overlapping candidate (or a component of
+            # a double-door candidate).
+            try:
+                srec = fstate.get("_last_draw_suggestions") or {}
+                suggestions = list(srec.get("suggestions") or [])
+            except Exception:
+                suggestions = []
+            if suggestions:
+                st.divider()
+                st.subheader("Selection matches")
+
+                idx_key = f"_draw_suggest_idx_{file_id}"
+                # Type filter dropdown (starts as "All types"; filtering only activates after user changes it).
+                type_key = f"_draw_suggest_type_{file_id}"
+                type_prev_key = f"_draw_suggest_type_prev_{file_id}"
+                type_touched_key = f"_draw_suggest_type_touched_{file_id}"
+
+                types = sorted({str(s.get("type") or "").strip() for s in suggestions if str(s.get("type") or "").strip()})
+                type_options = ["All types"] + types
+                if type_key not in st.session_state:
+                    st.session_state[type_key] = "All types"
+                if str(st.session_state.get(type_key) or "All types") not in type_options:
+                    st.session_state[type_key] = "All types"
+
+                chosen_type = st.selectbox("Type filter", type_options, key=type_key, label_visibility="collapsed")
+                prev_type = st.session_state.get(type_prev_key)
+                if prev_type is None:
+                    st.session_state[type_prev_key] = chosen_type
+                elif chosen_type != prev_type:
+                    st.session_state[type_prev_key] = chosen_type
+                    st.session_state[type_touched_key] = True
+
+                # Apply filter only after user has touched the dropdown.
+                use_filter = bool(st.session_state.get(type_touched_key, False)) and (chosen_type != "All types")
+                filtered = [s for s in suggestions if (not use_filter) or (str(s.get("type") or "") == chosen_type)]
+                if not filtered:
+                    filtered = suggestions
+                    use_filter = False
+
+                if idx_key not in st.session_state:
+                    st.session_state[idx_key] = 0
+                try:
+                    idx = int(st.session_state.get(idx_key) or 0)
+                except Exception:
+                    idx = 0
+                if idx < 0:
+                    idx = 0
+                if idx >= len(filtered):
+                    idx = 0
+                st.session_state[idx_key] = idx
+
+                cur = filtered[idx] if filtered else suggestions[0]
+                cur_type = str(cur.get("type") or "")
+                cur_src = str(cur.get("source") or "")
+                cur_iou = cur.get("iou")
+                cur_conf = cur.get("confidence")
+                bits = []
+                if cur_type:
+                    bits.append(f"type={cur_type}")
+                if isinstance(cur_iou, (int, float)):
+                    bits.append(f"iou={float(cur_iou):.3f}")
+                if isinstance(cur_conf, (int, float)):
+                    bits.append(f"conf={float(cur_conf):.2f}")
+                if cur_src:
+                    bits.append(str(cur_src))
+                st.caption(f"Showing **{idx+1} / {len(filtered)}**" + (" (filtered)" if use_filter else ""))
+                st.write(" / ".join(bits) if bits else "Match")
+
+                c_prev, c_next = st.columns(2)
+                if c_prev.button("Prev", use_container_width=True, key=f"prev_draw_suggest_{file_id}"):
+                    st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) - 1) % len(filtered)
+                    st.rerun()
+                if c_next.button("Next", use_container_width=True, key=f"next_draw_suggest_{file_id}"):
+                    st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) + 1) % len(filtered)
+                    st.rerun()
     with c4:
         auto_focus_key = f"auto_focus_{file_id}"
         # Keep widget state and per-file fstate in sync.
@@ -380,6 +458,10 @@ def right_panel_review(
 ) -> None:
     file_id = item["id"]
     file_dir = Path(item["path"])
+    # Some discovered file ids can include characters like '(' which are not valid
+    # HTML element ids; Streamlit may then omit the button id attribute. Use a
+    # safe hashed suffix for widget keys that we want to style via CSS.
+    key_suffix = hashlib.md5(str(file_id).encode("utf-8")).hexdigest()[:12]
 
     task = st.session_state.get("door_detector_pipeline_task")
     is_running_for_file = bool(task and task.get("file_id") == str(file_id))
@@ -557,7 +639,13 @@ def right_panel_review(
     # Actions
     is_editing = bool(fstate.get("edit_mode"))
     c1, c2 = st.columns(2)
-    if c1.button("Confirm door", use_container_width=True):
+    # Button labels include door type to make the feedback intent unambiguous.
+    ui_label_type = normalize_door_type(st.session_state.get(label_type_key), default=default_label_type)
+    detected_type = normalize_door_type(selected_door.get("type"), default="swing")
+    confirm_label = f"Confirm {str(ui_label_type).capitalize()} door"
+    reject_label = f"Delete / Reject {str(detected_type).capitalize()} door"
+
+    if c1.button(confirm_label, use_container_width=True, key=f"confirm_btn_{key_suffix}"):
         # Ensure confirmed_by_type exists.
         try:
             cbt = working.get("confirmed_by_type")
@@ -568,7 +656,7 @@ def right_panel_review(
             cbt = {t: set() for t in DOOR_TYPES}
             working["confirmed_by_type"] = cbt
 
-        label_type = normalize_door_type(st.session_state.get(label_type_key), default=default_label_type)
+        label_type = ui_label_type
         # Candidate can only be confirmed as exactly one type.
         for t in DOOR_TYPES:
             try:
@@ -597,9 +685,25 @@ def right_panel_review(
                 pass
         else:
             save_current_labels(str(file_id), file_dir)
+        # UX: advance to the next door (wrap) after confirming.
+        #
+        # IMPORTANT: don't rely on mutating the number_input's idx key here; Streamlit can
+        # re-apply the widget's prior value at the start of the rerun, clobbering it.
+        # Instead, use the click-sink (event-like) path which is consumed once by the
+        # selection sync logic and guarantees a selection change.
+        try:
+            next_id = door_ids[(int(selected_idx) + 1) % max(1, len(door_ids))]
+            st.session_state[f"door_click_sink_{file_id}"] = str(next_id)
+        except Exception:
+            pass
+        _mark_nav_intent(str(file_id))
         st.rerun()
-    if c2.button("Delete / Not a door", use_container_width=True, help="Reject this candidate as its detected door type (e.g. 'not a double')."):
-        detected_type = normalize_door_type(selected_door.get("type"), default="swing")
+    if c2.button(
+        reject_label,
+        use_container_width=True,
+        key=f"reject_btn_{key_suffix}",
+        help="Reject this candidate as its detected door type (e.g. 'not a double').",
+    ):
         # Ensure rejected_by_type exists.
         try:
             rbt = working.get("rejected_by_type")
@@ -643,11 +747,9 @@ def right_panel_review(
             ]
         else:
             save_current_labels(str(file_id), file_dir)
-        # Selection will advance automatically; do not autofocus the next door.
-        try:
-            st.session_state[_suppress_autofocus_key(str(file_id))] = True
-        except Exception:
-            pass
+        # UX: selection will advance automatically. Treat this as explicit navigation so
+        # auto-focus (if enabled) will focus the next selected door.
+        _mark_nav_intent(str(file_id))
         fstate["selected_door_id"] = None  # Move to next
         st.rerun()
 
@@ -656,6 +758,7 @@ def right_panel_review(
         "Not a door at all",
         use_container_width=True,
         type="secondary",
+        key=f"not_door_btn_{key_suffix}",
         help="Use this only when the highlighted item is truly not any door type (global negative).",
     ):
         working["deleted_ids"].add(did)
@@ -689,10 +792,9 @@ def right_panel_review(
             ]
         else:
             save_current_labels(str(file_id), file_dir)
-        try:
-            st.session_state[_suppress_autofocus_key(str(file_id))] = True
-        except Exception:
-            pass
+        # UX: selection will advance automatically. Treat this as explicit navigation so
+        # auto-focus (if enabled) will focus the next selected door.
+        _mark_nav_intent(str(file_id))
         fstate["selected_door_id"] = None
         st.rerun()
 
