@@ -67,28 +67,27 @@ st.set_page_config(page_title="Door Detector: Door Detection & Review", layout="
 # --- UI Styling ---
 st.markdown("""
 <style>
-    /* Hide Streamlit chrome (cosmetic only; not a security boundary)
-       NOTE: Do NOT fully hide the header: Streamlit renders the sidebar
-       re-expand control there when the sidebar is collapsed. Instead, collapse
-       the header visuals and keep only the collapsed control visible. */
-    /* IMPORTANT:
-       - Never `display:none` the header; that removes the sidebar re-expand control.
-       - Also avoid `visibility:hidden` on the header: in Streamlit 1.53.x the
-         sidebar toggle may not match our override selectors and can get hidden. */
-    header {
-        background: transparent !important;
-        box-shadow: none !important;
-    }
-    [data-testid="stHeader"] {
-        background: transparent !important;
-        box-shadow: none !important;
-    }
-    /* Don't hide the whole toolbar: Streamlit may render the sidebar re-expand
-       control inside it. Hide only the noisy bits. */
+    /* Hide Streamlit chrome (cosmetic only; not a security boundary).
+       We keep the sidebar always visible and remove the top toolbar entirely. */
+    header,
+    [data-testid="stHeader"],
     [data-testid="stToolbar"] {
+        /* IMPORTANT: don't `display:none` the toolbar/header; Streamlit may mount
+           the sidebar "open" control there when the sidebar is collapsed, and
+           we need it present so JS can force-open on page load. */
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
         background: transparent !important;
         box-shadow: none !important;
+        border: none !important;
         overflow: visible !important;
+        /* Actually hide it visually (incl. deploy button), but keep it in the DOM so
+           the sidebar "open" control can still exist and be clicked via JS. */
+        visibility: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important; /* avoid any accidental clicks */
     }
     [data-testid="stStatusWidget"] { display: none !important; }
     #MainMenu { display: none !important; }
@@ -96,58 +95,26 @@ st.markdown("""
     footer { display: none !important; }
     [data-testid="stDeployButton"] { display: none !important; }
 
-    /* "Custom" (restyled) sidebar collapsed control.
-       Keep it visible/clickable even though the rest of the header is hidden. */
+    /* Prevent collapsing: hide any sidebar close/collapse buttons. */
+    [data-testid="stSidebar"] button[aria-label="Close sidebar"],
+    [data-testid="stSidebar"] button[aria-label="Collapse sidebar"],
+    [data-testid="stSidebar"] button[title="Close sidebar"],
+    [data-testid="stSidebar"] button[title="Collapse sidebar"],
+    [data-testid="stSidebar"] button[data-testid="stBaseButton-headerNoPadding"],
+    [data-testid="stSidebar"] button[data-testid="baseButton-headerNoPadding"],
+    [data-testid="stSidebar"] button[kind="headerNoPadding"],
+    [data-testid="stSidebar"] button[data-testid*="headerNoPadding"] {
+        display: none !important;
+    }
+
+    /* Hide the collapsed-control toggle UI (we auto-open on load if needed).
+       Use visibility/opacity instead of display:none so it stays in the DOM. */
     [data-testid="collapsedControl"],
-    [data-testid="stSidebarCollapsedControl"] {
-        display: flex !important;
-        visibility: visible !important;
-        opacity: 1 !important;
-        position: fixed !important;
-        top: 10px !important;
-        left: 10px !important;
-        z-index: 2147483647 !important;
-        pointer-events: auto !important;
-    }
-
-    [data-testid="collapsedControl"] button,
-    [data-testid="stSidebarCollapsedControl"] button,
-    button[aria-label="Open sidebar"],
-    button[aria-label="Close sidebar"] {
-        /* Ensure it survives "hide buttons" rules */
-        display: inline-flex !important;
-        visibility: visible !important;
-        opacity: 0.92 !important;
-        pointer-events: auto !important;
-
-        width: 36px !important;
-        height: 36px !important;
-        padding: 0 !important;
-        align-items: center !important;
-        justify-content: center !important;
-
-        border-radius: 8px !important;
-        border: 1px solid rgba(255, 255, 255, 0.18) !important;
-        background: rgba(17, 25, 40, 0.72) !important;
-        color: rgba(255, 255, 255, 0.92) !important;
-        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35) !important;
-        backdrop-filter: blur(6px) !important;
-        -webkit-backdrop-filter: blur(6px) !important;
-        transition: opacity 120ms ease, transform 120ms ease, border-color 120ms ease, background 120ms ease !important;
-    }
-    [data-testid="collapsedControl"] button:hover,
-    [data-testid="stSidebarCollapsedControl"] button:hover,
-    button[aria-label="Open sidebar"]:hover,
-    button[aria-label="Close sidebar"]:hover {
-        opacity: 1 !important;
-        background: rgba(17, 25, 40, 0.86) !important;
-        border-color: rgba(255, 255, 255, 0.26) !important;
-    }
-    [data-testid="collapsedControl"] button:active,
-    [data-testid="stSidebarCollapsedControl"] button:active,
-    button[aria-label="Open sidebar"]:active,
-    button[aria-label="Close sidebar"]:active {
-        transform: scale(0.98) !important;
+    [data-testid="stSidebarCollapsedControl"],
+    button[aria-label="Open sidebar"] {
+        visibility: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
     }
 
     /* Remove Streamlit's default huge bottom spacing in main area */
@@ -514,6 +481,60 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# Some browsers persist a collapsed sidebar state. Since we remove the visible
+# toggle UI, auto-open the sidebar once on load if needed.
+components.html(
+    """
+<script>
+(function () {
+  try {
+    const doc = window.parent && window.parent.document ? window.parent.document : document;
+    function getSidebar() {
+      try { return doc.querySelector('[data-testid="stSidebar"]'); } catch (_) { return null; }
+    }
+    function isCollapsed() {
+      const sb = getSidebar();
+      if (!sb) return false;
+      const v = sb.getAttribute("aria-expanded");
+      return v === "false";
+    }
+    function findExpandControl() {
+      const selectors = [
+        '[data-testid="collapsedControl"] button',
+        '[data-testid="collapsedControl"]',
+        '[data-testid="stSidebarCollapsedControl"] button',
+        '[data-testid="stSidebarCollapsedControl"]',
+        'button[data-testid="stBaseButton-headerNoPadding"]',
+        'button[kind="headerNoPadding"]',
+        'button[aria-label="Open sidebar"]',
+      ];
+      for (const sel of selectors) {
+        try {
+          const el = doc.querySelector(sel);
+          if (el) return el;
+        } catch (_) {}
+      }
+      return null;
+    }
+    let tries = 0;
+    const maxTries = 40; // ~10s @ 250ms
+    const timer = setInterval(() => {
+      tries += 1;
+      if (tries > maxTries) { try { clearInterval(timer); } catch (_) {} return; }
+      if (!isCollapsed()) { try { clearInterval(timer); } catch (_) {} return; }
+      const btn = findExpandControl();
+      if (btn && btn.click) {
+        try { btn.click(); } catch (_) {}
+      }
+    }, 250);
+  } catch (_) {}
+})();
+</script>
+""",
+    height=0,
+    scrolling=False,
+)
 
 # --- Initialize Library ---
 if "library" not in st.session_state:
@@ -1443,48 +1464,12 @@ def _panzoom_image_viewer(
 def sidebar_library():
     st.sidebar.title("Library")
 
-    with st.sidebar.expander("Manage", expanded=False):
-        if st.button(
-            "Import existing artifacts",
-            key="import_existing_artifacts_btn",
-            help="Scan artifacts/**/meta.json and add them to the Library (may be a lot).",
-            use_container_width=True,
-        ):
-            lib.discover_existing()
-            st.rerun()
-
-        clear_key = "confirm_clear_library"
-        if clear_key not in st.session_state:
-            st.session_state[clear_key] = False
-
-        if not st.session_state[clear_key]:
-            if st.button(
-                "Clear library…",
-                key="clear_library_btn",
-                help="Remove ALL items from the Library (deletes artifacts/library/*).",
-                use_container_width=True,
-                type="secondary",
-            ):
-                st.session_state[clear_key] = True
-                st.rerun()
-        else:
-            if st.button(
-                "Confirm clear",
-                key="clear_library_confirm_btn",
-                use_container_width=True,
-                type="primary",
-            ):
-                _clear_library_and_reset_ui()
-                st.session_state[clear_key] = False
-                st.rerun()
-            if st.button(
-                "Cancel",
-                key="clear_library_cancel_btn",
-                use_container_width=True,
-                type="secondary",
-            ):
-                st.session_state[clear_key] = False
-                st.rerun()
+    # Manage actions removed (Import existing artifacts / Clear library).
+    # If a prior run left the confirm flag around, clear it so it doesn't linger.
+    try:
+        st.session_state.pop("confirm_clear_library", None)
+    except Exception:
+        pass
 
     # Search and Add Area
     if not st.session_state.search_visible:
