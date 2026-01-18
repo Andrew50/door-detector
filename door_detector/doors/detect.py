@@ -86,6 +86,34 @@ def _stable_swing_candidate_id(
     return "d_" + hashlib.sha1(stable).hexdigest()[:12]
 
 
+def _stable_swing_arc_candidate_id(
+    *,
+    center: Tuple[float, float],
+    radius: float,
+    angle_span: float,
+    arc_start: Tuple[float, float],
+    arc_end: Tuple[float, float],
+    bbox_xyxy: List[float],
+    quant_step_px: float = 1.0,
+) -> str:
+    """Stable id for arc-only swing candidates (no leaf/hinge line)."""
+    a0 = (_q(arc_start[0], step=quant_step_px), _q(arc_start[1], step=quant_step_px))
+    a1 = (_q(arc_end[0], step=quant_step_px), _q(arc_end[1], step=quant_step_px))
+    if a1 < a0:
+        a0, a1 = a1, a0
+    payload = {
+        "id_version": "swing_arc_geom_v1",
+        "type": "swing_arc",
+        "center": (_q(center[0], step=quant_step_px), _q(center[1], step=quant_step_px)),
+        "radius": _q(radius, step=quant_step_px),
+        "angle_span": _q(angle_span, step=1.0),
+        "arc_endpoints": (a0, a1),
+        "bbox": tuple(_q(float(v), step=quant_step_px) for v in (bbox_xyxy or [0, 0, 0, 0])),
+    }
+    stable = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "d_" + hashlib.sha1(stable).hexdigest()[:12]
+
+
 def apply_reweighter(candidates: List[Dict[str, Any]], model_path: str) -> List[Dict[str, Any]]:
     """Apply a learned reweighter to update candidate confidence scores."""
     try:
@@ -117,7 +145,14 @@ def apply_reweighter(candidates: List[Dict[str, Any]], model_path: str) -> List[
             x_scaled = (x - means) / (stds + 1e-8)
 
             z = np.dot(x_scaled, weights) + bias
-            prob = 1.0 / (1.0 + math.exp(-z))
+            # Numerically-stable sigmoid (avoid overflow for large negative z).
+            zf = float(z)
+            if zf >= 0:
+                ez = math.exp(-zf)  # safe: exp(-positive) in (0, 1]
+                prob = 1.0 / (1.0 + ez)
+            else:
+                ez = math.exp(zf)  # safe: exp(negative) in (0, 1]
+                prob = ez / (1.0 + ez)
             cand["confidence"] = float(prob)
 
         return candidates
@@ -237,6 +272,186 @@ def _line_len_px(line: Dict[str, Any]) -> float:
     return float(dist_point_to_point(p0, p1))
 
 
+def _extract_polyline_arcs_from_lines(
+    *,
+    lines: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Extract arc-like polylines from short line segments.
+
+    Many PDFs approximate circular arcs (door swings) as chains of short straight
+    segments rather than cubic beziers. This helper groups short segments by
+    snapped endpoints, fits a circle, and returns ordered point chains.
+    """
+    swing_conf = (config.get("swing") or {}) if isinstance(config, dict) else {}
+    arc_conf = (swing_conf.get("arc") or {}) if isinstance(swing_conf, dict) else {}
+    poly_conf = (swing_conf.get("polyline_arc") or {}) if isinstance(swing_conf, dict) else {}
+    if poly_conf.get("enabled") is False:
+        return []
+
+    # Defaults chosen to be conservative and roughly match bezier arc thresholds.
+    endpoint_snap_px = float(poly_conf.get("endpoint_snap_px", 3.0) or 3.0)
+    min_segments = int(poly_conf.get("min_segments", 4) or 4)
+    max_segments = int(poly_conf.get("max_segments", 36) or 36)
+    max_seg_len = float(poly_conf.get("max_segment_length_px", 85.0) or 85.0)
+    # Fit tolerance: reuse arc's circle fit constraint if present, else a mild default.
+    max_circle_fit_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
+
+    # Use the same arc thresholds as bezier arcs (in pixel space).
+    min_radius_px = float(arc_conf.get("min_radius_px", 0.0) or 0.0)
+    max_radius_px = float(arc_conf.get("max_radius_px", 1e9) or 1e9)
+    min_angle_deg = float(arc_conf.get("min_angle_deg", 0.0) or 0.0)
+    max_angle_deg = float(arc_conf.get("max_angle_deg", 1e9) or 1e9)
+
+    if not (endpoint_snap_px > 0):
+        endpoint_snap_px = 3.0
+    if max_seg_len <= 0:
+        max_seg_len = 85.0
+
+    def _bin_pt(p: Tuple[float, float]) -> Tuple[int, int]:
+        return (_q(p[0], step=endpoint_snap_px), _q(p[1], step=endpoint_snap_px))
+
+    # Only consider short, solid segments as arc pieces.
+    usable: List[int] = []
+    ends: Dict[int, Tuple[Tuple[float, float], Tuple[float, float], Tuple[int, int], Tuple[int, int]]] = {}
+    end_to_lines: Dict[Tuple[int, int], List[int]] = {}
+    for i, ln in enumerate(lines):
+        if _is_dashed_primitive(ln):
+            continue
+        try:
+            p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
+            p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
+        except Exception:
+            continue
+        seg_len = float(dist_point_to_point(p0, p1))
+        if not (0.5 <= seg_len <= max_seg_len):
+            continue
+        b0 = _bin_pt(p0)
+        b1 = _bin_pt(p1)
+        ends[i] = (p0, p1, b0, b1)
+        end_to_lines.setdefault(b0, []).append(i)
+        end_to_lines.setdefault(b1, []).append(i)
+        usable.append(i)
+
+    if not usable:
+        return []
+
+    # Build adjacency via shared binned endpoints.
+    adj: Dict[int, set[int]] = {i: set() for i in usable}
+    for node, inc in end_to_lines.items():
+        if len(inc) <= 1:
+            continue
+        # Link all incident short segments together.
+        for a in inc:
+            for b in inc:
+                if a != b:
+                    adj[a].add(b)
+
+    # Connected components (over usable short segments only).
+    seen: set[int] = set()
+    comps: List[List[int]] = []
+    for i in usable:
+        if i in seen:
+            continue
+        stack = [i]
+        seen.add(i)
+        comp: List[int] = []
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nb in adj.get(cur, set()):
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        comps.append(comp)
+
+    out: List[Dict[str, Any]] = []
+    for comp in comps:
+        if not (min_segments <= len(comp) <= max_segments):
+            continue
+
+        # Node degrees within this component.
+        node_deg: Dict[Tuple[int, int], int] = {}
+        for li in comp:
+            _, _, b0, b1 = ends[li]
+            node_deg[b0] = node_deg.get(b0, 0) + 1
+            node_deg[b1] = node_deg.get(b1, 0) + 1
+
+        end_nodes = [n for n, d in node_deg.items() if d == 1]
+        if len(end_nodes) != 2:
+            continue  # ignore loops/branches
+
+        # Walk the chain in order from one endpoint.
+        start_node = end_nodes[0]
+        ordered: List[int] = []
+        used_lines: set[int] = set()
+        current_node = start_node
+        prev_line: Optional[int] = None
+
+        for _ in range(len(comp)):
+            candidates = [li for li in end_to_lines.get(current_node, []) if li in comp and li not in used_lines]
+            if not candidates:
+                break
+            nxt = candidates[0]
+            if prev_line is not None and len(candidates) > 1:
+                # Prefer not to immediately backtrack.
+                for cand in candidates:
+                    if cand != prev_line:
+                        nxt = cand
+                        break
+            ordered.append(nxt)
+            used_lines.add(nxt)
+            p0, p1, b0, b1 = ends[nxt]
+            current_node = b1 if current_node == b0 else b0
+            prev_line = nxt
+
+        if len(ordered) != len(comp):
+            continue
+
+        # Build ordered point chain (dedupe consecutive identical points).
+        pts: List[Tuple[float, float]] = []
+        current_node = start_node
+        for li in ordered:
+            p0, p1, b0, b1 = ends[li]
+            if current_node == b0:
+                a, b = p0, p1
+                current_node = b1
+            else:
+                a, b = p1, p0
+                current_node = b0
+            if not pts:
+                pts.append(a)
+            if pts[-1] != b:
+                pts.append(b)
+
+        if len(pts) < 3:
+            continue
+
+        center, radius, rmse = fit_circle(pts)
+        if not (min_radius_px <= radius <= max_radius_px):
+            continue
+        if rmse > max_circle_fit_rmse:
+            continue
+
+        angle_span = get_arc_angle_span(pts, center)
+        if not (min_angle_deg <= angle_span <= max_angle_deg):
+            continue
+
+        out.append(
+            {
+                "source": "polyline",
+                "pts": pts,
+                "center": center,
+                "radius": float(radius),
+                "rmse": float(rmse),
+                "angle_span": float(angle_span),
+                "arc_lines": ordered,
+            }
+        )
+
+    return out
+
+
 def detect_swing_candidates(
     *,
     lines: List[Dict[str, Any]],
@@ -260,17 +475,56 @@ def detect_swing_candidates(
     pool_max_radial_angle_deg = 50.0
     pool_max_tip_to_arc_ratio = 0.70
 
-    for b_idx, bez in enumerate(beziers):
-        pts = sample_bezier(bez["p0"], bez["p1"], bez["p2"], bez["p3"], num_points=swing_conf["bezier_sampling_points"])
-        center, radius, rmse = fit_circle(pts)
+    arc_conf = swing_conf["arc"]
+    arc_items: List[Dict[str, Any]] = []
 
-        arc_conf = swing_conf["arc"]
+    # Bezier arcs (native PDF curves).
+    for b_idx, bez in enumerate(beziers):
+        try:
+            pts = sample_bezier(
+                bez["p0"],
+                bez["p1"],
+                bez["p2"],
+                bez["p3"],
+                num_points=swing_conf["bezier_sampling_points"],
+            )
+            center, radius, rmse = fit_circle(pts)
+            angle_span = get_arc_angle_span(pts, center)
+        except Exception:
+            continue
+        arc_items.append(
+            {
+                "source": "bezier",
+                "b_idx": int(b_idx),
+                "arc_lines": [],
+                "pts": pts,
+                "center": center,
+                "radius": float(radius),
+                "rmse": float(rmse),
+                "angle_span": float(angle_span),
+            }
+        )
+
+    # Polyline arcs (short line-segment chains approximating arcs).
+    for a in _extract_polyline_arcs_from_lines(lines=lines, config=config):
+        arc_items.append(a)
+
+    for arc in arc_items:
+        pts = arc.get("pts") or []
+        if not pts:
+            continue
+        center = arc.get("center") or (0.0, 0.0)
+        try:
+            radius = float(arc.get("radius", 0.0) or 0.0)
+            rmse = float(arc.get("rmse", 1e9) or 1e9)
+            angle_span = float(arc.get("angle_span", 0.0) or 0.0)
+        except Exception:
+            continue
+
         if not (arc_conf["min_radius_px"] <= radius <= arc_conf["max_radius_px"]):
             continue
         if rmse > arc_conf["max_circle_fit_rmse"]:
             continue
-
-        angle_span = get_arc_angle_span(pts, center)
         if not (arc_conf["min_angle_deg"] <= angle_span <= arc_conf["max_angle_deg"]):
             continue
 
@@ -298,7 +552,16 @@ def detect_swing_candidates(
         ]
 
         nearby_line_indices = line_index.query(query_bbox)
+        arc_line_set: set[int] = set()
+        try:
+            arc_line_set = set(int(i) for i in (arc.get("arc_lines") or []))
+        except Exception:
+            arc_line_set = set()
+
+        had_any_pool_candidate_for_arc = False
         for l_idx in nearby_line_indices:
+            if arc_line_set and int(l_idx) in arc_line_set:
+                continue
             line = lines[l_idx]
             p0 = (line["p0"]["x"], line["p0"]["y"])
             p1 = (line["p1"]["x"], line["p1"]["y"])
@@ -414,8 +677,13 @@ def detect_swing_candidates(
 
             # Canonicalize hinge/tip for stable IDs and consistent features.
             # Also compute a legacy index-derived id for one-time migration of old labels.
-            legacy_key = f"swing|b={b_idx}|l={l_idx}"
-            legacy_id = "d_" + hashlib.sha1(legacy_key.encode()).hexdigest()[:10]
+            legacy_ids: List[str] = []
+            try:
+                if str(arc.get("source") or "") == "bezier" and arc.get("b_idx") is not None:
+                    legacy_key = f"swing|b={int(arc.get('b_idx'))}|l={l_idx}"
+                    legacy_ids = ["d_" + hashlib.sha1(legacy_key.encode()).hexdigest()[:10]]
+            except Exception:
+                legacy_ids = []
             hinge_pt = p0 if d0_center <= d1_center else p1
             tip_pt = p1 if hinge_pt == p0 else p0
             bbox_xyxy = get_bbox(pts + [p0, p1])
@@ -433,7 +701,7 @@ def detect_swing_candidates(
 
             base: Dict[str, Any] = {
                 "id": door_id,
-                "legacy_ids": [legacy_id],
+                "legacy_ids": legacy_ids,
                 "type": "swing",
                 "bbox_xyxy": bbox_xyxy,
                 "geom": {
@@ -451,8 +719,13 @@ def detect_swing_candidates(
                     "center_dist": float(min(d0_center, d1_center)),
                     "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else 0.0,
                     "tip_to_arc_dist": float(tip_to_arc_dist) if tip_to_arc_dist is not None else 0.0,
+                    "arc_source": 1.0 if str(arc.get("source") or "") == "polyline" else 0.0,
                 },
-                "primitives": {"beziers": [b_idx], "lines": [l_idx]},
+                "primitives": {
+                    "beziers": [int(arc.get("b_idx"))] if str(arc.get("source") or "") == "bezier" and arc.get("b_idx") is not None else [],
+                    "lines": [l_idx],
+                    "arc_lines": sorted(list(arc_line_set)) if arc_line_set else [],
+                },
                 "_circle_key": circle_key,
             }
 
@@ -461,6 +734,7 @@ def detect_swing_candidates(
             cand_pool["confidence"] = float(conf_pool)
             cand_pool["pool"] = True
             candidate_pool.append(cand_pool)
+            had_any_pool_candidate_for_arc = True
 
             strict_ok = in_strict_len_ratio and strict_hinge_ok and strict_center_ok and strict_radial_ok and strict_tip_ok
             if strict_ok:
@@ -469,6 +743,69 @@ def detect_swing_candidates(
                 cand_strict["confidence"] = float(conf_strict)
                 cand_strict["pool"] = False
                 strict_candidates.append(cand_strict)
+
+        # If we couldn't find any reasonable "leaf" line for this arc, still emit an
+        # arc-only candidate into the pool to enable snapping/interactive review.
+        # This candidate type is excluded from final door selection logic.
+        if not had_any_pool_candidate_for_arc:
+            try:
+                arc_start = pts[0]
+                arc_end = pts[-1]
+                arc_bbox = get_bbox(pts)
+                pad = max(4.0, float(radius) * 0.15)
+                bbox_xyxy = [arc_bbox[0] - pad, arc_bbox[1] - pad, arc_bbox[2] + pad, arc_bbox[3] + pad]
+
+                # Use a conservative heuristic confidence from arc quality only.
+                fit_score = max(0.0, 1.0 - (float(rmse) / float(arc_conf["max_circle_fit_rmse"])))
+                min_a = float(arc_conf.get("min_angle_deg", 55.0))
+                denom = max(1.0, 90.0 - min_a)
+                angle_score = (float(angle_span) - min_a) / denom
+                angle_score = max(0.0, min(1.0, float(angle_score)))
+                conf_arc = 0.65 * float(fit_score) + 0.35 * float(angle_score)
+                conf_arc = max(0.0, min(1.0, float(conf_arc)))
+
+                cid = _stable_swing_arc_candidate_id(
+                    center=center,
+                    radius=float(radius),
+                    angle_span=float(angle_span),
+                    arc_start=tuple(arc_start),
+                    arc_end=tuple(arc_end),
+                    bbox_xyxy=bbox_xyxy,
+                    quant_step_px=1.0,
+                )
+                candidate_pool.append(
+                    {
+                        "id": cid,
+                        "legacy_ids": [],
+                        "type": "swing_arc",
+                        "bbox_xyxy": bbox_xyxy,
+                        "geom": {
+                            "center_xy": [float(center[0]), float(center[1])],
+                            "arc_endpoints_xy": [
+                                [float(arc_start[0]), float(arc_start[1])],
+                                [float(arc_end[0]), float(arc_end[1])],
+                            ],
+                        },
+                        "heuristic_confidence": float(conf_arc),
+                        "confidence": float(conf_arc),
+                        "pool": True,
+                        "features": {
+                            "rmse": float(rmse),
+                            "radius": float(radius),
+                            "angle_span": float(angle_span),
+                            "arc_only": 1.0,
+                            "arc_source": 1.0 if str(arc.get("source") or "") == "polyline" else 0.0,
+                        },
+                        "primitives": {
+                            "beziers": [int(arc.get("b_idx"))] if str(arc.get("source") or "") == "bezier" and arc.get("b_idx") is not None else [],
+                            "lines": [],
+                            "arc_lines": sorted(list(arc_line_set)) if arc_line_set else [],
+                        },
+                        "_circle_key": circle_key,
+                    }
+                )
+            except Exception:
+                pass
 
     # Apply swing-only circle-cluster suppression (if enabled) on both pools.
     arc_conf = swing_conf.get("arc", {}) if isinstance(swing_conf, dict) else {}
@@ -948,6 +1285,22 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
         strict_candidates_all = apply_reweighters_by_type(strict_candidates_all, model_paths_by_type=model_paths_by_type)
         candidate_pool_all = apply_reweighters_by_type(candidate_pool_all, model_paths_by_type=model_paths_by_type)
 
+    # Deduplicate candidate pool by stable id (keep highest-confidence record).
+    # This matters for snapping (UI pool transport) and prevents duplicates from
+    # crowding out spatial diversity.
+    if candidate_pool_all:
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for c in candidate_pool_all:
+            cid = c.get("id")
+            if cid is None:
+                continue
+            sid = str(cid)
+            prev = by_id.get(sid)
+            if prev is None or float(c.get("confidence", 0.0) or 0.0) > float(prev.get("confidence", 0.0) or 0.0):
+                by_id[sid] = c
+        if by_id:
+            candidate_pool_all = list(by_id.values())
+
     # Always export candidates (for snapping/training), sorted by current confidence.
     candidate_pool_all.sort(key=lambda x: float(x.get("confidence", 0.0) or 0.0), reverse=True)
     exported_candidates = candidate_pool_all[: max(0, max_candidates_out)]
@@ -956,6 +1309,14 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     # - If a model exists, select from the broad pool (post-reweight decisioning).
     # - Otherwise, keep the conservative strict selection behavior.
     selection_src = candidate_pool_all if has_any_model else strict_candidates_all
+    if not selection_src:
+        return {"doors": [], "candidates": exported_candidates}
+
+    # Only select final doors from canonical door types; other candidate-only types
+    # (e.g. swing_arc) should remain available for snapping/review but not appear
+    # as auto-detected doors.
+    allowed_final_types = {"swing", "double", "pocket", "bifold"}
+    selection_src = [c for c in selection_src if str(c.get("type") or "").strip().lower() in allowed_final_types]
     if not selection_src:
         return {"doors": [], "candidates": exported_candidates}
 
@@ -1064,6 +1425,41 @@ def debug_explain_unmatched_box(
     arc_fail_counts: Dict[str, int] = {"radius": 0, "rmse": 0, "angle": 0}
     arc_pass: List[Dict[str, Any]] = []
     arc_examples: List[Dict[str, Any]] = []
+    arc_suppression: Dict[str, Any] = {
+        "enabled": bool(arc_conf.get("suppress_circle_clusters", False)),
+        "near_suppressed_count": 0,
+        "near_examples": [],
+    }
+
+    # If circle-cluster suppression is enabled, compute cluster membership for arcs
+    # near the ROI so we can explain why an obvious arc may yield no candidates.
+    circle_counts: Dict[Tuple[int, int, int], int] = {}
+    circle_sum_angle: Dict[Tuple[int, int, int], float] = {}
+    circle_key_for_arc: Dict[int, Tuple[int, int, int]] = {}
+    if bool(arc_conf.get("suppress_circle_clusters", False)):
+        cbin = float(arc_conf.get("circle_cluster_center_bin_px", 4.0) or 4.0)
+        rbin = float(arc_conf.get("circle_cluster_radius_bin_px", 4.0) or 4.0)
+        cbin = cbin if cbin > 0 else 4.0
+        rbin = rbin if rbin > 0 else 4.0
+        for i in near_beziers:
+            bz = beziers[i]
+            try:
+                pts = sample_bezier(bz["p0"], bz["p1"], bz["p2"], bz["p3"], num_points=sampling_points)
+                center, radius, rmse = fit_circle(pts)
+                angle_span = get_arc_angle_span(pts, center)
+            except Exception:
+                continue
+            # Only count arcs that pass the arc filters (same as detection).
+            if not (min_r <= radius <= max_r):
+                continue
+            if rmse > max_rmse:
+                continue
+            if not (min_a <= angle_span <= max_a):
+                continue
+            key = (int(round(center[0] / cbin)), int(round(center[1] / cbin)), int(round(float(radius) / rbin)))
+            circle_key_for_arc[int(i)] = key
+            circle_counts[key] = circle_counts.get(key, 0) + 1
+            circle_sum_angle[key] = circle_sum_angle.get(key, 0.0) + float(angle_span)
 
     # For arcs that pass, attempt leaf pairing checks (pool + strict).
     pair_stats = {
@@ -1158,6 +1554,32 @@ def debug_explain_unmatched_box(
         if fails:
             continue
         arc_pass.append(ex)
+
+        # Explain if this arc is likely suppressed by the circle-cluster filter.
+        if bool(arc_conf.get("suppress_circle_clusters", False)) and b_idx in circle_key_for_arc:
+            try:
+                key = circle_key_for_arc[int(b_idx)]
+                min_arcs = int(arc_conf.get("circle_cluster_min_arcs", 3) or 3)
+                min_total_angle = float(arc_conf.get("circle_cluster_min_total_angle_deg", 250.0) or 250.0)
+                cnt = int(circle_counts.get(key, 0))
+                tot = float(circle_sum_angle.get(key, 0.0))
+                suppressed = bool(cnt >= min_arcs and tot >= min_total_angle)
+                if suppressed:
+                    arc_suppression["near_suppressed_count"] = int(arc_suppression.get("near_suppressed_count", 0) or 0) + 1
+                if len(arc_suppression["near_examples"]) < max_examples:
+                    arc_suppression["near_examples"].append(
+                        {
+                            "b_idx": int(b_idx),
+                            "circle_key": list(key),
+                            "cluster_count": cnt,
+                            "cluster_total_angle_deg": tot,
+                            "min_arcs": min_arcs,
+                            "min_total_angle_deg": min_total_angle,
+                            "suppressed": suppressed,
+                        }
+                    )
+            except Exception:
+                pass
 
         # Leaf pairing checks.
         arc_bbox = get_bbox(pts)
@@ -1325,6 +1747,7 @@ def debug_explain_unmatched_box(
             "arc_near_examples": arc_examples,
             "arc_pass_near_count": int(len(arc_pass)),
             "arc_fail_counts_near": arc_fail_counts,
+            "arc_circle_cluster_suppression": arc_suppression,
             "leaf_pair_stats_near": pair_stats,
         },
         "pocket": {

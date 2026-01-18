@@ -332,6 +332,19 @@ def _process_draw_event_if_any(
         except Exception:
             pass
     else:
+        # Persist the unmatched box (in the edit draft only) so it survives reruns.
+        # The viewer will render only the *current edit session* unmatched boxes.
+        try:
+            draft.setdefault("unmatched_manual_boxes", [])
+            draft["unmatched_manual_boxes"].append(
+                {
+                    "bbox_xyxy": drawn_full,
+                    "note": "unmatched (no overlapping candidate)",
+                    "event_id": str(event_id),
+                }
+            )
+        except Exception:
+            pass
         fstate["_last_unmatched_debug"] = _debug_unmatched_region(
             file_dir=file_dir,
             drawn_bbox_full_xyxy=drawn_full,
@@ -447,6 +460,20 @@ def main() -> None:
                 file_id = selected_item["id"]
                 file_dir = Path(selected_item["path"])
 
+                # Render title + a stable two-column layout. Use placeholders so the
+                # viewer is *replaced* by the loader (instead of leaving the old viewer
+                # output below it on reruns).
+                title = html.escape(str(selected_item.get("original_name", "")))
+                st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
+
+                col_main, col_review = st.columns([2, 1])
+                with col_main:
+                    # Always keep the sidebar auto-open logic mounted.
+                    components.html(assets.sidebar_autopen_component_html(), height=0, scrolling=False)
+                    viewer_slot = st.empty()
+                with col_review:
+                    review_slot = st.empty()
+
                 # If a pipeline run is queued for this file, replace the viewer with a loader,
                 # then run the pipeline synchronously (so the title stays constant).
                 task = st.session_state.get("door_detector_pipeline_task")
@@ -457,18 +484,29 @@ def main() -> None:
                     except Exception:
                         pass
                     try:
-                        title = html.escape(str(selected_item.get("original_name", "")))
-                        st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
-
-                        col_main, col_review = st.columns([2, 1])
-                        with col_main:
-                            components.html(assets.sidebar_autopen_component_html(), height=0, scrolling=False)
-                            st.markdown(
-                                "<div class='door_detector-viewer-loading' style='height: 650px;'><div class='door_detector-viewer-loading-inner'><div class='door_detector-spinner'></div><div class='door_detector-viewer-loading-title'>Analyzing…</div><div class='door_detector-viewer-loading-sub'>Updating detections and refreshing results. This can take a moment.</div></div></div>",
-                                unsafe_allow_html=True,
-                            )
-                        with col_review:
-                            st.info("Analysis is running…")
+                        # IMPORTANT: explicitly clear prior viewer output so it doesn't
+                        # remain stacked underneath the loader (Streamlit can otherwise
+                        # leave a previous iframe render in place).
+                        try:
+                            viewer_slot.empty()
+                            review_slot.empty()
+                        except Exception:
+                            pass
+                        # Hide any stale Streamlit component iframes while analyzing.
+                        # Some Streamlit builds can leave a previous components.html iframe
+                        # attached below the loader; this CSS prevents that UI artifact.
+                        viewer_slot.markdown(
+                            "<div id='door_detector-analyzing-flag' style='display:none;'></div>"
+                            "<style>"
+                            "body:has(#door_detector-analyzing-flag) section.main iframe,"
+                            "body:has(#door_detector-analyzing-flag) section.stMain iframe{"
+                            "display:none !important;"
+                            "}"
+                            "</style>"
+                            "<div class='door_detector-viewer-loading' style='height: 650px;'><div class='door_detector-viewer-loading-inner'><div class='door_detector-spinner'></div><div class='door_detector-viewer-loading-title'>Analyzing…</div><div class='door_detector-viewer-loading-sub'>Updating detections and refreshing results. This can take a moment.</div></div></div>",
+                            unsafe_allow_html=True,
+                        )
+                        review_slot.info("Analysis is running…")
 
                         run_pipeline(
                             str(file_id),
@@ -510,11 +548,6 @@ def main() -> None:
                     full_dims=full_dims,
                     config_path=str(doors_data.get("config_path") or "configs/door_rules.json"),
                 )
-
-                title = html.escape(str(selected_item.get("original_name", "")))
-                st.markdown(f"<div class='door_detector-pdf-title'><h3>{title}</h3></div>", unsafe_allow_html=True)
-
-                col_main, col_review = st.columns([2, 1])
 
                 # Compute active doors once so the main viewer + right panel stay in perfect sync.
                 detections = doors_data.get("doors", [])
@@ -586,7 +619,18 @@ def main() -> None:
                 all_visible.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
                 _sync_selected_door_for_run(file_id=str(file_id), fstate=fstate, all_visible=all_visible)
 
-                with col_main:
+                with viewer_slot.container():
+                    # Scan-mode UX: be explicit that vector-first detection cannot run.
+                    try:
+                        page_mode = str(meta_data.get("mode") or "").strip().lower()
+                    except Exception:
+                        page_mode = ""
+                    if page_mode == "scan":
+                        st.warning(
+                            "This PDF page is classified as **scan** (not a vector drawing), so the current "
+                            "vector-first door detector can’t process it. Try a vector/hybrid floor plan PDF.",
+                            icon="⚠️",
+                        )
                     main_viewer_canvas(
                         selected_item,
                         preview_spec=preview_spec,
@@ -597,7 +641,7 @@ def main() -> None:
                         click_sink_label=click_sink_label,
                     )
 
-                with col_review:
+                with review_slot.container():
                     main_viewer_controls(
                         selected_item,
                         full_dims=full_dims,

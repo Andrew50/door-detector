@@ -101,9 +101,6 @@ def _manual_overlay_payload_for_sink(
     """
     state = _get_working_label_state(fstate)
     out_manual: List[Dict[str, Any]] = []
-    # NOTE: We intentionally do not render persisted unmatched manual boxes in the
-    # viewer overlay. Unmatched draw attempts are shown immediately client-side,
-    # but are not kept around as server-supplied overlays.
     out_unmatched: List[Dict[str, Any]] = []
 
     if not (preview_scale > 0):
@@ -113,6 +110,7 @@ def _manual_overlay_payload_for_sink(
     # We do this by subtracting baseline manual additions (captured when entering edit mode)
     # from the current draft.
     baseline_counts: Counter = Counter()
+    baseline_unmatched_counts: Counter = Counter()
     baseline = fstate.get("_edit_baseline") if bool(fstate.get("edit_mode")) else None
     if isinstance(baseline, dict):
         for b in list(baseline.get("manual_additions", []) or []):
@@ -121,6 +119,12 @@ def _manual_overlay_payload_for_sink(
             except Exception:
                 tok = repr(b)
             baseline_counts[tok] += 1
+        for b in list(baseline.get("unmatched_manual_boxes", []) or []):
+            try:
+                tok = json.dumps(b, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(b)
+            baseline_unmatched_counts[tok] += 1
 
     for rec in list(state.get("manual_additions", [])):
         if baseline_counts:
@@ -148,6 +152,29 @@ def _manual_overlay_payload_for_sink(
                 "snapped_bbox_xyxy": snapped_prev,
                 "snapped_candidate_id": rec.get("snapped_candidate_id"),
                 "iou": rec.get("iou"),
+            }
+        )
+
+    # Render unmatched boxes created during the current edit session (if any).
+    for rec in list(state.get("unmatched_manual_boxes", [])):
+        if baseline_unmatched_counts:
+            try:
+                tok = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                tok = repr(rec)
+            if baseline_unmatched_counts.get(tok, 0) > 0:
+                baseline_unmatched_counts[tok] -= 1
+                continue
+        bb_full = rec.get("bbox_xyxy")
+        if not isinstance(bb_full, list) or len(bb_full) != 4:
+            continue
+        bb_prev = _scale_bbox_xyxy([float(v) for v in bb_full], preview_scale)
+        if bb_prev is None:
+            continue
+        out_unmatched.append(
+            {
+                "bbox_xyxy": bb_prev,
+                "note": rec.get("note") or "unmatched",
             }
         )
 
@@ -1776,10 +1803,92 @@ def main_viewer_canvas(
             except Exception:
                 scale = 1.0
             pool = list(doors_data.get("candidates", []) or [])
+
+            def _sample_pool_for_sink(
+                cands: List[Dict[str, Any]],
+                *,
+                full_w: Optional[int],
+                full_h: Optional[int],
+                max_out: int,
+                grid: int = 8,
+            ) -> List[Dict[str, Any]]:
+                """Pick a spatially-diverse subset of candidates for client snapping.
+
+                Using only top-N by confidence can omit low-confidence-but-correct
+                candidates elsewhere on the page. A coarse grid keeps coverage.
+                """
+                if not cands:
+                    return []
+                if not full_w or not full_h or full_w <= 0 or full_h <= 0:
+                    return cands[:max_out]
+                g = max(2, min(16, int(grid)))
+                per_cell = max(1, int(max_out // (g * g)))
+                buckets: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+                seen: set[str] = set()
+
+                def _cell_for_bbox(bb: Tuple[float, float, float, float]) -> Tuple[int, int]:
+                    cx = 0.5 * (bb[0] + bb[2])
+                    cy = 0.5 * (bb[1] + bb[3])
+                    ix = int((cx / float(full_w)) * g)
+                    iy = int((cy / float(full_h)) * g)
+                    ix = max(0, min(g - 1, ix))
+                    iy = max(0, min(g - 1, iy))
+                    return (ix, iy)
+
+                # Pool is already sorted by confidence; keep each bucket in that order.
+                for cand in cands:
+                    cid = cand.get("id")
+                    bbox = cand.get("bbox_xyxy")
+                    if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
+                        continue
+                    sid = str(cid)
+                    if sid in seen:
+                        continue
+                    nb = _normalize_bbox_xyxy(bbox)
+                    if nb is None:
+                        continue
+                    cell = _cell_for_bbox(nb)
+                    buckets.setdefault(cell, []).append(cand)
+                    seen.add(sid)
+
+                out: List[Dict[str, Any]] = []
+                used: set[str] = set()
+                for ix in range(g):
+                    for iy in range(g):
+                        for cand in buckets.get((ix, iy), [])[:per_cell]:
+                            sid = str(cand.get("id"))
+                            if sid in used:
+                                continue
+                            out.append(cand)
+                            used.add(sid)
+                            if len(out) >= max_out:
+                                return out
+
+                # Fill remaining slots with highest-confidence unused candidates.
+                if len(out) < max_out:
+                    for cand in cands:
+                        sid = str(cand.get("id"))
+                        if not sid or sid in used:
+                            continue
+                        out.append(cand)
+                        used.add(sid)
+                        if len(out) >= max_out:
+                            break
+                return out[:max_out]
+
+            # Determine full-res dimensions for spatial bucketing.
+            full_w = None
+            full_h = None
+            if isinstance(full_dims, tuple) and len(full_dims) == 2:
+                try:
+                    full_w = int(full_dims[0]) if full_dims[0] is not None else None
+                    full_h = int(full_dims[1]) if full_dims[1] is not None else None
+                except Exception:
+                    full_w, full_h = None, None
+
+            picked = _sample_pool_for_sink(pool, full_w=full_w, full_h=full_h, max_out=1200, grid=8)
             out_pool: List[Dict[str, Any]] = []
-            # Keep this small enough for Streamlit hidden-input transport; the pool is
-            # sorted by confidence in Step 2 so high-recall candidates should still appear.
-            for cand in pool[:1200]:
+            for cand in picked:
                 cid = cand.get("id")
                 bbox = cand.get("bbox_xyxy")
                 if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
@@ -1791,6 +1900,8 @@ def main_viewer_canvas(
                 out_pool.append(
                     {
                         "id": str(cid),
+                        "type": str(cand.get("type") or ""),
+                        "confidence": float(cand.get("confidence", 0.0) or 0.0),
                         "bbox_xyxy": [float(nb[0]) * scale, float(nb[1]) * scale, float(nb[2]) * scale, float(nb[3]) * scale],
                     }
                 )
