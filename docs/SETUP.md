@@ -132,6 +132,9 @@ virtualenv venv
 python3 --version  # Must be 3.8 or higher
 ```
 
+**Streamlit / Drawable Canvas Compatibility:**
+If you see `AttributeError: module 'streamlit.elements.image' has no attribute 'image_to_url'`, it is due to a change in Streamlit's internal API that `streamlit-drawable-canvas` relies on. A compatibility shim has been added to `door_detector/review_app.py` to fix this. No action is required unless you are using the component in a new script.
+
 **Install build tools (if needed):**
 ```bash
 # On Ubuntu/Debian

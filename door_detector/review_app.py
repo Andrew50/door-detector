@@ -3,12 +3,48 @@ import json
 import os
 import shutil
 import time
+import base64
+import io
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageDraw
 from streamlit_drawable_canvas import st_canvas
+
+def _patch_streamlit_drawable_canvas_image_to_url() -> None:
+    """Compatibility shim for streamlit-drawable-canvas.
+
+    streamlit-drawable-canvas<=0.9.x calls streamlit.elements.image.image_to_url,
+    but newer Streamlit moved the implementation and changed its signature.
+    """
+    try:
+        import streamlit.elements.image as st_image
+
+        if hasattr(st_image, "image_to_url"):
+            return
+
+        from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
+        from streamlit.elements.lib.layout_utils import LayoutConfig
+
+        def _image_to_url_compat(image, width, clamp, channels, output_format, image_id):
+            return _image_to_url(
+                image=image,
+                layout_config=LayoutConfig(width=width),
+                clamp=clamp,
+                channels=channels,
+                output_format=output_format,
+                image_id=image_id,
+            )
+
+        st_image.image_to_url = _image_to_url_compat  # type: ignore[attr-defined]
+    except Exception:
+        # If Streamlit internals change again, avoid breaking the app on import.
+        return
+
+
+_patch_streamlit_drawable_canvas_image_to_url()
 
 from door_detector.library import Library
 from door_detector.step1_pipeline import process_pdf
@@ -23,17 +59,186 @@ st.set_page_config(page_title="Door Detector: Door Detection & Review", layout="
 # --- UI Styling ---
 st.markdown("""
 <style>
-    [data-testid="stSidebar"] .stButton button {
-        height: 28px;
-        padding-top: 0px;
-        padding-bottom: 0px;
+    /* Pull main content to the top (align with sidebar header) */
+    [data-testid="stAppViewContainer"] .main .block-container {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
+    }
+    [data-testid="stAppViewContainer"] .main h1, 
+    [data-testid="stAppViewContainer"] .main h3 {
+        margin-top: 0 !important;
+        padding-top: 0.5rem !important;
+    }
+
+    /* Styling for the file list rows */
+    [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+        padding: 2px 4px !important;
+        transition: background-color 0.2s;
+    }
+    [data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+        border-radius: 4px;
+    }
+
+    /* Library file list: plain text buttons, single-line, clipped (no wrap) */
+    [data-testid="stSidebar"] button[id^="sel_"] {
+        background: none !important;
+        border: none !important;
+        padding: 2px 0px !important;
+        margin: 0 !important;
+        color: rgba(255, 255, 255, 0.8) !important;
+        text-align: left !important;
+        width: 100% !important;
+        display: block !important;
+        box-shadow: none !important;
+        min-height: 0 !important;
+        line-height: 1.2 !important;
+        outline: none !important;
+        overflow: hidden !important;
+        white-space: nowrap !important;
+    }
+
+    [data-testid="stSidebar"] button[id^="sel_"]:hover {
+        background: none !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    /* Streamlit renders button labels via a markdown container; force it to never wrap */
+    [data-testid="stSidebar"] button[id^="sel_"] [data-testid="stMarkdownContainer"] {
+        overflow: hidden !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+    }
+
+    [data-testid="stSidebar"] button[id^="sel_"] div {
+        overflow: hidden !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        flex-wrap: nowrap !important;
+    }
+
+    [data-testid="stSidebar"] button[id^="sel_"] * {
+        white-space: nowrap !important;
+    }
+
+    [data-testid="stSidebar"] button[id^="sel_"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stSidebar"] button[id^="sel_"] [data-testid="stMarkdownContainer"] span {
+        overflow: hidden !important;
+        text-overflow: clip !important;
+        display: block !important;
+        width: 100% !important;
         font-size: 13px !important;
+        margin: 0 !important;
     }
-    [data-testid="stSidebar"] .stButton p {
-        font-size: 13px;
+
+    /* Selected library item: emphasize via text only (no box) */
+    [data-testid="stSidebar"] button[id^="sel_"][data-testid="stBaseButton-primary"] {
+        color: white !important;
+        font-weight: 600 !important;
     }
+
+    /* Streamlit/BaseUI buttons often look like: #bui3__anchor > button
+       Force sidebar button labels to NEVER wrap (clip instead). */
+    [data-testid="stSidebar"] div[id$="__anchor"] > button {
+        max-width: 100% !important;
+        width: 100% !important;
+        overflow: hidden !important;
+    }
+
+    [data-testid="stSidebar"] div[id$="__anchor"] > button > div,
+    [data-testid="stSidebar"] div[id$="__anchor"] > button > div > div {
+        max-width: 100% !important;
+        min-width: 0 !important;
+        overflow: hidden !important;
+    }
+
+    [data-testid="stSidebar"] div[id$="__anchor"] > button [data-testid="stMarkdownContainer"] {
+        max-width: 100% !important;
+        min-width: 0 !important;
+        overflow: hidden !important;
+    }
+
+    [data-testid="stSidebar"] div[id$="__anchor"] > button [data-testid="stMarkdownContainer"] p,
+    [data-testid="stSidebar"] div[id$="__anchor"] > button [data-testid="stMarkdownContainer"] span {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: clip !important;
+        max-width: 100% !important;
+    }
+
+    /* File Uploader styling to look like a simple "Add" button */
+    [data-testid="stFileUploader"] section {
+        padding: 0 !important;
+        border: none !important;
+        background: none !important;
+    }
+    [data-testid="stFileUploader"] section > div {
+        display: none !important;
+    }
+    [data-testid="stFileUploader"] button {
+        background-color: #ff4b4b !important;
+        color: white !important;
+        border: none !important;
+        padding: 0px 12px !important;
+        border-radius: 4px !important;
+        font-size: 14px !important;
+        height: 38px !important;
+        width: 100% !important;
+    }
+    /* Replace Streamlit's default "Browse files" label with "Upload" */
+    [data-testid="stFileUploader"] button > div > p {
+        font-size: 0 !important;
+        line-height: 1 !important;
+        margin: 0 !important;
+    }
+    [data-testid="stFileUploader"] button > div > p::before {
+        content: "Upload";
+        font-size: 14px;
+    }
+    [data-testid="stFileUploader"] small {
+        display: none !important;
+    }
+
+    /* Keep Search/Clear buttons looking like buttons */
+    [data-testid="stSidebar"] .stButton button#open_search_btn,
+    [data-testid="stSidebar"] .stButton button#close_search_btn {
+        background-color: rgba(255, 255, 255, 0.1) !important;
+        border: 1px solid rgba(255, 255, 255, 0.2) !important;
+        padding: 0px 12px !important;
+        text-align: center !important;
+        border-radius: 4px !important;
+        margin-bottom: 0px !important;
+        height: 38px !important;
+    }
+
+    /* File list rows: remove column gap and ensure background covers everything */
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] [data-testid="stVerticalBlock"] [data-testid="stHorizontalBlock"] {
+        gap: 0 !important;
+        border: none !important;
+    }
+
     [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
-        gap: 0.5rem;
+        gap: 0.1rem !important;
+    }
+    
+    [data-testid="stSidebar"] h1 {
+        padding-top: 0 !important;
+        margin-top: -20px !important;
+    }
+
+    /* Make the X button align better with the search input */
+    [data-testid="stSidebar"] div[data-testid="column"] .stButton button#close_search_btn {
+        margin-top: 0px !important;
+        height: 38px !important;
+        width: 100% !important;
+    }
+
+    /* Make the Search button match Upload sizing */
+    [data-testid="stSidebar"] div[data-testid="column"] .stButton button#open_search_btn {
+        margin-top: 0px !important;
+        height: 38px !important;
+        width: 100% !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -43,6 +248,12 @@ if "library" not in st.session_state:
     st.session_state.library = Library(Path("artifacts"))
     # One-time discovery of existing artifacts
     st.session_state.library.discover_existing()
+
+if "search_visible" not in st.session_state:
+    st.session_state.search_visible = False
+
+if "search_query" not in st.session_state:
+    st.session_state.search_query = ""
 
 lib = st.session_state.library
 
@@ -59,7 +270,6 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
             "notes": labels_data.get("notes", ""),
             "selected_door_id": None,
             "viewer_mode": "Highlight All",
-            "overlay_opacity": 0.5,
         }
 
 # --- Data Loading ---
@@ -117,107 +327,193 @@ def get_current_signature(config_path: str):
 
 # --- UI Components ---
 
-def sidebar_library():
-    col1, col2 = st.sidebar.columns([4, 1])
-    col1.title("Library")
-    if col2.button("X", key="collapse_sidebar", help="Collapse sidebar"):
-        st.info("Use the arrow at the top left to collapse/expand the sidebar.")
+def _pil_image_to_data_url(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
 
-    # Search
-    search_query = st.sidebar.text_input("Search files...", "").lower()
-    
+def _panzoom_image_viewer(img: Image.Image, *, height: int, key: str) -> None:
+    data_url = _pil_image_to_data_url(img)
+    # This viewer provides:
+    # - scrollwheel zoom (centered at cursor)
+    # - click+drag pan
+    # - initial fit-to-container with letterboxing
+    html = f"""
+<div id="pz_root_{key}" style="width: 100%; height: {height}px; overflow: hidden; background: #0e1117; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);">
+  <div id="pz_stage_{key}" style="width: 100%; height: 100%; position: relative; user-select: none; cursor: grab; touch-action: none;">
+    <img
+      id="pz_img_{key}"
+      src="{data_url}"
+      style="position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; pointer-events: none;"
+    />
+  </div>
+</div>
+
+<script>
+(function() {{
+  const root = document.getElementById("pz_root_{key}");
+  const stage = document.getElementById("pz_stage_{key}");
+  const img = document.getElementById("pz_img_{key}");
+  if (!root || !stage || !img) return;
+
+  let scale = 1;
+  let tx = 0;
+  let ty = 0;
+
+  let dragging = false;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let dragStartTx = 0;
+  let dragStartTy = 0;
+
+  function clamp(v, lo, hi) {{
+    return Math.max(lo, Math.min(hi, v));
+  }}
+
+  function applyTransform() {{
+    img.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`;
+  }}
+
+  function fitToContainer() {{
+    const cw = root.clientWidth;
+    const ch = root.clientHeight;
+    const iw = img.naturalWidth || img.width;
+    const ih = img.naturalHeight || img.height;
+    if (!cw || !ch || !iw || !ih) return;
+
+    // Prefer fitting to height to reduce top/bottom letterboxing.
+    // This can crop horizontally on narrow containers, but works well with drag+zoom.
+    const pad = 6; // subtle breathing room against the rounded border
+    scale = Math.min(1, (ch - pad * 2) / ih);
+    tx = (cw - iw * scale) / 2;
+    ty = (ch - ih * scale) / 2;
+    applyTransform();
+  }}
+
+  function zoomAt(clientX, clientY, zoomFactor) {{
+    const rect = root.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+
+    const oldScale = scale;
+    scale = clamp(scale * zoomFactor, 0.05, 20);
+
+    // Keep the point under the cursor stable:
+    // p = t + s * q  => q = (p - t)/s
+    const qx = (px - tx) / oldScale;
+    const qy = (py - ty) / oldScale;
+    tx = px - scale * qx;
+    ty = py - scale * qy;
+    applyTransform();
+  }}
+
+  // Fit once image is ready.
+  if (img.complete) fitToContainer();
+  else img.addEventListener("load", fitToContainer, {{ once: true }});
+
+  root.addEventListener("wheel", (e) => {{
+    e.preventDefault();
+    const zoomFactor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    zoomAt(e.clientX, e.clientY, zoomFactor);
+  }}, {{ passive: false }});
+
+  root.addEventListener("pointerdown", (e) => {{
+    if (e.button !== 0) return;
+    dragging = true;
+    stage.style.cursor = "grabbing";
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    dragStartTx = tx;
+    dragStartTy = ty;
+    try {{ root.setPointerCapture(e.pointerId); }} catch (_) {{}}
+  }});
+
+  root.addEventListener("pointermove", (e) => {{
+    if (!dragging) return;
+    tx = dragStartTx + (e.clientX - dragStartX);
+    ty = dragStartTy + (e.clientY - dragStartY);
+    applyTransform();
+  }});
+
+  function endDrag() {{
+    if (!dragging) return;
+    dragging = false;
+    stage.style.cursor = "grab";
+  }}
+
+  root.addEventListener("pointerup", endDrag);
+  root.addEventListener("pointercancel", endDrag);
+  root.addEventListener("pointerleave", endDrag);
+}})();
+</script>
+"""
+    components.html(html, height=height, scrolling=False)
+
+def sidebar_library():
+    st.sidebar.title("Library")
+
+    # Search and Add Area
+    if not st.session_state.search_visible:
+        col_search, col_add = st.sidebar.columns(2)
+        with col_search:
+            if st.button("Search", key="open_search_btn", help="Open search", use_container_width=True):
+                st.session_state.search_visible = True
+                st.rerun()
+        with col_add:
+            uploaded_file = st.file_uploader("Upload", type=["pdf"], label_visibility="collapsed")
+            if uploaded_file:
+                file_id = lib.add_file(uploaded_file.name, uploaded_file.getvalue())
+                st.rerun()
+    else:
+        col_input, col_close = st.sidebar.columns([5, 1])
+        with col_input:
+            search_val = st.text_input(
+                "Search", 
+                value=st.session_state.search_query,
+                label_visibility="collapsed",
+                key="search_input_widget"
+            )
+            if search_val != st.session_state.search_query:
+                st.session_state.search_query = search_val
+                st.rerun()
+        with col_close:
+            if st.button("X", key="close_search_btn", help="Clear search"):
+                st.session_state.search_query = ""
+                st.session_state.search_visible = False
+                st.rerun()
+
     st.sidebar.divider()
     
-    # Upload
-    uploaded_file = st.sidebar.file_uploader("Upload Floor Plan PDF", type=["pdf"])
-    if uploaded_file:
-        if st.sidebar.button("Add to Library"):
-            file_id = lib.add_file(uploaded_file.name, uploaded_file.getvalue())
-            st.rerun()
-
     items = lib.get_items()
-    if search_query:
-        items = [i for i in items if search_query in i["original_name"].lower()]
+    if st.session_state.search_query:
+        items = [i for i in items if st.session_state.search_query.lower() in i["original_name"].lower()]
     
     if not items:
         st.sidebar.info("No files in library.")
     else:
         for item in items:
-            col_sel, col_del = st.sidebar.columns([5, 1])
-            
+            is_selected = (st.session_state.get("selected_file_id") == item["id"])
             display_name = item["original_name"]
-            # Manual truncation to keep it on one line
-            if len(display_name) > 22:
-                display_name = display_name[:19] + "..."
+            label = display_name
             
-            status = item.get("status", "not_processed")
-            status_tag = ""
-            if status == "processing":
-                status_tag = "(P) "
-            elif status == "error":
-                status_tag = "(E) "
-            elif status == "done":
-                status_tag = "(D) "
-            
-            label = f"{status_tag}{display_name}"
-            
-            if col_sel.button(label, key=f"sel_{item['id']}", use_container_width=True, help=item["original_name"]):
+            if st.sidebar.button(
+                label,
+                key=f"sel_{item['id']}",
+                help=item["original_name"],
+                type="primary" if is_selected else "secondary",
+                use_container_width=True,
+            ):
                 st.session_state.selected_file_id = item["id"]
                 st.rerun()
-                
-            if col_del.button("X", key=f"del_{item['id']}", help="Delete file"):
-                lib.delete_item(item["id"])
-                if st.session_state.get("selected_file_id") == item["id"]:
-                    st.session_state.selected_file_id = None
-                st.rerun()
 
-def main_viewer(item: Dict):
+def main_viewer_canvas(item: Dict, image: Image.Image, doors_data: Dict, fstate: Dict):
     file_id = item["id"]
     file_dir = Path(item["path"])
     
-    image, doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
-    init_file_state(file_id, doors_data, labels_data)
-    fstate = st.session_state.files[file_id]
-    
-    st.title(item['original_name'])
-    
-    # Controls bar
-    col_run, col_mode, col_add = st.columns([1, 1, 1])
-    
-    config_path = "configs/door_rules.json" # Default
-    current_sig = get_current_signature(config_path)
-    stored_sig = doors_data.get("analysis_signature")
-    is_out_of_date = stored_sig and current_sig and stored_sig != current_sig
-    
-    with col_run:
-        status = item.get("status", "not_processed")
-        if status == "processing":
-            st.button("Processing...", disabled=True)
-        else:
-            label = "Rerun Analysis" if status == "done" else "Run Analysis"
-            if is_out_of_date:
-                label = f"{label} (Out of Date)"
-                st.warning("Analysis config changed. Rerun recommended.")
-            
-            if st.button(label, type="primary" if not status == "done" else "secondary"):
-                run_pipeline(file_id, file_dir, config_path)
-                st.rerun()
-
-    with col_mode:
-        fstate["viewer_mode"] = st.selectbox(
-            "Overlay Mode", 
-            ["Highlight All", "Highlight Selected", "Off"],
-            index=["Highlight All", "Highlight Selected", "Off"].index(fstate["viewer_mode"])
-        )
-
-    with col_add:
-        if st.button("Add Door"):
-            fstate["viewer_mode"] = "Add Door"
-
-    # Display Image / Canvas
     if image:
         detections = doors_data.get("doors", [])
-        
+
         # Filter detections: keep undecided and accepted, exclude rejected
         active_doors = [d for d in detections if d["id"] not in fstate["rejected"]]
         # Add user added boxes as pseudo-detections
@@ -233,127 +529,153 @@ def main_viewer(item: Dict):
                 "is_user_added": True
             })
 
+        viewer_height = 800
+        viewer_width_hint = 1200  # used only for Add Door canvas sizing
+
+        # NOTE: Don't wrap this in `st.container(height=...)` because Streamlit makes that
+        # container scrollable (adds a scrollbar) which steals scroll/drag interactions.
         if fstate["viewer_mode"] == "Add Door":
-            st.write("Draw a rectangle for the missed door.")
+            # Fit-to-container (approx) for first render.
+            fit_scale = min(1.0, min(viewer_width_hint / image.width, viewer_height / image.height))
+            display_width = max(400, int(image.width * fit_scale))
+            display_height = max(400, int(image.height * fit_scale))
+
+            # Resize background for performance.
+            bg_img = image.resize((display_width, display_height), Image.LANCZOS)
+
             canvas_result = st_canvas(
                 fill_color="rgba(0, 255, 255, 0.3)",
                 stroke_width=2,
                 stroke_color="#00ffff",
-                background_image=image,
+                background_image=bg_img,
                 update_streamlit=True,
-                height=int(image.height * (1000 / image.width)) if image.width > 1000 else image.height,
-                width=1000 if image.width > 1000 else image.width,
+                height=display_height,
+                width=display_width,
                 drawing_mode="rect",
                 key=f"canvas_{file_id}",
             )
+            return canvas_result, active_doors
+
+        # Normal viewing: pan+zoom image viewer (scrollwheel + click-drag).
+        # Downscale large pages for faster rendering, while keeping the right panel
+        # crop coming from the full-resolution image.
+        max_viewer_width = 2000
+        viewer_scale = min(1.0, max_viewer_width / image.width)
+        v_w = max(1, int(image.width * viewer_scale))
+        v_h = max(1, int(image.height * viewer_scale))
+        viewer_img = image.resize((v_w, v_h), Image.LANCZOS)
+
+        draw = ImageDraw.Draw(viewer_img)
+        if fstate["viewer_mode"] != "Off":
+            for d in active_doors:
+                is_selected = d["id"] == fstate["selected_door_id"]
+                if fstate["viewer_mode"] == "Highlight Selected" and not is_selected:
+                    continue
+
+                bbox = d["bbox_xyxy"]
+                bbox_s = [int(round(x * viewer_scale)) for x in bbox]
+
+                color = (0, 255, 0) if d["id"] in fstate["accepted"] else (255, 165, 0)
+                if d.get("is_user_added"):
+                    color = (0, 255, 255)
+
+                width = max(1, int(round(4 * viewer_scale)))
+                if is_selected:
+                    color = (255, 255, 255)
+                    width = max(2, int(round(8 * viewer_scale)))
+
+                draw.rectangle(bbox_s, outline=color, width=width)
+
+        _panzoom_image_viewer(viewer_img, height=viewer_height, key=str(file_id))
+        return None, active_doors
+    else:
+        st.info("Run analysis to see results.")
+        return None, []
+
+def main_viewer_controls(item: Dict, image: Image.Image, doors_data: Dict, fstate: Dict, canvas_result: Any):
+    file_id = item["id"]
+    file_dir = Path(item["path"])
+    
+    # Grid for main controls
+    c1, c2 = st.columns(2)
+    with c1:
+        status = item.get("status", "not_processed")
+        if status == "processing":
+            st.button("Processing...", disabled=True, use_container_width=True)
+        else:
+            config_path = "configs/door_rules.json"
+            current_sig = get_current_signature(config_path)
+            stored_sig = doors_data.get("analysis_signature")
+            is_out_of_date = stored_sig and current_sig and stored_sig != current_sig
             
-            if st.button("Save Added Door"):
-                if canvas_result.json_data is not None:
-                    objects = canvas_result.json_data["objects"]
-                    scale_x = image.width / (1000 if image.width > 1000 else image.width)
-                    scale_y = image.height / (int(image.height * (1000 / image.width)) if image.width > 1000 else image.height)
-                    
-                    for obj in objects:
-                        if obj["type"] == "rect":
-                            x0 = obj["left"] * scale_x
-                            y0 = obj["top"] * scale_y
-                            x1 = (obj["left"] + obj["width"]) * scale_x
-                            y1 = (obj["top"] + obj["height"]) * scale_y
-                            fstate["added_boxes"].append({"bbox_xyxy": [x0, y0, x1, y1]})
-                    
+            label = "Rerun" if status == "done" else "Run"
+            if is_out_of_date:
+                label = f"{label} (!)"
+            
+            if st.button(label, type="primary" if not status == "done" else "secondary", use_container_width=True):
+                run_pipeline(file_id, file_dir, config_path)
+                st.rerun()
+    with c2:
+        modes = ["Highlight All", "Highlight Selected", "Off", "Add Door"]
+        fstate["viewer_mode"] = st.selectbox(
+            "Mode", 
+            modes,
+            index=modes.index(fstate["viewer_mode"]) if fstate["viewer_mode"] in modes else 0,
+            label_visibility="collapsed"
+        )
+
+    c3, c4 = st.columns(2)
+    with c3:
+        if fstate["viewer_mode"] == "Add Door":
+            if st.button("Cancel", use_container_width=True):
+                fstate["viewer_mode"] = "Highlight All"
+                st.rerun()
+        else:
+            if st.button("Add Door", use_container_width=True):
+                fstate["viewer_mode"] = "Add Door"
+                st.rerun()
+    with c4:
+        if fstate["viewer_mode"] != "Add Door":
+            pass
+
+    if fstate["viewer_mode"] == "Add Door":
+        st.info("Draw rectangles on the PDF.")
+        if st.button("Save Added Doors", type="primary", use_container_width=True):
+            if canvas_result and canvas_result.json_data:
+                objects = canvas_result.json_data["objects"]
+                display_width = canvas_result.image_data.shape[1] if canvas_result.image_data is not None else 1
+                display_height = canvas_result.image_data.shape[0] if canvas_result.image_data is not None else 1
+                scale_x = image.width / display_width if display_width else 1.0
+                scale_y = image.height / display_height if display_height else 1.0
+                
+                added_count = 0
+                for obj in objects:
+                    if obj["type"] == "rect":
+                        x0 = obj["left"] * scale_x
+                        y0 = obj["top"] * scale_y
+                        x1 = (obj["left"] + obj["width"]) * scale_x
+                        y1 = (obj["top"] + obj["height"]) * scale_y
+                        fstate["added_boxes"].append({"bbox_xyxy": [x0, y0, x1, y1]})
+                        added_count += 1
+                
+                if added_count > 0:
                     save_current_labels(file_id, file_dir)
                     fstate["viewer_mode"] = "Highlight All"
                     st.rerun()
-        else:
-            # Normal viewing with click capture
-            display_img = image.copy()
-            draw = ImageDraw.Draw(display_img)
-            
-            if fstate["viewer_mode"] != "Off":
-                for d in active_doors:
-                    is_selected = d["id"] == fstate["selected_door_id"]
-                    if fstate["viewer_mode"] == "Highlight Selected" and not is_selected:
-                        continue
-                        
-                    bbox = d["bbox_xyxy"]
-                    color = (0, 255, 0) if d["id"] in fstate["accepted"] else (255, 165, 0)
-                    if d.get("is_user_added"):
-                        color = (0, 255, 255)
-                    
-                    width = 4
-                    if is_selected:
-                        color = (255, 255, 255)
-                        width = 8
-                    
-                    draw.rectangle(bbox, outline=color, width=width)
+                else:
+                    st.warning("No rectangles drawn.")
 
-            # Use canvas just to capture clicks
-            canvas_click = st_canvas(
-                background_image=display_img,
-                update_streamlit=True,
-                height=int(image.height * (1000 / image.width)) if image.width > 1000 else image.height,
-                width=1000 if image.width > 1000 else image.width,
-                drawing_mode="point",
-                display_toolbar=False,
-                key=f"viewer_{file_id}",
-            )
-            
-            if canvas_click.json_data and canvas_click.json_data["objects"]:
-                last_point = canvas_click.json_data["objects"][-1]
-                if last_point["type"] == "circle":
-                    scale_x = image.width / (1000 if image.width > 1000 else image.width)
-                    scale_y = image.height / (int(image.height * (1000 / image.width)) if image.width > 1000 else image.height)
-                    click_x = last_point["left"] * scale_x
-                    click_y = last_point["top"] * scale_y
-                    
-                    # Find clicked door
-                    clicked_id = None
-                    for d in active_doors:
-                        b = d["bbox_xyxy"]
-                        if b[0] <= click_x <= b[2] and b[1] <= click_y <= b[3]:
-                            clicked_id = d["id"]
-                            break
-                    
-                    if clicked_id:
-                        fstate["selected_door_id"] = clicked_id
-                        st.rerun()
-
-    else:
-        st.info("Run analysis to see results.")
-
-def right_panel_review(item: Dict):
+def right_panel_review(item: Dict, image: Image.Image, doors_data: Dict, fstate: Dict, active_doors: List):
     file_id = item["id"]
     file_dir = Path(item["path"])
-    image, doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
     
-    if file_id not in st.session_state.files:
-        return # Not initialized yet
-        
-    fstate = st.session_state.files[file_id]
-    detections = doors_data.get("doors", [])
-    
-    # Filter and sort
-    all_visible = []
-    for d in detections:
-        if d["id"] not in fstate["rejected"]:
-            all_visible.append(d)
-    for box in fstate["added_boxes"]:
-        bbox = box["bbox_xyxy"]
-        box_id = f"u_{int(bbox[0])}_{int(bbox[1])}"
-        all_visible.append({
-            "id": box_id,
-            "type": "added",
-            "bbox_xyxy": bbox,
-            "confidence": 1.0,
-            "is_user_added": True
-        })
-    
+    # Use pre-calculated active_doors (which already includes added_boxes)
+    all_visible = active_doors.copy()
     all_visible.sort(key=lambda x: x["confidence"], reverse=True)
     
     st.subheader(f"Doors ({len(all_visible)})")
     
     if not all_visible:
-        st.write("No doors detected.")
         return
 
     # Selection sync
@@ -368,13 +690,30 @@ def right_panel_review(item: Dict):
         selected_idx = 0
         fstate["selected_door_id"] = all_visible[0]["id"]
 
+    # Jump-to selector (replaces click-to-select in the main viewer)
+    door_ids = [d["id"] for d in all_visible]
+    id_to_label = {
+        d["id"]: f"{i+1}/{len(all_visible)}  {d['type']}  {d['confidence']:.3f}  {d['id']}"
+        for i, d in enumerate(all_visible)
+    }
+    picked = st.selectbox(
+        "Jump to door",
+        door_ids,
+        index=selected_idx,
+        format_func=lambda did: id_to_label.get(did, str(did)),
+        label_visibility="collapsed",
+        key=f"jump_{file_id}",
+    )
+    fstate["selected_door_id"] = picked
+    selected_idx = door_ids.index(picked) if picked in door_ids else selected_idx
+
     # Prev/Next
     col_p, col_idx, col_n = st.columns([1, 2, 1])
-    if col_p.button("Prev", disabled=selected_idx <= 0):
+    if col_p.button("Prev", disabled=selected_idx <= 0, use_container_width=True):
         fstate["selected_door_id"] = all_visible[selected_idx - 1]["id"]
         st.rerun()
-    col_idx.write(f"{selected_idx + 1} / {len(all_visible)}")
-    if col_n.button("Next", disabled=selected_idx >= len(all_visible) - 1):
+    col_idx.write(f"<div style='text-align: center; line-height: 38px;'>{selected_idx + 1} / {len(all_visible)}</div>", unsafe_allow_html=True)
+    if col_n.button("Next", disabled=selected_idx >= len(all_visible) - 1, use_container_width=True):
         fstate["selected_door_id"] = all_visible[selected_idx + 1]["id"]
         st.rerun()
 
@@ -384,9 +723,7 @@ def right_panel_review(item: Dict):
     selected_door = all_visible[selected_idx]
     did = selected_door["id"]
     
-    st.write(f"**ID:** `{did}`")
-    st.write(f"**Type:** {selected_door['type']}")
-    st.write(f"**Confidence:** {selected_door['confidence']:.3f}")
+    st.write(f"**ID:** `{did}` | **Type:** {selected_door['type']} | **Conf:** {selected_door['confidence']:.3f}")
     
     # Zoom
     if image:
@@ -409,8 +746,6 @@ def right_panel_review(item: Dict):
         st.rerun()
     if c2.button("Reject", use_container_width=True):
         if selected_door.get("is_user_added"):
-            # If it's user added, "Reject" means remove it entirely
-            # Find by ID
             fstate["added_boxes"] = [b for b in fstate["added_boxes"] if f"u_{int(b['bbox_xyxy'][0])}_{int(b['bbox_xyxy'][1])}" != did]
         else:
             fstate["rejected"].add(did)
@@ -424,13 +759,12 @@ def right_panel_review(item: Dict):
             st.rerun()
 
     st.divider()
-    st.write(f"**Stats:** {len(fstate['accepted'])} Accepted, {len(fstate['rejected'])} Rejected, {len(fstate['added_boxes'])} Added")
+    st.write(f"**Stats:** {len(fstate['accepted'])} Acc, {len(fstate['rejected'])} Rej, {len(fstate['added_boxes'])} Add")
     
     # Train badge
     total_overrides = len(fstate["accepted"]) + len(fstate["rejected"]) + len(fstate["added_boxes"])
     if total_overrides >= 5:
-        st.success("Ready to retrain!")
-        if st.button("Train Reweighter"):
+        if st.button("Train Model", use_container_width=True):
             with st.spinner("Training..."):
                 fit_reweighter(Path("artifacts"), Path("models/reweighter_v1.json"))
                 st.success("Model updated!")
@@ -469,12 +803,22 @@ if "selected_file_id" in st.session_state and st.session_state.selected_file_id:
     selected_item = next((i for i in items if i["id"] == st.session_state.selected_file_id), None)
     
     if selected_item:
+        file_id = selected_item["id"]
+        file_dir = Path(selected_item["path"])
+        image, doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+        init_file_state(file_id, doors_data, labels_data)
+        fstate = st.session_state.files[file_id]
+
+        st.markdown(f"### {selected_item['original_name']}")
+        
         col_main, col_review = st.columns([2, 1])
         
         with col_main:
-            main_viewer(selected_item)
+            canvas_result, active_doors = main_viewer_canvas(selected_item, image, doors_data, fstate)
             
         with col_review:
-            right_panel_review(selected_item)
+            main_viewer_controls(selected_item, image, doors_data, fstate, canvas_result)
+            st.divider()
+            right_panel_review(selected_item, image, doors_data, fstate, active_doors)
 else:
     st.info("Select a file from the library to begin.")
