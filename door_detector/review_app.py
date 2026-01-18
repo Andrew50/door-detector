@@ -2587,6 +2587,8 @@ def _panzoom_image_viewer(
     try {{
       g = document.createElementNS("http://www.w3.org/2000/svg", "g");
       g.setAttribute("id", id);
+      // Make edit overlays crisp (avoid fuzzy antialiased edges).
+      g.setAttribute("shape-rendering", "crispEdges");
       svg.appendChild(g);
       return g;
     }} catch (_) {{
@@ -2603,12 +2605,14 @@ def _panzoom_image_viewer(
 
   function drawBox(layer, bbox, stroke, strokeWidth, dashArray, opacity, titleText) {{
     if (!layer || !bbox || !Array.isArray(bbox) || bbox.length !== 4) return;
-    const x0 = Math.min(bbox[0], bbox[2]);
-    const y0 = Math.min(bbox[1], bbox[3]);
-    const x1 = Math.max(bbox[0], bbox[2]);
-    const y1 = Math.max(bbox[1], bbox[3]);
-    const w = Math.max(0, x1 - x0);
-    const h = Math.max(0, y1 - y0);
+    // Quantize to half-pixel boundaries for crisper strokes.
+    const q = (v) => Math.round(Number(v) * 2) / 2;
+    const x0 = q(Math.min(bbox[0], bbox[2]));
+    const y0 = q(Math.min(bbox[1], bbox[3]));
+    const x1 = q(Math.max(bbox[0], bbox[2]));
+    const y1 = q(Math.max(bbox[1], bbox[3]));
+    const w = q(Math.max(0, x1 - x0));
+    const h = q(Math.max(0, y1 - y0));
     if (!(w > 0) || !(h > 0)) return;
 
     let r = null;
@@ -2621,9 +2625,12 @@ def _panzoom_image_viewer(
       r.setAttribute("fill", "none");
       r.setAttribute("stroke", stroke || "#00ffff");
       r.setAttribute("stroke-width", String(strokeWidth || 2));
+      r.setAttribute("stroke-linecap", "square");
+      r.setAttribute("shape-rendering", "crispEdges");
       r.setAttribute("vector-effect", "non-scaling-stroke");
       if (dashArray) r.setAttribute("stroke-dasharray", String(dashArray));
-      if (Number.isFinite(opacity)) r.setAttribute("opacity", String(opacity));
+      // Use stroke-opacity instead of overall opacity to avoid fuzzy edges.
+      if (Number.isFinite(opacity)) r.setAttribute("stroke-opacity", String(opacity));
       r.style.pointerEvents = "none";
       if (titleText) {{
         const t = document.createElementNS("http://www.w3.org/2000/svg", "title");
@@ -2933,20 +2940,20 @@ def _panzoom_image_viewer(
       drawBox(
         manualLayer,
         drawn,
-        "rgba(0,255,255,0.85)",
+        "rgb(0,255,255)",
         2,
         "6,4",
-        0.55,
+        0.47,
         cid ? `drawn (→ ${{cid}}, iou=${{iou}})` : "drawn"
       );
       if (snapped && Array.isArray(snapped) && snapped.length === 4) {{
         drawBox(
           manualLayer,
           snapped,
-          "rgba(0,255,0,0.9)",
+          "rgb(0,255,0)",
           3,
           "4,3",
-          0.85,
+          0.77,
           cid ? `snapped (${{cid}}, iou=${{iou}})` : "snapped"
         );
       }}
@@ -2955,7 +2962,7 @@ def _panzoom_image_viewer(
     for (const u of unmatched) {{
       const bbox = u.bbox_xyxy;
       const note = u.note || "unmatched";
-      drawBox(manualLayer, bbox, "rgba(255,0,255,0.9)", 2, "6,4", 0.7, String(note));
+      drawBox(manualLayer, bbox, "rgb(255,0,255)", 2, "6,4", 0.63, String(note));
     }}
     return true;
   }}
@@ -3016,10 +3023,14 @@ def _panzoom_image_viewer(
       if (tempLayer) {{
         try {{
           drawRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-          drawRect.setAttribute("fill", "rgba(0,255,255,0.12)");
-          drawRect.setAttribute("stroke", "rgba(0,255,255,0.9)");
+          drawRect.setAttribute("fill", "rgb(0,255,255)");
+          drawRect.setAttribute("fill-opacity", "0.12");
+          drawRect.setAttribute("stroke", "rgb(0,255,255)");
+          drawRect.setAttribute("stroke-opacity", "0.90");
           drawRect.setAttribute("stroke-width", "2");
           drawRect.setAttribute("stroke-dasharray", "6,4");
+          drawRect.setAttribute("stroke-linecap", "square");
+          drawRect.setAttribute("shape-rendering", "crispEdges");
           drawRect.setAttribute("vector-effect", "non-scaling-stroke");
           drawRect.style.pointerEvents = "none";
           tempLayer.appendChild(drawRect);
@@ -3045,12 +3056,13 @@ def _panzoom_image_viewer(
   root.addEventListener("pointermove", (e) => {{
     if (drawing && drawStart) {{
       const p = clientToImage(e.clientX, e.clientY);
-      const x0 = Math.min(drawStart.x, p.x);
-      const y0 = Math.min(drawStart.y, p.y);
-      const x1 = Math.max(drawStart.x, p.x);
-      const y1 = Math.max(drawStart.y, p.y);
-      const w = Math.max(0, x1 - x0);
-      const h = Math.max(0, y1 - y0);
+      const q = (v) => Math.round(Number(v) * 2) / 2;
+      const x0 = q(Math.min(drawStart.x, p.x));
+      const y0 = q(Math.min(drawStart.y, p.y));
+      const x1 = q(Math.max(drawStart.x, p.x));
+      const y1 = q(Math.max(drawStart.y, p.y));
+      const w = q(Math.max(0, x1 - x0));
+      const h = q(Math.max(0, y1 - y0));
       if (drawRect) {{
         try {{
           drawRect.setAttribute("x", String(x0));
@@ -3081,8 +3093,10 @@ def _panzoom_image_viewer(
       // Keep the drawn rect faintly visible until the rerun overlays arrive.
       if (drawRect) {{
         try {{
-          drawRect.setAttribute("fill", "rgba(0,255,255,0.08)");
-          drawRect.setAttribute("stroke", "rgba(0,255,255,0.65)");
+          drawRect.setAttribute("fill", "rgb(0,255,255)");
+          drawRect.setAttribute("fill-opacity", "0.08");
+          drawRect.setAttribute("stroke", "rgb(0,255,255)");
+          drawRect.setAttribute("stroke-opacity", "0.65");
         }} catch (_) {{}}
       }}
       drawRect = null;
@@ -3125,10 +3139,10 @@ def _panzoom_image_viewer(
             drawBox(
               tempLayer,
               snap.bbox,
-              "rgba(0,255,0,0.9)",
+              "rgb(0,255,0)",
               3,
               "4,3",
-              0.85,
+              0.77,
               `snapped (${{snap.id}}, iou=${{snap.iou}})`
             );
             try {{ console.log("[door_detector] draw_rect drew snap overlay", {{ id: snap.id }}); }} catch (_) {{}}
@@ -3142,10 +3156,10 @@ def _panzoom_image_viewer(
               drawBox(
                 tempLayer,
                 drawn,
-                "rgba(255,0,255,0.9)",
+                "rgb(255,0,255)",
                 2,
                 "6,4",
-                0.75,
+                0.68,
                 "unmatched (no overlapping candidate)"
               );
               console.log("[door_detector] draw_rect drew unmatched overlay");
