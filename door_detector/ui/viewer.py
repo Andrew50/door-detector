@@ -1914,7 +1914,10 @@ def main_viewer_canvas(
         overlay_doors_pdf.append({"id": str(did), "bbox_pdf_xyxy": bb_pdf})
 
     # Candidate pool for snapping (PDF-space bboxes).
-    pool = list(doors_data.get("candidates", []) or [])
+    #
+    # Some artifacts only have `doors` (final detections) and omit `candidates`.
+    # In that case, fall back to `doors` so Shift+drag snap still works.
+    pool = list(doors_data.get("candidates") or doors_data.get("doors") or [])
 
     def _sample_pool_for_viewer(
         cands: List[Dict[str, Any]],
@@ -2033,6 +2036,7 @@ def main_viewer_canvas(
         candidate_pool=out_pool,
         selected_door_id=str(fstate.get("selected_door_id") or ""),
         focus_seq=int(fstate.get("_focus_seq") or 0),
+        auto_focus=bool(fstate.get("auto_focus", True)),
         edit_mode=bool(fstate.get("edit_mode")),
         viewer_display_mode=str(viewer_display),
         door_state=door_state,

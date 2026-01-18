@@ -8,6 +8,29 @@ GlobalWorkerOptions.workerSrc = workerSrc;
 
 type BBox = [number, number, number, number];
 
+function dbg(label: string, payload?: any) {
+  try {
+    const enabled = (window as any).__door_detectorPdfjsDebug;
+    if (enabled === false) return;
+    // eslint-disable-next-line no-console
+    console.log(label, payload ?? {});
+  } catch {
+    // ignore
+  }
+}
+
+// This runs only when the iframe JS bundle loads (useful to detect full remount/reload).
+try {
+  const boot = ((window as any).__door_detectorPdfjsBoot ??= {
+    bootId: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    bootTs: Date.now(),
+    href: window.location?.href ?? null,
+  });
+  dbg("[door_detector] pdfjs boot", boot);
+} catch {
+  // ignore
+}
+
 type OverlayDoor = {
   id: string;
   // In PDF coordinate space (bottom-left origin, points).
@@ -141,6 +164,7 @@ export function PdfJsViewer(props: ComponentProps) {
 
   const selectedDoorId = String(args.selectedDoorId ?? "");
   const focusSeq = Number(args.focusSeq ?? 0);
+  const autoFocus = Boolean(args.autoFocus ?? true);
   const editMode = Boolean(args.editMode ?? false);
   const viewerDisplayMode = String(args.viewerDisplayMode ?? "all");
 
@@ -176,6 +200,9 @@ export function PdfJsViewer(props: ComponentProps) {
 
   // Pan/zoom state (applied as a CSS transform on the content div).
   const stateKey = useMemo(() => `door_detector_pdfjs_state_${fileId}`, [fileId]);
+  const instanceIdRef = useRef<string>(randEventId());
+  const renderCountRef = useRef<number>(0);
+  renderCountRef.current += 1;
   const scaleRef = useRef(1);
   const txRef = useRef(0);
   const tyRef = useRef(0);
@@ -199,6 +226,82 @@ export function PdfJsViewer(props: ComponentProps) {
   const emitEvent = useCallback((evt: ViewerEvent) => {
     Streamlit.setComponentValue(evt);
   }, []);
+
+  // High-signal lifecycle + prop-change logs (helps distinguish remount vs rerender).
+  useEffect(() => {
+    dbg("[door_detector] pdfjs mount", {
+      instanceId: instanceIdRef.current,
+      fileId,
+      stateKey,
+      pdfHash,
+      pageNumber,
+      height,
+      ts: Date.now(),
+    });
+    return () => {
+      dbg("[door_detector] pdfjs unmount", {
+        instanceId: instanceIdRef.current,
+        fileId,
+        stateKey,
+        ts: Date.now(),
+      });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const lastPropsRef = useRef<any>(null);
+  useEffect(() => {
+    const cur = {
+      fileId,
+      pdfHash,
+      pageNumber,
+      height,
+      selectedDoorId,
+      focusSeq,
+      autoFocus,
+      editMode,
+      viewerDisplayMode,
+      overlayDoorsLen: overlayDoors.length,
+      candidatePoolLen: candidatePool.length,
+      confirmedLen: doorState?.confirmed_ids?.length ?? 0,
+      deletedLen: doorState?.deleted_ids?.length ?? 0,
+      manualAddsLen: manualOverlays?.manual_additions?.length ?? 0,
+      unmatchedLen: manualOverlays?.unmatched_manual_boxes?.length ?? 0,
+    };
+    const prev = lastPropsRef.current;
+    if (!prev) {
+      lastPropsRef.current = cur;
+      dbg("[door_detector] pdfjs props(init)", { ...cur, instanceId: instanceIdRef.current, renderCount: renderCountRef.current });
+      return;
+    }
+    const changes: Record<string, { from: any; to: any }> = {};
+    for (const k of Object.keys(cur)) {
+      if (!Object.is((prev as any)[k], (cur as any)[k])) changes[k] = { from: (prev as any)[k], to: (cur as any)[k] };
+    }
+    if (Object.keys(changes).length) {
+      dbg("[door_detector] pdfjs props(change)", {
+        instanceId: instanceIdRef.current,
+        renderCount: renderCountRef.current,
+        changes,
+        ts: Date.now(),
+      });
+    }
+    lastPropsRef.current = cur;
+  }, [
+    autoFocus,
+    candidatePool.length,
+    doorState,
+    editMode,
+    fileId,
+    focusSeq,
+    height,
+    manualOverlays,
+    overlayDoors.length,
+    pageNumber,
+    pdfHash,
+    selectedDoorId,
+    viewerDisplayMode,
+  ]);
 
   // Be explicit about readiness. (Some Streamlit frontends can log
   // "unregistered ComponentInstance" if messages arrive before registration.)
@@ -327,6 +430,17 @@ export function PdfJsViewer(props: ComponentProps) {
       tyRef.current = saved.ty;
       applyTransform();
     }
+    dbg("[door_detector] pdfjs applyInitialView", {
+      instanceId: instanceIdRef.current,
+      fileId,
+      stateKey,
+      hasSaved: !!saved,
+      saved,
+      base: { scale: baseScaleRef.current, tx: baseTxRef.current, ty: baseTyRef.current },
+      current: { scale: scaleRef.current, tx: txRef.current, ty: tyRef.current },
+      pageSize,
+      ts: Date.now(),
+    });
   }, [applyTransform, fitToContainer, loadState, pageSize]);
 
   // Frame height: keep stable so Streamlit doesn't thrash layout.
@@ -339,6 +453,17 @@ export function PdfJsViewer(props: ComponentProps) {
     let cancelled = false;
 
     async function run() {
+      dbg("[door_detector] pdfjs loadPDF(effect)", {
+        instanceId: instanceIdRef.current,
+        fileId,
+        pdfHash,
+        lastLoadedHash: lastLoadedHashRef.current,
+        hasPdf: !!pdfRef.current,
+        hasPage: !!pageRef.current,
+        pdfDataB64Len: pdfDataB64 ? pdfDataB64.length : 0,
+        pageNumber,
+        ts: Date.now(),
+      });
       if (!pdfHash) return;
       if (lastLoadedHashRef.current === pdfHash && pdfRef.current && pageRef.current) return;
       // Cache PDF bytes in localStorage keyed by hash to avoid re-sending large
@@ -376,6 +501,14 @@ export function PdfJsViewer(props: ComponentProps) {
       const vp = page.getViewport({ scale: 1 });
       viewportRef.current = vp;
       setPageSize({ w: vp.width, h: vp.height });
+      dbg("[door_detector] pdfjs loadPDF(done)", {
+        instanceId: instanceIdRef.current,
+        fileId,
+        pdfHash,
+        pageNumber,
+        vp: { w: vp.width, h: vp.height },
+        ts: Date.now(),
+      });
     }
 
     run().catch((err) => {
@@ -397,6 +530,15 @@ export function PdfJsViewer(props: ComponentProps) {
       const canvas = canvasARef.current;
       if (!page || !canvas || !pageSize) return;
 
+      dbg("[door_detector] pdfjs renderCanvas(baseline start)", {
+        instanceId: instanceIdRef.current,
+        fileId,
+        pdfHash,
+        pageNumber,
+        pageSize,
+        dpr: window.devicePixelRatio || 1,
+        ts: Date.now(),
+      });
       const dpr = window.devicePixelRatio || 1;
       const renderScale = 1 * dpr; // baseline; upgraded later
       const viewport = page.getViewport({ scale: renderScale });
@@ -418,6 +560,15 @@ export function PdfJsViewer(props: ComponentProps) {
       setActiveCanvas("a");
       // After first render, apply fit + saved state.
       applyInitialView();
+      dbg("[door_detector] pdfjs renderCanvas(baseline done)", {
+        instanceId: instanceIdRef.current,
+        fileId,
+        pdfHash,
+        pageNumber,
+        canvasPx: { w: canvas.width, h: canvas.height },
+        cssPx: pageSize,
+        ts: Date.now(),
+      });
     }
 
     render().catch((err) => {
@@ -454,6 +605,15 @@ export function PdfJsViewer(props: ComponentProps) {
 
     renderInFlightRef.current = true;
     try {
+      dbg("[door_detector] pdfjs renderCanvas(quality start)", {
+        instanceId: instanceIdRef.current,
+        fileId,
+        pdfHash,
+        pageNumber,
+        fromQuality: renderQualityRef.current,
+        toQuality: quality,
+        ts: Date.now(),
+      });
       const viewport = page.getViewport({ scale: quality * dpr });
       const ctx = nextCanvas.getContext("2d", { alpha: false });
       if (!ctx) return;
@@ -474,6 +634,16 @@ export function PdfJsViewer(props: ComponentProps) {
       // Swap active canvas without blending (no crossfade).
       activeCanvasRef.current = nextCanvasKey;
       setActiveCanvas(nextCanvasKey);
+      dbg("[door_detector] pdfjs renderCanvas(quality done)", {
+        instanceId: instanceIdRef.current,
+        fileId,
+        pdfHash,
+        pageNumber,
+        activeCanvas: nextCanvasKey,
+        quality: renderQualityRef.current,
+        canvasPx: { w: nextCanvas.width, h: nextCanvas.height },
+        ts: Date.now(),
+      });
     } finally {
       renderInFlightRef.current = false;
     }
@@ -680,6 +850,20 @@ export function PdfJsViewer(props: ComponentProps) {
     for (const u of unmatched) {
       drawBox(manualLayer, pdfBBoxToViewportBBox(vp, u.bbox_pdf_xyxy), "rgb(255,0,255)", 2, "6,4", 0.63);
     }
+
+    dbg("[door_detector] pdfjs renderOverlays", {
+      instanceId: instanceIdRef.current,
+      fileId,
+      overlayDoorsLen: overlayDoors.length,
+      editMode,
+      viewerDisplayMode,
+      selectedDoorId,
+      localSelectedId: localSelectedIdRef.current,
+      scale: scaleRef.current,
+      tx: txRef.current,
+      ty: tyRef.current,
+      ts: Date.now(),
+    });
   }, [candidatePool, clearSvgLayer, drawBox, editMode, ensureLayer, manualOverlays, overlayDoors, pageSize]);
 
   const snapCandidateForDrawPdf = useCallback(
@@ -860,12 +1044,13 @@ export function PdfJsViewer(props: ComponentProps) {
 
   useEffect(() => {
     focusSeqRef.current = focusSeq;
+    if (!autoFocus) return;
     if (editMode) return;
     if (!selectedDoorId) return;
     const lastApplied = loadState()?.focusSeq ?? null;
     if (lastApplied !== null && lastApplied === focusSeq) return;
     focusToDoorId(selectedDoorId);
-  }, [editMode, focusSeq, focusToDoorId, loadState, selectedDoorId]);
+  }, [autoFocus, editMode, focusSeq, focusToDoorId, loadState, selectedDoorId]);
 
   // Wheel zoom + drag pan + shift+drag drawing.
   useEffect(() => {
@@ -1089,7 +1274,7 @@ export function PdfJsViewer(props: ComponentProps) {
       e.stopPropagation();
       localSelectedIdRef.current = String(did);
       applyDoorStyles();
-      if (!editMode) focusToDoorId(String(did));
+      if (!editMode && autoFocus) focusToDoorId(String(did));
       emitEvent({ type: "door_click", event_id: randEventId(), door_id: String(did), ts: Date.now() });
     };
 
@@ -1113,7 +1298,19 @@ export function PdfJsViewer(props: ComponentProps) {
       svg?.removeEventListener("pointerdown", onSvgPointerDownCapture as any, true);
       svg?.removeEventListener("click", onSvgClick as any);
     };
-  }, [applyDoorStyles, applyTransform, drawBox, editMode, emitEvent, ensureLayer, focusToDoorId, pageSize, scheduleQualityRender, snapCandidateForDrawPdf]);
+  }, [
+    applyDoorStyles,
+    applyTransform,
+    autoFocus,
+    drawBox,
+    editMode,
+    emitEvent,
+    ensureLayer,
+    focusToDoorId,
+    pageSize,
+    scheduleQualityRender,
+    snapCandidateForDrawPdf,
+  ]);
 
   // React to prop changes like the old pollSelection loop.
   useEffect(() => {

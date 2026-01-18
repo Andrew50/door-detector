@@ -119,11 +119,8 @@ def _snap_to_candidate(
         if iou <= 0.0:
             continue
         any_overlap = True
-        if iou > best_iou:
-            best_iou = iou
-            best_by_iou = cand
-            best_iou_inter = inter
-        # Track maximum intersection area as fallback.
+
+        # Track maximum intersection area (and capture the intersection for the IoU-best pick).
         inter_x0 = max(drawn[0], cbox[0])
         inter_y0 = max(drawn[1], cbox[1])
         inter_x1 = min(drawn[2], cbox[2])
@@ -131,6 +128,11 @@ def _snap_to_candidate(
         inter_w = max(0.0, inter_x1 - inter_x0)
         inter_h = max(0.0, inter_y1 - inter_y0)
         inter = inter_w * inter_h
+
+        if iou > best_iou:
+            best_iou = iou
+            best_by_iou = cand
+            best_iou_inter = inter
         if inter > best_inter:
             best_inter = inter
             best_by_inter = cand
@@ -511,9 +513,15 @@ def main() -> None:
                     # Always keep the sidebar auto-open logic mounted.
                     # NOTE: Streamlit treats height=0 as "default" in some builds; use 1px.
                     components.html(assets.sidebar_autopen_component_html(), height=1, scrolling=False)
-                    viewer_slot = st.empty()
+                    # IMPORTANT: avoid `st.empty()` here.
+                    #
+                    # Using a placeholder tends to *replace* its children on each rerun,
+                    # which can destroy and recreate the PDF.js component iframe.
+                    # That forces a PDF reload + canvas rerender even for selection-only
+                    # state changes, and causes pan/zoom "reset flashes".
+                    viewer_slot = st.container()
                 with col_review:
-                    review_slot = st.empty()
+                    review_slot = st.container()
 
                 # If a pipeline run is queued for this file, keep rendering the *existing*
                 # viewer state while analysis runs (don't swap in a loader).
@@ -652,7 +660,20 @@ def main() -> None:
                 all_visible.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
                 _sync_selected_door_for_run(file_id=str(file_id), fstate=fstate, all_visible=all_visible)
 
-                with viewer_slot.container():
+                # --- Sync viewer-affecting widget state BEFORE rendering the viewer ---
+                # Widgets live in the right panel, but their state is available at the start
+                # of a rerun. Pull from `st.session_state` so the viewer reflects changes
+                # immediately (same rerun), rather than one rerun later.
+                auto_focus_key = f"auto_focus_{file_id}"
+                if auto_focus_key not in st.session_state:
+                    st.session_state[auto_focus_key] = bool(fstate.get("auto_focus", True))
+                fstate["auto_focus"] = bool(st.session_state.get(auto_focus_key))
+
+                viewer_display_key = f"viewer_display_mode_{file_id}"
+                if viewer_display_key in st.session_state:
+                    fstate["viewer_display_mode"] = str(st.session_state.get(viewer_display_key) or "Highlight All")
+
+                with viewer_slot:
                     # Scan-mode UX: be explicit that vector-first detection cannot run.
                     try:
                         page_mode = str(meta_data.get("mode") or "").strip().lower()
@@ -673,7 +694,7 @@ def main() -> None:
                         click_sink_label=click_sink_label,
                     )
 
-                with review_slot.container():
+                with review_slot:
                     main_viewer_controls(
                         selected_item,
                         full_dims=full_dims,

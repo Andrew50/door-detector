@@ -15,6 +15,13 @@ GLOBAL_STYLE_HTML = r"""
         --st-header-height: 0px !important;
     }
 
+    /* Streamlit's thin colored "decoration" bar at the very top. */
+    [data-testid="stDecoration"] {
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+    }
+
     header,
     [data-testid="stHeader"],
     [data-testid="stToolbar"] {

@@ -63,6 +63,7 @@ def _delete_library_item_and_reset_ui(file_id: str) -> None:
     for k in [
         f"auto_focus_{file_id}",
         f"auto_focus_sink_{file_id}",
+        f"viewer_display_mode_{file_id}",
         f"jump_{file_id}",
         f"door_click_sink_{file_id}",
         f"selected_door_sink_{file_id}",
@@ -157,6 +158,9 @@ def main_viewer_controls(
         )
     with c2:
         modes = ["Highlight All", "Highlight Selected", "Off"]
+        viewer_display_key = f"viewer_display_mode_{file_id}"
+        if viewer_display_key not in st.session_state:
+            st.session_state[viewer_display_key] = str(fstate.get("viewer_display_mode") or "Highlight All")
         fstate["viewer_display_mode"] = st.selectbox(
             "Mode",
             modes,
@@ -164,6 +168,7 @@ def main_viewer_controls(
             if fstate.get("viewer_display_mode") in modes
             else 0,
             label_visibility="collapsed",
+            key=viewer_display_key,
         )
     with c_del:
         confirm_key = f"confirm_delete_{file_id}"
