@@ -713,9 +713,11 @@ if "door_detector_pipeline_task" not in st.session_state:
     # { file_id, file_dir, config_path, label, _started }
     st.session_state.door_detector_pipeline_task = None
 
-# Debug logging toggle (server console). Used by `_debug_log(...)`.
-if "debug_perf" not in st.session_state:
-    st.session_state.debug_perf = False
+# Debug logs toggle removed from the UI; ensure it stays disabled.
+try:
+    st.session_state.pop("debug_perf", None)
+except Exception:
+    pass
 
 VIEWER_TARGET_WIDTH_PX = 1200
 VIEWER_ASPECT_RATIO_HW = 0.75  # height/width
@@ -757,7 +759,7 @@ def _queue_pipeline_run(file_id: str, file_dir_str: str, config_path: str, label
     }
 
 def _debug_log(msg: str, *args: Any) -> None:
-    """Debug logging gated by the sidebar perf checkbox."""
+    """Optional debug logging to the server console (disabled in the UI)."""
     try:
         if st.session_state.get("debug_perf"):
             logger.info(msg, *args)
@@ -924,18 +926,36 @@ def _viewer_display_mode_to_sink_value(mode: str) -> str:
     return "all"
 
 
+def _coerce_id_set(v: Any) -> set:
+    """Coerce a list/set of ids into a stable set[str]."""
+    out: set = set()
+    if v is None:
+        return out
+    try:
+        it = v if isinstance(v, (list, tuple, set)) else list(v)
+    except Exception:
+        it = []
+    for x in it:
+        if x is None:
+            continue
+        s = str(x)
+        if s:
+            out.add(s)
+    return out
+
+
 def _snapshot_label_state(src: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "confirmed_ids": set(src.get("confirmed_ids", set())),
-        "deleted_ids": set(src.get("deleted_ids", set())),
+        "confirmed_ids": _coerce_id_set(src.get("confirmed_ids", set())),
+        "deleted_ids": _coerce_id_set(src.get("deleted_ids", set())),
         "manual_additions": copy.deepcopy(list(src.get("manual_additions", []))),
         "unmatched_manual_boxes": copy.deepcopy(list(src.get("unmatched_manual_boxes", []))),
     }
 
 
 def _apply_label_state(dst: Dict[str, Any], state: Dict[str, Any]) -> None:
-    dst["confirmed_ids"] = set(state.get("confirmed_ids", set()))
-    dst["deleted_ids"] = set(state.get("deleted_ids", set()))
+    dst["confirmed_ids"] = _coerce_id_set(state.get("confirmed_ids", set()))
+    dst["deleted_ids"] = _coerce_id_set(state.get("deleted_ids", set()))
     dst["manual_additions"] = copy.deepcopy(list(state.get("manual_additions", [])))
     dst["unmatched_manual_boxes"] = copy.deepcopy(list(state.get("unmatched_manual_boxes", [])))
 
@@ -1105,12 +1125,8 @@ def _debug_unmatched_region(
     config_path: str,
 ) -> Optional[str]:
     """Explain why a clearly-boxed door produced no candidate overlap.
-
-    This runs only when Debug logs is enabled and prints to the server console.
     """
-    # Always compute a report (so we can surface it to the browser console even if
-    # the right panel isn't updating). Server-console logging remains gated by
-    # the debug checkbox via `_debug_log(...)`.
+    # Always compute a report; server-console logging is via `_debug_log(...)`.
 
     primitives_path = file_dir / "primitives.json"
     meta_path = file_dir / "meta.json"
@@ -1582,6 +1598,23 @@ def _process_draw_event_if_any(
         try:
             fstate["selected_door_id"] = cid
             st.session_state[f"jump_{file_id}"] = cid
+            # If a type filter is active, switch it so the snapped selection is visible.
+            # (This mirrors the "clicked door switches filter" behavior.)
+            try:
+                door_type_filter_key = f"door_type_filter_{file_id}"
+                snapped_type = str(best.get("type") or "").strip()
+                cur_filter = str(st.session_state.get(door_type_filter_key) or "All")
+                if snapped_type and cur_filter not in ("", "All") and cur_filter != snapped_type:
+                    st.session_state[door_type_filter_key] = snapped_type
+            except Exception:
+                pass
+            # IMPORTANT: drawing a rectangle should not yank the viewer pan/zoom.
+            #
+            # The viewer's JS persists pan/zoom and will auto-focus when `_focus_seq`
+            # changes. Selection changes typically bump `_focus_seq` in `sync_select`.
+            # When the selection change originates from a draw/snap, suppress the
+            # focus bump by pre-setting `_focus_last_id` to the new selection.
+            fstate["_focus_last_id"] = cid
         except Exception:
             pass
     else:
@@ -1664,8 +1697,8 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict):
     
     if file_id not in st.session_state.files:
         st.session_state.files[file_id] = {
-            "confirmed_ids": set(labels_data.get("confirmed_ids", [])),
-            "deleted_ids": set(labels_data.get("deleted_ids", [])),
+            "confirmed_ids": _coerce_id_set(labels_data.get("confirmed_ids", [])),
+            "deleted_ids": _coerce_id_set(labels_data.get("deleted_ids", [])),
             "manual_additions": list(labels_data.get("manual_additions", [])),
             "unmatched_manual_boxes": list(labels_data.get("unmatched_manual_boxes", [])),
             "selected_door_id": None,
@@ -2082,6 +2115,10 @@ def _panzoom_image_viewer(
   let scale = 1;
   let tx = 0;
   let ty = 0;
+  // Track last-seen focus sequence from Streamlit so pan/zoom persistence can
+  // also persist which selection-focus we've already applied (prevents refocus
+  // on reruns).
+  let focusSeq = 0;
 
   // "Original state" = initial fit-to-container transform.
   let baseScale = 1;
@@ -2292,6 +2329,13 @@ def _panzoom_image_viewer(
 
   function getEditEnabled() {{
     return readParentInputValue(editModeSinkLabel) === "1";
+  }}
+
+  // In Edit Doors mode, we intentionally suppress auto-focus so the view doesn't
+  // keep yanking/zooming while the user is trying to pan/zoom and manipulate boxes.
+  // (Selection highlight + right-panel preview still update as normal.)
+  function getEffectiveAutoFocus() {{
+    return getAutoFocus() && !getEditEnabled();
   }}
 
   function getViewerDisplayMode() {{
@@ -2522,10 +2566,12 @@ def _panzoom_image_viewer(
     // Sync highlight and optional focus based on parent state.
     const doorId = getSelectedId();
     const seq = getFocusSeq();
+    focusSeq = seq;
     updateDoorStateFromSinks();
     applyDoorStyles();
     renderManualOverlays();
-    if (doorId && autoFocus && (!saved || saved.focusSeq !== seq)) {{
+    const effectiveAutoFocus = getEffectiveAutoFocus();
+    if (doorId && effectiveAutoFocus && (!saved || saved.focusSeq !== seq)) {{
       try {{
         console.log("[door_detector] pz autoFocus", {{
           key: {json.dumps(str(key))},
@@ -3146,6 +3192,10 @@ def _panzoom_image_viewer(
               `snapped (${{snap.id}}, iou=${{snap.iou}})`
             );
             try {{ console.log("[door_detector] draw_rect drew snap overlay", {{ id: snap.id }}); }} catch (_) {{}}
+            // Immediate UX: select the snapped door locally (server selection arrives on rerun).
+            // Auto-focus is suppressed in Edit Doors mode by `getEffectiveAutoFocus()`.
+            localSelectedId = String(snap.id || "");
+            try {{ applyDoorStyles(); }} catch (_) {{}}
           }} catch (_) {{}}
         }} else {{
           try {{ console.log("[door_detector] draw_rect no snap overlay drawn", {{ hasSnap: !!snap, hasTempLayer: !!tempLayer }}); }} catch (_) {{}}
@@ -3246,6 +3296,7 @@ def _panzoom_image_viewer(
   function pollSelection() {{
     const did = getSelectedId();
     const seq = getFocusSeq();
+    focusSeq = seq;
     const viewMode = getViewerDisplayMode();
     const editEnabled = getEditEnabled();
     const doorStateChanged = updateDoorStateFromSinks();
@@ -3293,7 +3344,8 @@ def _panzoom_image_viewer(
     if (doorStateChanged) needsStyle = true;
     if (needsStyle) applyDoorStyles();
 
-    if (autoFocus && did) {{
+    const effectiveAutoFocus = getAutoFocus() && !editEnabled;
+    if (effectiveAutoFocus && did) {{
       if (lastFocusSeq === null) {{
         lastFocusSeq = seq;
       }} else if (seq !== lastFocusSeq) {{
@@ -3327,7 +3379,7 @@ def _panzoom_image_viewer(
       // Immediate UX: highlight/focus locally without waiting for the rerun.
       localSelectedId = did;
       applyDoorStyles();
-      if (getAutoFocus()) focusToDoorId(did);
+      if (getEffectiveAutoFocus()) focusToDoorId(did);
       setSelectedDoorId(did);
     }});
   }}
@@ -3343,12 +3395,6 @@ def _panzoom_image_viewer(
 
 def sidebar_library():
     st.sidebar.title("Library")
-
-    # Server-console debug logs (selection sync, timing, etc.)
-    try:
-        st.sidebar.checkbox("Debug logs", key="debug_perf", help="Log selection sync + perf to the server console.")
-    except Exception:
-        pass
 
     # Manage actions removed (Import existing artifacts / Clear library).
     # If a prior run left the confirm flag around, clear it so it doesn't linger.
@@ -3721,7 +3767,12 @@ def _sync_selected_door_for_run(
         fstate["selected_door_id"] = None
         return
 
-    door_ids = [d.get("id") for d in all_visible if d.get("id") is not None]
+    # IMPORTANT: normalize door ids to strings.
+    #
+    # The viewer communicates selection via hidden Streamlit text inputs, which are
+    # string-valued. If `door_ids` contains ints (from JSON) but sinks provide str,
+    # selection/snap will fail membership checks and silently fall back to the first door.
+    door_ids = [str(d.get("id")) for d in all_visible if d.get("id") is not None]
     if not door_ids:
         fstate["selected_door_id"] = None
         return
@@ -3751,6 +3802,8 @@ def _sync_selected_door_for_run(
     # Priority: clicked bbox → explicit index → previous selection → first.
     current_id: Optional[Any] = None
     clicked_id = st.session_state.get(click_sink_key)
+    if clicked_id not in (None, ""):
+        clicked_id = str(clicked_id)
     # Consume internal sentinel events (used to force reruns from the viewer).
     if isinstance(clicked_id, str) and clicked_id.startswith("__draw_event__"):
         try:
@@ -3784,15 +3837,21 @@ def _sync_selected_door_for_run(
             else:
                 current_id = door_ids[idx_req - 1]
             _debug_log("sync_select file_id=%s idx_select idx=%r id=%r", str(file_id), idx_req, current_id)
-        elif st.session_state.get(jump_key) in door_ids:
-            current_id = st.session_state[jump_key]
-            _debug_log("sync_select file_id=%s jump_select id=%r", str(file_id), current_id)
-        elif fstate.get("selected_door_id") in door_ids:
-            current_id = fstate["selected_door_id"]
-            _debug_log("sync_select file_id=%s fstate_select id=%r", str(file_id), current_id)
         else:
-            current_id = door_ids[0]
-            _debug_log("sync_select file_id=%s default_select id=%r", str(file_id), current_id)
+            jump_raw = st.session_state.get(jump_key)
+            jump_id = str(jump_raw) if jump_raw not in (None, "") else None
+            if jump_id in door_ids:
+                current_id = jump_id
+                _debug_log("sync_select file_id=%s jump_select id=%r", str(file_id), current_id)
+            else:
+                sel_raw = fstate.get("selected_door_id")
+                sel_id = str(sel_raw) if sel_raw not in (None, "") else None
+                if sel_id in door_ids:
+                    current_id = sel_id
+                    _debug_log("sync_select file_id=%s fstate_select id=%r", str(file_id), current_id)
+                else:
+                    current_id = door_ids[0]
+                    _debug_log("sync_select file_id=%s default_select id=%r", str(file_id), current_id)
 
     # Make selection canonical for the rest of this run.
     if st.session_state.get(jump_key) != current_id:
@@ -3802,7 +3861,7 @@ def _sync_selected_door_for_run(
     except Exception:
         # If anything is off, fall back to 1 so the widget doesn't break.
         st.session_state[idx_key] = 1
-    fstate["selected_door_id"] = current_id
+    fstate["selected_door_id"] = str(current_id) if current_id not in (None, "") else None
     _debug_log(
         "sync_select file_id=%s final current_id=%r jump_now=%r idx_now=%r",
         str(file_id),
@@ -3873,7 +3932,7 @@ def right_panel_review(
     f_sel.selectbox("Door type", type_options, key=door_type_filter_key, label_visibility="collapsed")
 
     # Door navigation (index input + Prev/Next).
-    door_ids = [d["id"] for d in all_visible if d.get("id") is not None]
+    door_ids = [str(d["id"]) for d in all_visible if d.get("id") is not None]
     if not door_ids:
         return
 
@@ -3881,7 +3940,9 @@ def right_panel_review(
     idx_key = f"{jump_key}__idx"
     idx_label = f"door_jump_idx_{file_id}"
 
-    current_id = st.session_state.get(jump_key) if st.session_state.get(jump_key) in door_ids else door_ids[0]
+    jump_raw = st.session_state.get(jump_key)
+    jump_id = str(jump_raw) if jump_raw not in (None, "") else None
+    current_id = jump_id if (jump_id in door_ids) else door_ids[0]
     selected_idx = door_ids.index(current_id) if current_id in door_ids else 0
     # Keep the editable index input in sync with selection (must happen before widget instantiation).
     if st.session_state.get(idx_key) != (selected_idx + 1):
@@ -3913,12 +3974,12 @@ def right_panel_review(
     
     # Details of selected
     # Selection is canonicalized earlier by `_sync_selected_door_for_run(...)`.
-    current_id = fstate.get("selected_door_id")
+    current_id = str(fstate.get("selected_door_id") or "")
     if current_id not in door_ids:
         current_id = door_ids[0]
     selected_idx = door_ids.index(current_id) if current_id in door_ids else 0
     selected_door = all_visible[selected_idx]
-    did = selected_door["id"]
+    did = str(selected_door.get("id") or "")
     door_type = html.escape(str(selected_door.get("type", "")))
     try:
         conf = float(selected_door.get("confidence", 0.0) or 0.0)
@@ -4087,11 +4148,8 @@ def right_panel_review(
         else:
             st.markdown("**Unmatched manual boxes (0)**")
 
-        # Show the most recent unmatched-debug report in the UI (when enabled).
-        if st.session_state.get("debug_perf") and fstate.get("_last_unmatched_debug"):
-            with st.expander("Why was this unmatched?", expanded=False):
-                st.code(str(fstate.get("_last_unmatched_debug")), language="json")
-    
+        # (Debug report UI removed; see `_debug_unmatched_region` for details.)
+
     # Train badge
     total_overrides = len(working.get("confirmed_ids", set())) + len(working.get("deleted_ids", set()))
     if (not is_editing) and total_overrides >= 5:
@@ -4256,7 +4314,7 @@ with col_app:
 
             # Compute active doors once so the main viewer + right panel stay in perfect sync.
             detections = doors_data.get("doors", [])
-            deleted_ids = _get_working_label_state(fstate).get("deleted_ids", set())
+            deleted_ids = _coerce_id_set(_get_working_label_state(fstate).get("deleted_ids", set()))
             overlay_doors: List[Dict[str, Any]] = [d for d in detections if d.get("id") is not None]
             # Ensure any confirmed snapped candidates are also rendered (even if they were
             # not in the strict output doors list).
@@ -4289,7 +4347,7 @@ with col_app:
             except Exception:
                 pass
             # Right panel / navigation list excludes deleted; overlay hides deleted via JS state sink.
-            active_doors_all: List[Dict[str, Any]] = [d for d in overlay_doors if d.get("id") not in deleted_ids]
+            active_doors_all: List[Dict[str, Any]] = [d for d in overlay_doors if str(d.get("id")) not in deleted_ids]
 
             # Door type filter (affects navigation list + right panel; overlay still includes all).
             door_type_filter_key = f"door_type_filter_{file_id}"
