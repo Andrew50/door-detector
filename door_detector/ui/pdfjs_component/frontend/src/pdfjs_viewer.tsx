@@ -153,7 +153,11 @@ export function PdfJsViewer(props: ComponentProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Double-buffered canvases to avoid blank frames during re-render.
+  // We render into the inactive canvas, then swap opacity.
+  const canvasARef = useRef<HTMLCanvasElement | null>(null);
+  const canvasBRef = useRef<HTMLCanvasElement | null>(null);
+  const [activeCanvas, setActiveCanvas] = useState<"a" | "b">("a");
   const svgRef = useRef<SVGSVGElement | null>(null);
 
   const pdfRef = useRef<PDFDocumentProxy | null>(null);
@@ -168,6 +172,7 @@ export function PdfJsViewer(props: ComponentProps) {
   const renderQualityRef = useRef<number>(1);
   const renderTimerRef = useRef<number | null>(null);
   const renderInFlightRef = useRef<boolean>(false);
+  const activeCanvasRef = useRef<"a" | "b">("a");
 
   // Pan/zoom state (applied as a CSS transform on the content div).
   const stateKey = useMemo(() => `door_detector_pdfjs_state_${fileId}`, [fileId]);
@@ -178,6 +183,9 @@ export function PdfJsViewer(props: ComponentProps) {
   const baseTxRef = useRef(0);
   const baseTyRef = useRef(0);
   const focusSeqRef = useRef(0);
+  const resetBtnRef = useRef<HTMLButtonElement | null>(null);
+  const [resetVisible, setResetVisible] = useState(false);
+  const resetVisibleRef = useRef(false);
 
   // Selection for immediate feedback (server catches up on rerun).
   const localSelectedIdRef = useRef<string | null>(null);
@@ -218,6 +226,18 @@ export function PdfJsViewer(props: ComponentProps) {
     }
   }, [unmatchedDebugRaw]);
 
+  const updateResetVisibility = useCallback(() => {
+    const eps = 0.5;
+    const atBase =
+      Math.abs(scaleRef.current - baseScaleRef.current) < 0.0005 &&
+      Math.abs(txRef.current - baseTxRef.current) < eps &&
+      Math.abs(tyRef.current - baseTyRef.current) < eps;
+    const visible = !atBase;
+    if (visible === resetVisibleRef.current) return;
+    resetVisibleRef.current = visible;
+    setResetVisible(visible);
+  }, []);
+
   const applyTransform = useCallback(() => {
     const content = contentRef.current;
     if (!content) return;
@@ -233,7 +253,8 @@ export function PdfJsViewer(props: ComponentProps) {
     } catch {
       // ignore
     }
-  }, [stateKey]);
+    updateResetVisibility();
+  }, [stateKey, updateResetVisibility]);
 
   const fitToContainer = useCallback(() => {
     const root = rootRef.current;
@@ -260,6 +281,17 @@ export function PdfJsViewer(props: ComponentProps) {
     baseTyRef.current = ty;
     applyTransform();
   }, [applyTransform, pageSize]);
+
+  const resetView = useCallback(() => {
+    // Reset to the same "default view" used on initial load: fit-to-container and centered.
+    // Also clear persisted state so a rerun/reload doesn't snap back to a non-default view.
+    try {
+      sessionStorage.removeItem(stateKey);
+    } catch {
+      // ignore
+    }
+    fitToContainer();
+  }, [fitToContainer, stateKey]);
 
   const loadState = useCallback(() => {
     try {
@@ -351,7 +383,7 @@ export function PdfJsViewer(props: ComponentProps) {
 
     async function render() {
       const page = pageRef.current;
-      const canvas = canvasRef.current;
+      const canvas = canvasARef.current;
       if (!page || !canvas || !pageSize) return;
 
       const dpr = window.devicePixelRatio || 1;
@@ -371,6 +403,8 @@ export function PdfJsViewer(props: ComponentProps) {
       if (cancelled) return;
 
       renderQualityRef.current = 1;
+      activeCanvasRef.current = "a";
+      setActiveCanvas("a");
       // After first render, apply fit + saved state.
       applyInitialView();
     }
@@ -387,27 +421,45 @@ export function PdfJsViewer(props: ComponentProps) {
 
   const renderCanvasAtQuality = useCallback(async (quality: number) => {
     const page = pageRef.current;
-    const canvas = canvasRef.current;
-    if (!page || !canvas || !pageSize) return;
+    if (!page || !pageSize) return;
     if (!(quality >= 1)) quality = 1;
     if (renderInFlightRef.current) return;
     if (quality === renderQualityRef.current) return;
 
+    const dpr = window.devicePixelRatio || 1;
+    // Cap quality so we don't exceed typical GPU/Canvas limits.
+    // (Prevent huge allocations at extreme zoom + large pages.)
+    const MAX_DIM = 16384;
+    const maxByDim = Math.max(
+      1,
+      Math.floor(Math.min(MAX_DIM / (pageSize.w * dpr), MAX_DIM / (pageSize.h * dpr)))
+    );
+    quality = Math.min(quality, maxByDim);
+    if (quality === renderQualityRef.current) return;
+
+    const nextCanvasKey: "a" | "b" = activeCanvasRef.current === "a" ? "b" : "a";
+    const nextCanvas = nextCanvasKey === "a" ? canvasARef.current : canvasBRef.current;
+    if (!nextCanvas) return;
+
     renderInFlightRef.current = true;
     try {
-      const dpr = window.devicePixelRatio || 1;
       const viewport = page.getViewport({ scale: quality * dpr });
-      const ctx = canvas.getContext("2d", { alpha: false });
+      const ctx = nextCanvas.getContext("2d", { alpha: false });
       if (!ctx) return;
 
-      canvas.width = Math.floor(viewport.width);
-      canvas.height = Math.floor(viewport.height);
-      canvas.style.width = `${pageSize.w}px`;
-      canvas.style.height = `${pageSize.h}px`;
+      // Resize the inactive canvas (the active one stays visible until we swap).
+      nextCanvas.width = Math.floor(viewport.width);
+      nextCanvas.height = Math.floor(viewport.height);
+      nextCanvas.style.width = `${pageSize.w}px`;
+      nextCanvas.style.height = `${pageSize.h}px`;
 
       const task = page.render({ canvasContext: ctx, viewport });
       await task.promise;
       renderQualityRef.current = quality;
+
+      // Swap active canvas without blanking.
+      activeCanvasRef.current = nextCanvasKey;
+      setActiveCanvas(nextCanvasKey);
     } finally {
       renderInFlightRef.current = false;
     }
@@ -416,8 +468,11 @@ export function PdfJsViewer(props: ComponentProps) {
   const scheduleQualityRender = useCallback(() => {
     if (!pageSize) return;
     const z = baseScaleRef.current > 0 ? scaleRef.current / baseScaleRef.current : scaleRef.current;
+    // More resolution steps at higher zoom; actual cap is enforced in renderCanvasAtQuality.
     let desired = 1;
-    if (z >= 4.0) desired = 3;
+    if (z >= 8.0) desired = 5;
+    else if (z >= 5.5) desired = 4;
+    else if (z >= 3.6) desired = 3;
     else if (z >= 2.2) desired = 2;
     if (desired === renderQualityRef.current) return;
 
@@ -425,7 +480,7 @@ export function PdfJsViewer(props: ComponentProps) {
     renderTimerRef.current = window.setTimeout(() => {
       renderTimerRef.current = null;
       void renderCanvasAtQuality(desired);
-    }, 180);
+    }, 320);
   }, [pageSize, renderCanvasAtQuality]);
 
   // ResizeObserver: keep base fit-to-container updated when user hasn't deviated.
@@ -692,11 +747,12 @@ export function PdfJsViewer(props: ComponentProps) {
         scaleRef.current = sScale + dScale * e;
         applyTransform();
         if (t < 1) requestAnimationFrame(step);
+        else scheduleQualityRender();
       }
 
       requestAnimationFrame(step);
     },
-    [applyTransform, pageSize]
+    [applyTransform, pageSize, scheduleQualityRender]
   );
 
   const focusToDoorId = useCallback(
@@ -753,6 +809,7 @@ export function PdfJsViewer(props: ComponentProps) {
     };
 
     const onWheel = (e: WheelEvent) => {
+      if (resetBtnRef.current && e.target instanceof Node && resetBtnRef.current.contains(e.target)) return;
       e.preventDefault();
       const rect = root.getBoundingClientRect();
       const px = e.clientX - rect.left;
@@ -772,6 +829,7 @@ export function PdfJsViewer(props: ComponentProps) {
 
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
+      if (resetBtnRef.current && e.target instanceof Node && resetBtnRef.current.contains(e.target)) return;
       if (editMode && e.shiftKey) {
         drawing = true;
         stage.style.cursor = "crosshair";
@@ -996,6 +1054,47 @@ export function PdfJsViewer(props: ComponentProps) {
         position: "relative",
       }}
     >
+      <button
+        ref={resetBtnRef}
+        type="button"
+        aria-label="Reset view"
+        aria-hidden={!resetVisible}
+        tabIndex={resetVisible ? 0 : -1}
+        onPointerDownCapture={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          resetView();
+        }}
+        style={{
+          position: "absolute",
+          top: 10,
+          right: 10,
+          zIndex: 5,
+          padding: "6px 10px",
+          borderRadius: 999,
+          border: "1px solid rgba(255, 255, 255, 0.16)",
+          background: "rgba(17, 25, 40, 0.65)",
+          color: "rgba(255, 255, 255, 0.92)",
+          fontSize: 12,
+          lineHeight: 1,
+          cursor: "pointer",
+          backdropFilter: "blur(6px)",
+          WebkitBackdropFilter: "blur(6px)",
+          boxShadow: "0 6px 22px rgba(0, 0, 0, 0.35)",
+          opacity: resetVisible ? 1 : 0,
+          transform: resetVisible ? "translateY(0px)" : "translateY(-4px)",
+          transition:
+            "opacity 120ms ease, transform 120ms ease, border-color 120ms ease, background 120ms ease",
+          userSelect: "none",
+          pointerEvents: resetVisible ? "auto" : "none",
+        }}
+      >
+        Reset
+      </button>
       <div
         ref={stageRef}
         style={{
@@ -1019,7 +1118,28 @@ export function PdfJsViewer(props: ComponentProps) {
             willChange: "transform",
           }}
         >
-          <canvas ref={canvasRef} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none" }} />
+          <canvas
+            ref={canvasARef}
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              pointerEvents: "none",
+              opacity: activeCanvas === "a" ? 1 : 0,
+              transition: "opacity 90ms linear",
+            }}
+          />
+          <canvas
+            ref={canvasBRef}
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              pointerEvents: "none",
+              opacity: activeCanvas === "b" ? 1 : 0,
+              transition: "opacity 90ms linear",
+            }}
+          />
           <svg
             ref={svgRef}
             width={pageSize?.w ?? 1}

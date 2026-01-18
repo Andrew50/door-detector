@@ -160,7 +160,7 @@ This is only used to propose an id quickly for UX (e.g., drawing a green snapped
 2) **Server-side snap (authoritative)**  
 When Streamlit receives the draw event, `_process_draw_event_if_any()`:
 
-- converts preview coords → full-res coords
+- converts PDF coords → full-res pixel coords (via Step1 `pdf_to_pix_affine`)
 - loads candidates from `doors_data["candidates"]` (fallback to `doors_data["doors"]`)
 - validates any client-proposed `snapped_candidate_id` (must overlap)
 - otherwise runs its own IoU/intersection-based snap search

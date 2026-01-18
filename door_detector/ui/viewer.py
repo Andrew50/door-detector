@@ -19,7 +19,7 @@ from PIL import Image
 from door_detector.ui.assets import sidebar_autopen_component_html
 from door_detector.ui.labels import flatten_confirmed_ids, get_working_label_state as _get_working_label_state
 from door_detector.ui.pdfjs_component import pdfjs_viewer
-from door_detector.pdf.affine import apply_affine_bbox_xyxy, normalize_bbox_xyxy
+from door_detector.pdf.affine import apply_affine_bbox_xyxy, flip_bbox_y_xyxy, normalize_bbox_xyxy
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -198,6 +198,8 @@ def _manual_overlay_payload_for_pdfjs(
     *,
     fstate: Dict[str, Any],
     pix_to_pdf_affine: List[float],
+    cropbox_y0: float,
+    cropbox_y1: float,
 ) -> Dict[str, Any]:
     """Return PDF-space overlays for the PDF.js component.
 
@@ -243,7 +245,8 @@ def _manual_overlay_payload_for_pdfjs(
         if not isinstance(drawn_full, list) or len(drawn_full) != 4:
             continue
         try:
-            drawn_pdf = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(drawn_full))
+            drawn_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(drawn_full))
+            drawn_pdf = flip_bbox_y_xyxy(drawn_fitz, y0=cropbox_y0, y1=cropbox_y1)
         except Exception:
             continue
 
@@ -251,7 +254,8 @@ def _manual_overlay_payload_for_pdfjs(
         snapped_full = rec.get("snapped_bbox_xyxy")
         if isinstance(snapped_full, list) and len(snapped_full) == 4:
             try:
-                snapped_pdf = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(snapped_full))
+                snapped_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(snapped_full))
+                snapped_pdf = flip_bbox_y_xyxy(snapped_fitz, y0=cropbox_y0, y1=cropbox_y1)
             except Exception:
                 snapped_pdf = None
 
@@ -277,7 +281,8 @@ def _manual_overlay_payload_for_pdfjs(
         if not isinstance(bb_full, list) or len(bb_full) != 4:
             continue
         try:
-            bb_pdf = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(bb_full))
+            bb_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(bb_full))
+            bb_pdf = flip_bbox_y_xyxy(bb_fitz, y0=cropbox_y0, y1=cropbox_y1)
         except Exception:
             continue
         out_unmatched.append({"bbox_pdf_xyxy": bb_pdf, "note": rec.get("note") or "unmatched"})
@@ -757,7 +762,7 @@ def _panzoom_image_viewer(
 
   // In Edit Doors mode, we intentionally suppress auto-focus so the view doesn't
   // keep yanking/zooming while the user is trying to pan/zoom and manipulate boxes.
-  // (Selection highlight + right-panel preview still update as normal.)
+  // (Selection highlight still updates as normal.)
   function getEffectiveAutoFocus() {{
     return getAutoFocus() && !getEditEnabled();
   }}
@@ -1821,7 +1826,6 @@ def _panzoom_image_viewer(
 def main_viewer_canvas(
     item: Dict,
     *,
-    preview_spec: Optional[Dict[str, Any]],
     full_dims: Optional[Tuple[int, int]],
     doors_data: Dict,
     fstate: Dict,
@@ -1831,190 +1835,209 @@ def main_viewer_canvas(
     file_id = item["id"]
     file_dir = Path(item["path"])
 
-    if preview_spec:
-        viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
-        viewer_width_hint = max(600, min(2000, viewer_width_hint))
-        aspect = float(VIEWER_ASPECT_RATIO_HW)
-        aspect = max(0.35, min(1.25, aspect))
+    # Always mount the PDF viewer when `source.pdf` is available, even before any
+    # analysis has been run. In that state we simply pass an empty overlay list,
+    # so no door highlights appear until detections exist.
+    viewer_width_hint = int(VIEWER_TARGET_WIDTH_PX)
+    viewer_width_hint = max(600, min(2000, viewer_width_hint))
+    aspect = float(VIEWER_ASPECT_RATIO_HW)
+    aspect = max(0.35, min(1.25, aspect))
 
-        # Viewer height derived from width and a fixed aspect ratio.
-        viewer_height = int(round(viewer_width_hint * aspect))
-        viewer_height = max(450, min(1400, viewer_height))
+    # Viewer height derived from width and a fixed aspect ratio.
+    viewer_height = int(round(viewer_width_hint * aspect))
+    viewer_height = max(450, min(1400, viewer_height))
 
-        # --- Build PDF.js props (PDF-space bboxes) ---
-        pdf_path = file_dir / "source.pdf"
-        if not pdf_path.exists():
-            st.error("Missing source.pdf; cannot render PDF viewer.")
-            return None, active_doors
+    # --- Build PDF.js props (PDF-space bboxes) ---
+    pdf_path = file_dir / "source.pdf"
+    if not pdf_path.exists():
+        # Still run the sidebar auto-open logic even when the viewer isn't mounted.
+        components.html(sidebar_autopen_component_html(), height=0, scrolling=False)
+        st.error("Missing source.pdf; cannot render PDF viewer.")
+        return None, []
 
-        try:
-            pdf_mtime = int(pdf_path.stat().st_mtime_ns)
-        except Exception:
-            pdf_mtime = 0
-        pdf_hash, pdf_b64 = _load_pdf_b64_and_hash(str(pdf_path), mtime_ns=pdf_mtime)
+    try:
+        pdf_mtime = int(pdf_path.stat().st_mtime_ns)
+    except Exception:
+        pdf_mtime = 0
+    pdf_hash, pdf_b64 = _load_pdf_b64_and_hash(str(pdf_path), mtime_ns=pdf_mtime)
 
-        # Load Step1 transform so we can compute bbox_pdf_xyxy for any legacy data.
-        pix_to_pdf_affine: Optional[List[float]] = None
-        try:
-            tpath = file_dir / "transform.json"
-            if tpath.exists():
-                obj = json.loads(tpath.read_text())
-                m = obj.get("pix_to_pdf_affine") if isinstance(obj, dict) else None
-                if isinstance(m, list) and len(m) == 6:
-                    pix_to_pdf_affine = [float(v) for v in m]
-        except Exception:
-            pix_to_pdf_affine = None
-
-        def _bbox_pdf_for_any(bbox_xyxy: Any, bbox_pdf_xyxy: Any) -> Optional[List[float]]:
-            if isinstance(bbox_pdf_xyxy, list) and len(bbox_pdf_xyxy) == 4:
+    # Load Step1 transform so we can compute bbox_pdf_xyxy for any legacy data.
+    pix_to_pdf_affine: Optional[List[float]] = None
+    cropbox_y0 = 0.0
+    cropbox_y1 = 0.0
+    doors_schema_version = int(doors_data.get("schema_version") or 1) if isinstance(doors_data, dict) else 1
+    try:
+        tpath = file_dir / "transform.json"
+        if tpath.exists():
+            obj = json.loads(tpath.read_text())
+            m = obj.get("pix_to_pdf_affine") if isinstance(obj, dict) else None
+            if isinstance(m, list) and len(m) == 6:
+                pix_to_pdf_affine = [float(v) for v in m]
+            cb = obj.get("cropbox") if isinstance(obj, dict) else None
+            if isinstance(cb, dict):
                 try:
-                    return [float(v) for v in bbox_pdf_xyxy]
+                    cropbox_y0 = float(cb.get("y0", 0.0) or 0.0)
+                    cropbox_y1 = float(cb.get("y1", 0.0) or 0.0)
                 except Exception:
-                    return None
-            if pix_to_pdf_affine is not None and isinstance(bbox_xyxy, list) and len(bbox_xyxy) == 4:
-                try:
-                    bb = normalize_bbox_xyxy(bbox_xyxy)
-                    return apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
-                except Exception:
-                    return None
-            return None
+                    cropbox_y0, cropbox_y1 = 0.0, 0.0
+    except Exception:
+        pix_to_pdf_affine = None
 
-        overlay_doors_pdf: List[Dict[str, Any]] = []
-        for d in list(active_doors or []):
-            did = d.get("id")
-            if did is None:
+    def _bbox_pdf_for_any(bbox_xyxy: Any, bbox_pdf_xyxy: Any) -> Optional[List[float]]:
+        if isinstance(bbox_pdf_xyxy, list) and len(bbox_pdf_xyxy) == 4:
+            try:
+                bb = [float(v) for v in bbox_pdf_xyxy]
+                # Back-compat: schema v1 stored bbox_pdf_xyxy in fitz coords (Y-down).
+                if doors_schema_version <= 1:
+                    return flip_bbox_y_xyxy(bb, y0=cropbox_y0, y1=cropbox_y1)
+                return bb
+            except Exception:
+                return None
+        if pix_to_pdf_affine is not None and isinstance(bbox_xyxy, list) and len(bbox_xyxy) == 4:
+            try:
+                bb = normalize_bbox_xyxy(bbox_xyxy)
+                bbox_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
+                return flip_bbox_y_xyxy(bbox_fitz, y0=cropbox_y0, y1=cropbox_y1)
+            except Exception:
+                return None
+        return None
+
+    overlay_doors_pdf: List[Dict[str, Any]] = []
+    for d in list(active_doors or []):
+        did = d.get("id")
+        if did is None:
+            continue
+        bb_pdf = _bbox_pdf_for_any(d.get("bbox_xyxy"), d.get("bbox_pdf_xyxy"))
+        if not bb_pdf:
+            continue
+        overlay_doors_pdf.append({"id": str(did), "bbox_pdf_xyxy": bb_pdf})
+
+    # Candidate pool for snapping (PDF-space bboxes).
+    pool = list(doors_data.get("candidates", []) or [])
+
+    def _sample_pool_for_viewer(
+        cands: List[Dict[str, Any]],
+        *,
+        full_w: Optional[int],
+        full_h: Optional[int],
+        max_out: int,
+        grid: int = 8,
+    ) -> List[Dict[str, Any]]:
+        if not cands:
+            return []
+        if not full_w or not full_h or full_w <= 0 or full_h <= 0:
+            return cands[:max_out]
+        g = max(2, min(16, int(grid)))
+        per_cell = max(1, int(max_out // (g * g)))
+        buckets: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+        seen: set[str] = set()
+
+        def _cell_for_bbox(bb: Tuple[float, float, float, float]) -> Tuple[int, int]:
+            cx = 0.5 * (bb[0] + bb[2])
+            cy = 0.5 * (bb[1] + bb[3])
+            ix = int((cx / float(full_w)) * g)
+            iy = int((cy / float(full_h)) * g)
+            ix = max(0, min(g - 1, ix))
+            iy = max(0, min(g - 1, iy))
+            return (ix, iy)
+
+        for cand in cands:
+            cid = cand.get("id")
+            bbox = cand.get("bbox_xyxy")
+            if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
                 continue
-            bb_pdf = _bbox_pdf_for_any(d.get("bbox_xyxy"), d.get("bbox_pdf_xyxy"))
-            if not bb_pdf:
+            sid = str(cid)
+            if sid in seen:
                 continue
-            overlay_doors_pdf.append({"id": str(did), "bbox_pdf_xyxy": bb_pdf})
+            nb = _normalize_bbox_xyxy(bbox)
+            if nb is None:
+                continue
+            buckets.setdefault(_cell_for_bbox(nb), []).append(cand)
+            seen.add(sid)
 
-        # Candidate pool for snapping (PDF-space bboxes).
-        pool = list(doors_data.get("candidates", []) or [])
-
-        def _sample_pool_for_viewer(
-            cands: List[Dict[str, Any]],
-            *,
-            full_w: Optional[int],
-            full_h: Optional[int],
-            max_out: int,
-            grid: int = 8,
-        ) -> List[Dict[str, Any]]:
-            if not cands:
-                return []
-            if not full_w or not full_h or full_w <= 0 or full_h <= 0:
-                return cands[:max_out]
-            g = max(2, min(16, int(grid)))
-            per_cell = max(1, int(max_out // (g * g)))
-            buckets: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
-            seen: set[str] = set()
-
-            def _cell_for_bbox(bb: Tuple[float, float, float, float]) -> Tuple[int, int]:
-                cx = 0.5 * (bb[0] + bb[2])
-                cy = 0.5 * (bb[1] + bb[3])
-                ix = int((cx / float(full_w)) * g)
-                iy = int((cy / float(full_h)) * g)
-                ix = max(0, min(g - 1, ix))
-                iy = max(0, min(g - 1, iy))
-                return (ix, iy)
-
-            for cand in cands:
-                cid = cand.get("id")
-                bbox = cand.get("bbox_xyxy")
-                if cid is None or not isinstance(bbox, list) or len(bbox) != 4:
-                    continue
-                sid = str(cid)
-                if sid in seen:
-                    continue
-                nb = _normalize_bbox_xyxy(bbox)
-                if nb is None:
-                    continue
-                buckets.setdefault(_cell_for_bbox(nb), []).append(cand)
-                seen.add(sid)
-
-            out: List[Dict[str, Any]] = []
-            used: set[str] = set()
-            for ix in range(g):
-                for iy in range(g):
-                    for cand in buckets.get((ix, iy), [])[:per_cell]:
-                        sid = str(cand.get("id"))
-                        if sid in used:
-                            continue
-                        out.append(cand)
-                        used.add(sid)
-                        if len(out) >= max_out:
-                            return out
-
-            if len(out) < max_out:
-                for cand in cands:
+        out: List[Dict[str, Any]] = []
+        used: set[str] = set()
+        for ix in range(g):
+            for iy in range(g):
+                for cand in buckets.get((ix, iy), [])[:per_cell]:
                     sid = str(cand.get("id"))
-                    if not sid or sid in used:
+                    if sid in used:
                         continue
                     out.append(cand)
                     used.add(sid)
                     if len(out) >= max_out:
-                        break
-            return out[:max_out]
+                        return out
 
-        full_w = None
-        full_h = None
-        if isinstance(full_dims, tuple) and len(full_dims) == 2:
-            try:
-                full_w = int(full_dims[0]) if full_dims[0] is not None else None
-                full_h = int(full_dims[1]) if full_dims[1] is not None else None
-            except Exception:
-                full_w, full_h = None, None
+        if len(out) < max_out:
+            for cand in cands:
+                sid = str(cand.get("id"))
+                if not sid or sid in used:
+                    continue
+                out.append(cand)
+                used.add(sid)
+                if len(out) >= max_out:
+                    break
+        return out[:max_out]
 
-        picked = _sample_pool_for_viewer(pool, full_w=full_w, full_h=full_h, max_out=1200, grid=8)
-        out_pool: List[Dict[str, Any]] = []
-        for cand in picked:
-            cid = cand.get("id")
-            if cid is None:
-                continue
-            bb_pdf = _bbox_pdf_for_any(cand.get("bbox_xyxy"), cand.get("bbox_pdf_xyxy"))
-            if not bb_pdf:
-                continue
-            out_pool.append({"id": str(cid), "bbox_pdf_xyxy": bb_pdf})
+    full_w = None
+    full_h = None
+    if isinstance(full_dims, tuple) and len(full_dims) == 2:
+        try:
+            full_w = int(full_dims[0]) if full_dims[0] is not None else None
+            full_h = int(full_dims[1]) if full_dims[1] is not None else None
+        except Exception:
+            full_w, full_h = None, None
 
-        # Door state for styling.
-        working = _get_working_label_state(fstate)
-        door_state = {
-            "confirmed_ids": sorted(list(flatten_confirmed_ids(working.get("confirmed_by_type", {})))),
-            "deleted_ids": sorted(list(working.get("deleted_ids", set()))),
-        }
+    picked = _sample_pool_for_viewer(pool, full_w=full_w, full_h=full_h, max_out=1200, grid=8)
+    out_pool: List[Dict[str, Any]] = []
+    for cand in picked:
+        cid = cand.get("id")
+        if cid is None:
+            continue
+        bb_pdf = _bbox_pdf_for_any(cand.get("bbox_xyxy"), cand.get("bbox_pdf_xyxy"))
+        if not bb_pdf:
+            continue
+        out_pool.append({"id": str(cid), "bbox_pdf_xyxy": bb_pdf})
 
-        # Manual overlays: show only the current edit-session records.
-        if bool(fstate.get("edit_mode")) and pix_to_pdf_affine is not None:
-            manual_payload = _manual_overlay_payload_for_pdfjs(fstate=fstate, pix_to_pdf_affine=pix_to_pdf_affine)
-        else:
-            manual_payload = {"manual_additions": [], "unmatched_manual_boxes": []}
+    # Door state for styling.
+    working = _get_working_label_state(fstate)
+    door_state = {
+        "confirmed_ids": sorted(list(flatten_confirmed_ids(working.get("confirmed_by_type", {})))),
+        "deleted_ids": sorted(list(working.get("deleted_ids", set()))),
+    }
 
-        unmatched_debug_raw = str(fstate.get("_last_unmatched_debug") or "")
-        viewer_display = _viewer_display_mode_to_sink_value(str(fstate.get("viewer_display_mode") or "Highlight All"))
-        viewer_key = f"pdfjs_viewer_{file_id}"
-
-        # NOTE: component value is stored in session_state under this key.
-        pdfjs_viewer(
-            file_id=str(file_id),
-            height=int(viewer_height),
-            pdf_hash=str(pdf_hash),
-            pdf_data_b64=str(pdf_b64),
-            page_number=1,
-            overlay_doors=overlay_doors_pdf,
-            candidate_pool=out_pool,
-            selected_door_id=str(fstate.get("selected_door_id") or ""),
-            focus_seq=int(fstate.get("_focus_seq") or 0),
-            edit_mode=bool(fstate.get("edit_mode")),
-            viewer_display_mode=str(viewer_display),
-            door_state=door_state,
-            manual_overlays=manual_payload,
-            unmatched_debug_raw=unmatched_debug_raw,
-            key=viewer_key,
+    # Manual overlays: show only the current edit-session records.
+    if bool(fstate.get("edit_mode")) and pix_to_pdf_affine is not None:
+        manual_payload = _manual_overlay_payload_for_pdfjs(
+            fstate=fstate,
+            pix_to_pdf_affine=pix_to_pdf_affine,
+            cropbox_y0=cropbox_y0,
+            cropbox_y1=cropbox_y1,
         )
-        return None, active_doors
+    else:
+        manual_payload = {"manual_additions": [], "unmatched_manual_boxes": []}
 
-    # Still run the sidebar auto-open logic even when the viewer isn't mounted.
-    components.html(sidebar_autopen_component_html(), height=0, scrolling=False)
-    st.info("Analyze to see results.")
-    return None, []
+    unmatched_debug_raw = str(fstate.get("_last_unmatched_debug") or "")
+    viewer_display = _viewer_display_mode_to_sink_value(str(fstate.get("viewer_display_mode") or "Highlight All"))
+    viewer_key = f"pdfjs_viewer_{file_id}"
+
+    # NOTE: component value is stored in session_state under this key.
+    pdfjs_viewer(
+        file_id=str(file_id),
+        height=int(viewer_height),
+        pdf_hash=str(pdf_hash),
+        pdf_data_b64=str(pdf_b64),
+        page_number=1,
+        overlay_doors=overlay_doors_pdf,
+        candidate_pool=out_pool,
+        selected_door_id=str(fstate.get("selected_door_id") or ""),
+        focus_seq=int(fstate.get("_focus_seq") or 0),
+        edit_mode=bool(fstate.get("edit_mode")),
+        viewer_display_mode=str(viewer_display),
+        door_state=door_state,
+        manual_overlays=manual_payload,
+        unmatched_debug_raw=unmatched_debug_raw,
+        key=viewer_key,
+    )
+    return None, active_doors
 

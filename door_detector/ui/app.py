@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import time
-import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,7 +21,7 @@ from door_detector.signatures import compute_step1_signature
 from door_detector.step2_pipeline import run_step2
 
 from door_detector.ui import assets
-from door_detector.ui.artifacts_io import get_full_page_dims, get_or_create_page_preview, load_file_artifacts
+from door_detector.ui.artifacts_io import get_full_page_dims, load_file_artifacts
 from door_detector.doors.types import normalize_door_type
 from door_detector.ui.labels import (
     coerce_confirmed_by_type,
@@ -210,29 +209,12 @@ def _process_draw_event_if_any(
     file_dir: Path,
     fstate: Dict[str, Any],
     doors_data: Dict[str, Any],
-    preview_spec: Optional[Dict[str, Any]],
     full_dims: Optional[Tuple[int, int]],
     config_path: str,
 ) -> None:
-    """Consume a Shift+drag draw event from the iframe (if present)."""
-    if not preview_spec:
-        return
+    """Consume a Shift+drag draw event from the PDF viewer (if present)."""
     draw_key = f"draw_event_sink_{file_id}"
     raw = st.session_state.get(draw_key) or ""
-
-    # Fallback: some Streamlit builds may not rerun on the hidden draw_event sink change.
-    # In that case we also stuff the payload into the existing click sink as a sentinel.
-    if not raw:
-        click_key = f"door_click_sink_{file_id}"
-        click_raw = st.session_state.get(click_key) or ""
-        if isinstance(click_raw, str) and click_raw.startswith("__draw_event__"):
-            try:
-                encoded = click_raw[len("__draw_event__") :]
-                # payload is URI-encoded JSON
-                raw = urllib.parse.unquote(encoded)
-                _debug_log("draw_event fallback from click sink file_id=%s", str(file_id))
-            except Exception:
-                raw = ""
     if not raw:
         return
     try:
@@ -244,7 +226,6 @@ def _process_draw_event_if_any(
     if evt.get("event") != "draw_rect":
         return
     event_id = evt.get("event_id")
-    bbox = evt.get("bbox_xyxy")
     bbox_pdf = evt.get("bbox_pdf_xyxy")
     snapped_candidate_id = evt.get("snapped_candidate_id")
     if not event_id:
@@ -260,35 +241,29 @@ def _process_draw_event_if_any(
     _enter_edit_mode(fstate)
     draft = _get_working_label_state(fstate)
 
-    drawn_full = None
-    # New path: PDF.js emits bbox_pdf_xyxy in PDF coords; convert PDF → pixel using Step1 transform.
-    if isinstance(bbox_pdf, list) and len(bbox_pdf) == 4:
+    # PDF.js emits bbox_pdf_xyxy in PDF coords; convert PDF → pixel using Step1 transform.
+    if not (isinstance(bbox_pdf, list) and len(bbox_pdf) == 4):
+        return
+    try:
+        tpath = file_dir / "transform.json"
+        tob = json.loads(tpath.read_text()) if tpath.exists() else {}
+        m = tob.get("pdf_to_pix_affine") if isinstance(tob, dict) else None
+        cb = tob.get("cropbox") if isinstance(tob, dict) else None
+        if not (isinstance(m, list) and len(m) == 6 and isinstance(cb, dict)):
+            return
+        # `pdf_to_pix_affine` expects fitz coordinates (Y-down). The PDF.js viewer emits
+        # PDF-spec coords (Y-up), so flip Y using the cropbox.
         try:
-            tpath = file_dir / "transform.json"
-            tob = json.loads(tpath.read_text()) if tpath.exists() else {}
-            m = tob.get("pdf_to_pix_affine") if isinstance(tob, dict) else None
-            if isinstance(m, list) and len(m) == 6:
-                drawn_full = _apply_affine_bbox_xyxy(m, bbox_pdf)
+            cb_y0 = float(cb.get("y0", 0.0) or 0.0)
+            cb_y1 = float(cb.get("y1", 0.0) or 0.0)
         except Exception:
-            drawn_full = None
-
-    # Legacy path: iframe emits preview-space pixels.
-    if drawn_full is None:
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            return
-        scale_full_to_preview = float(preview_spec.get("scale", 1.0) or 1.0)
-        if not (scale_full_to_preview > 0):
-            return
-        try:
-            x0p, y0p, x1p, y1p = [float(v) for v in bbox]
-        except Exception:
-            return
-        drawn_full = [
-            x0p / scale_full_to_preview,
-            y0p / scale_full_to_preview,
-            x1p / scale_full_to_preview,
-            y1p / scale_full_to_preview,
-        ]
+            cb_y0, cb_y1 = 0.0, 0.0
+        x0, y0, x1, y1 = [float(v) for v in bbox_pdf]
+        y_sum = cb_y0 + cb_y1
+        bbox_fitz = [x0, y_sum - y1, x1, y_sum - y0]
+        drawn_full = _apply_affine_bbox_xyxy(m, bbox_fitz)
+    except Exception:
+        return
 
     full_w = full_dims[0] if full_dims else None
     full_h = full_dims[1] if full_dims else None
@@ -371,14 +346,6 @@ def _process_draw_event_if_any(
     # Consume the sink value so it doesn't grow / re-trigger on reconnects.
     try:
         st.session_state[draw_key] = ""
-    except Exception:
-        pass
-
-    # Also clear the click sink sentinel if it was used.
-    try:
-        click_key = f"door_click_sink_{file_id}"
-        if isinstance(st.session_state.get(click_key), str) and str(st.session_state.get(click_key)).startswith("__draw_event__"):
-            st.session_state[click_key] = ""
     except Exception:
         pass
 
@@ -543,17 +510,6 @@ def main() -> None:
                 fstate = st.session_state.files[file_id]
 
                 full_dims = get_full_page_dims(meta_data)
-                page_png_path = file_dir / "page.png"
-                try:
-                    page_png_mtime_ns = page_png_path.stat().st_mtime_ns
-                except Exception:
-                    page_png_mtime_ns = 0
-                preview_spec = get_or_create_page_preview(
-                    str(file_dir),
-                    full_width=full_dims[0] if full_dims else None,
-                    full_height=full_dims[1] if full_dims else None,
-                    page_png_mtime_ns=page_png_mtime_ns,
-                )
 
                 # --- Consume PDF.js component events early (before snapping + selection sync) ---
                 # The PDF.js viewer is a Streamlit custom component keyed by `pdfjs_viewer_{file_id}`.
@@ -593,7 +549,6 @@ def main() -> None:
                     file_dir=file_dir,
                     fstate=fstate,
                     doors_data=doors_data,
-                    preview_spec=preview_spec,
                     full_dims=full_dims,
                     config_path=str(doors_data.get("config_path") or "configs/door_rules.json"),
                 )
@@ -682,7 +637,6 @@ def main() -> None:
                         )
                     main_viewer_canvas(
                         selected_item,
-                        preview_spec=preview_spec,
                         full_dims=full_dims,
                         doors_data=doors_data,
                         fstate=fstate,
@@ -700,7 +654,6 @@ def main() -> None:
                     st.divider()
                     right_panel_review(
                         selected_item,
-                        preview_spec=preview_spec,
                         doors_data=doors_data,
                         fstate=fstate,
                         active_doors=active_doors,

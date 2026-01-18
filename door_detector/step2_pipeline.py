@@ -10,7 +10,7 @@ from PIL import Image
 from door_detector.signatures import compute_analysis_signature
 from door_detector.doors.detect import detect_doors
 from door_detector.doors.overlay import create_door_overlay
-from door_detector.pdf.affine import apply_affine_bbox_xyxy, normalize_bbox_xyxy
+from door_detector.pdf.affine import apply_affine_bbox_xyxy, flip_bbox_y_xyxy, normalize_bbox_xyxy
 
 
 def run_step2(
@@ -59,17 +59,27 @@ def run_step2(
     detect_ms = (time.time() - start_time) * 1000
 
     # 3b. Add PDF-space bboxes for UI (PDF.js) and future-proofed downstream use.
-    # These are derived from the same Step1 transform used to produce page.png.
+    # NOTE: `pix_to_pdf_affine` maps pixel → PyMuPDF (fitz) coordinates (Y-down).
+    # PDF.js expects PDF-spec coordinates (Y-up), so we flip the Y axis using the cropbox.
     pix_to_pdf_affine = None
+    cropbox = None
     try:
         if isinstance(transform, dict):
             m = transform.get("pix_to_pdf_affine")
             if isinstance(m, list) and len(m) == 6:
                 pix_to_pdf_affine = [float(v) for v in m]
+            cb = transform.get("cropbox")
+            if isinstance(cb, dict):
+                cropbox = cb
     except Exception:
         pix_to_pdf_affine = None
 
-    if pix_to_pdf_affine is not None:
+    if pix_to_pdf_affine is not None and isinstance(cropbox, dict):
+        try:
+            cb_y0 = float(cropbox.get("y0", 0.0))
+            cb_y1 = float(cropbox.get("y1", 0.0))
+        except Exception:
+            cb_y0, cb_y1 = 0.0, 0.0
         for seq in (doors, candidates):
             for d in seq:
                 try:
@@ -77,13 +87,14 @@ def run_step2(
                     if not isinstance(bb, list) or len(bb) != 4:
                         continue
                     bb = normalize_bbox_xyxy(bb)
-                    d["bbox_pdf_xyxy"] = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
+                    bbox_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
+                    d["bbox_pdf_xyxy"] = flip_bbox_y_xyxy(bbox_fitz, y0=cb_y0, y1=cb_y1)
                 except Exception:
                     continue
 
     # 4. Save doors.json
     doors_data = {
-        "schema_version": 1,
+        "schema_version": 2,
         "page_id": meta["id"],
         "source_artifacts_dir": str(artifacts_dir),
         "config_path": str(config_path),

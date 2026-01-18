@@ -6,13 +6,11 @@ import hashlib
 import html
 import json
 import logging
-import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
-from PIL import Image
 
 from door_detector.signatures import compute_analysis_signature
 from door_detector.reweight_fit import fit_reweighter
@@ -26,14 +24,10 @@ from door_detector.ui.labels import (
     save_edit_mode as _save_edit_mode,
     save_labels,
 )
-from door_detector.ui.viewer import _normalize_bbox_xyxy
 from door_detector.doors.types import DOOR_TYPES, normalize_door_type
 
 
 logger = logging.getLogger("door_detector.review_app")
-
-# Increase PIL pixel limit
-Image.MAX_IMAGE_PIXELS = None
 
 
 def _queue_pipeline_run(file_id: str, file_dir_str: str, config_path: str, label: str) -> None:
@@ -321,7 +315,6 @@ def _sync_selected_door_for_run(
 def right_panel_review(
     item: Dict,
     *,
-    preview_spec: Optional[Dict[str, Any]],
     doors_data: Dict,
     fstate: Dict,
     active_doors: List,
@@ -459,44 +452,6 @@ def right_panel_review(
     if str(st.session_state.get(label_type_key) or "") not in DOOR_TYPES:
         st.session_state[label_type_key] = default_label_type
     st.selectbox("Label as", list(DOOR_TYPES), key=label_type_key)
-
-    # Zoom
-    if preview_spec:
-        image = Image.open(preview_spec["path"])
-        bbox = selected_door["bbox_xyxy"]
-        nb = _normalize_bbox_xyxy(bbox)
-        if nb is None:
-            st.warning("Selected door has an invalid bbox; preview unavailable.")
-            return
-        x0, y0, x1, y1 = nb
-        scale = float(preview_spec.get("scale", 1.0))
-        pad_full = 100.0
-        pad = pad_full * scale
-
-        left = max(0, int(math.floor(x0 * scale - pad)))
-        upper = max(0, int(math.floor(y0 * scale - pad)))
-        right = min(image.width, int(math.ceil(x1 * scale + pad)))
-        lower = min(image.height, int(math.ceil(y1 * scale + pad)))
-        if right <= left or lower <= upper:
-            st.warning("Selected door bbox is degenerate after clamping; preview unavailable.")
-            logger.info(
-                "Degenerate preview crop file_id=%s door_id=%s bbox=%s nb=%s scale=%.6f pad_full=%.1f crop=(%d,%d,%d,%d) preview=%dx%d shift=%s",
-                file_id,
-                did,
-                bbox,
-                nb,
-                scale,
-                pad_full,
-                left,
-                upper,
-                right,
-                lower,
-                image.width,
-                image.height,
-                doors_data.get("_bbox_transform_fix") or doors_data.get("_bbox_origin_shift"),
-            )
-        else:
-            st.image(image.crop((left, upper, right, lower)), use_container_width=True)
 
     # Actions
     is_editing = bool(fstate.get("edit_mode"))

@@ -37,3 +37,16 @@ def normalize_bbox_xyxy(bbox_xyxy: Iterable[float]) -> List[float]:
     x0, y0, x1, y1 = [float(v) for v in bbox_xyxy]
     return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
 
+
+def flip_bbox_y_xyxy(bbox_xyxy: Iterable[float], *, y0: float, y1: float) -> List[float]:
+    """Flip bbox Y coordinates about the horizontal axis defined by [y0, y1].
+
+    Useful for converting between coordinate systems that differ only by the Y axis
+    direction (e.g. PyMuPDF/fitz Y-down vs PDF-spec Y-up).
+    """
+    x0b, y0b, x1b, y1b = normalize_bbox_xyxy(bbox_xyxy)
+    y_sum = float(y0) + float(y1)
+    fy0 = y_sum - float(y1b)
+    fy1 = y_sum - float(y0b)
+    return [float(x0b), float(fy0), float(x1b), float(fy1)]
+
