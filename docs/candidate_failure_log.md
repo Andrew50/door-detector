@@ -104,6 +104,24 @@ This file records concrete “door looked real but wasn’t in `doors.json["cand
   - Updated polyline-arc extraction (`_extract_polyline_arcs_from_lines` and `_debug_polyline_arcs_from_lines_subset`) to attempt **contiguous subpath recovery** when the full chain fails, so a valid 90-ish degree arc can be recovered from a longer concatenated chain.
   - Augmented `unmatched_debug_report.summary` with `top_polyline_arc_fail` so we can quickly see when the missing door is due to polyline arc RMSE/angle rejection.
 
+### 2026-01-19 — `f_1768793538233` — candidates exist but snap rejected as “candidate too small” when ROI includes room tag bubble
+
+- **Symptom (UI)**: Edit Doors → Shift+drag around a swing door (including the room tag bubble inside the arc) produced:
+  - `snapCandidateForDrawPdf no match (coverage candidate too small)` (client-side)
+  - `unmatched_debug_report extra.debug_reason: "weak_snap_low_iou"` (server-side)
+  - Result: `snap: null` and the UI fell back to a manual-box candidate even though door candidates overlapped.
+- **What geometry exists**:
+  - Valid `swing` / `swing_arc` candidates overlap the ROI on the server (e.g. `swing_arc` candidates with \( \mathrm{IoU} \approx 0.013 \) in that ROI).
+- **Why it failed to snap**:
+  - The snap logic includes an anti-false-positive guardrail that rejects coverage/intersection snaps when the candidate covers <6% of the drawn area (`MIN_INTER_FRAC_OF_DRAWN = 0.06`).
+  - When the reviewer includes a **large room tag bubble** inside the swing arc in the drawn box, the ROI becomes much larger than the door candidate bbox, driving \( \mathrm{inter\_frac} \) down to \(\approx 0.01\) and causing an unnecessary rejection.
+- **Change made**:
+  - Kept the strict 6% guardrail for generic symbol-like candidates, but introduced a relaxed threshold for **door-like** candidate types with reasonable confidence:
+    - `MIN_INTER_FRAC_OF_DRAWN_DOORLIKE = 0.01` (applies to `swing`, `swing_arc`, `double`, `pocket`, `bifold`, `swing_leaf` when `confidence >= 0.55`)
+  - Implemented in both:
+    - `door_detector/ui/pdfjs_component/frontend/src/pdfjs_viewer.tsx` (`snapCandidateForDrawPdf`)
+    - `door_detector/ui/app.py` (`_snap_to_candidate`)
+
 ### 2026-01-19 — `f_1768786633852` — swing arc missing; leaf-only candidates blocked by “wall support line too long” gate
 
 - **Symptom (UI)**: Shift+drag produced `snap: null` (client snap rejected as “candidate too small”), and the unmatched report showed `polyline_arc_candidates_near: 1` with `top_polyline_arc_fail: "angle"` (the only arc-like polyline was a tiny \(\approx 16^\circ\) fragment, not a door swing).

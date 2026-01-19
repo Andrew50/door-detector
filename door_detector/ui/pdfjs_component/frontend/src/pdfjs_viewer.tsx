@@ -21,29 +21,6 @@ function dbg(label: string, payload?: any) {
   }
 }
 
-function perf(label: string, payload?: any) {
-  try {
-    // Enable either via console:
-    // - `window.__door_detectorPdfjsPerf = true`
-    // or via storage:
-    // - `localStorage.setItem("door_detector_profile","1")` (or sessionStorage)
-    const enabledFlag = (window as any).__door_detectorPdfjsPerf === true;
-    let enabledStorage = false;
-    try {
-      enabledStorage =
-        window.localStorage?.getItem("door_detector_profile") === "1" ||
-        window.sessionStorage?.getItem("door_detector_profile") === "1";
-    } catch {
-      enabledStorage = false;
-    }
-    if (!enabledFlag && !enabledStorage) return;
-    // eslint-disable-next-line no-console
-    console.log(label, payload ?? {});
-  } catch {
-    // ignore
-  }
-}
-
 // This runs only when the iframe JS bundle loads (useful to detect full remount/reload).
 try {
   const boot = ((window as any).__door_detectorPdfjsBoot ??= {
@@ -369,13 +346,6 @@ export function PdfJsViewer(props: ComponentProps) {
     if (!mountedRef.current) return;
     try {
       Streamlit.setComponentValue(evt);
-      try {
-        const eid = (evt as any)?.event_id ? String((evt as any).event_id) : "";
-        const et = String((evt as any)?.type ?? "");
-        perf("[door_detector][perf] emit", { type: et, event_id: eid, ts: Date.now() });
-      } catch {
-        // ignore
-      }
     } catch {
       // ignore
     }
@@ -388,7 +358,6 @@ export function PdfJsViewer(props: ComponentProps) {
       const eid0 = (evt as any)?.event_id ? String((evt as any).event_id) : "";
       resendForEventIdRef.current = eid0;
       const evtType = String((evt as any)?.type ?? "");
-      perf("[door_detector][perf] resend_schedule", { type: evtType, event_id: eid0, ts: Date.now() });
 
       const step = () => {
         if (!mountedRef.current) return;
@@ -412,27 +381,18 @@ export function PdfJsViewer(props: ComponentProps) {
         const maxAttempts = evtType === "draw_rect" ? 2 : 6;
         if (resendAttemptsRef.current >= maxAttempts) return;
         resendAttemptsRef.current += 1;
-        perf("[door_detector][perf] resend_attempt", {
-          type: evtType,
-          event_id: eid,
-          attempt: resendAttemptsRef.current,
-          max: maxAttempts,
-          ts: Date.now(),
-        });
         sendEventOnce(evt);
         // Exponential-ish backoff. Draw events can be heavier server-side, so start *much*
         // slower to avoid interrupting the in-flight rerun.
         const base = evtType === "draw_rect" ? 2500 : 520;
         const cap = evtType === "draw_rect" ? 12000 : 2600;
         const delay = Math.min(cap, Math.round(base * Math.pow(1.75, resendAttemptsRef.current - 1)));
-        perf("[door_detector][perf] resend_delay", { type: evtType, event_id: eid, delay_ms: delay, ts: Date.now() });
         resendTimerRef.current = window.setTimeout(step, delay);
       };
 
       // First retry is delayed so we don't immediately spam in the common case.
       // (Especially important for draw events which can legitimately take longer.)
       const firstDelay = evtType === "draw_rect" ? 2500 : 520;
-      perf("[door_detector][perf] resend_first_delay", { type: evtType, event_id: eid0, delay_ms: firstDelay, ts: Date.now() });
       resendTimerRef.current = window.setTimeout(step, firstDelay);
     },
     [clearResendTimer, sendEventOnce]
@@ -453,13 +413,6 @@ export function PdfJsViewer(props: ComponentProps) {
         const q = queuedEventsRef.current.slice();
         q.push(evt);
         persistPendingStore({ inFlight, queue: q });
-        perf("[door_detector][perf] enqueue", {
-          in_flight_event_id: inFlightId,
-          queued_len: q.length,
-          type: String((evt as any)?.type ?? ""),
-          event_id: String((evt as any)?.event_id ?? ""),
-          ts: Date.now(),
-        });
         try {
           const arr = recentEmittedEventsRef.current;
           arr.push(evt);
@@ -472,12 +425,6 @@ export function PdfJsViewer(props: ComponentProps) {
 
       // No in-flight event (or it was already acked): send immediately.
       persistPendingStore({ inFlight: evt, queue: queuedEventsRef.current.slice() });
-      perf("[door_detector][perf] send_immediate", {
-        type: String((evt as any)?.type ?? ""),
-        event_id: String((evt as any)?.event_id ?? ""),
-        queued_len: queuedEventsRef.current.length,
-        ts: Date.now(),
-      });
       try {
         const arr = recentEmittedEventsRef.current;
         arr.push(evt);
@@ -538,7 +485,6 @@ export function PdfJsViewer(props: ComponentProps) {
 
     // If the in-flight event is acked, clear it and advance the queue.
     if (inFlightId && ack && ack === inFlightId) {
-      perf("[door_detector][perf] ack", { ack, in_flight_event_id: inFlightId, queued_len: queuedEventsRef.current.length, ts: Date.now() });
       inFlightEventRef.current = null;
       resendAttemptsRef.current = 0;
       clearResendTimer();
@@ -547,12 +493,6 @@ export function PdfJsViewer(props: ComponentProps) {
       const next = q.shift() ?? null;
       if (next) {
         persistPendingStore({ inFlight: next, queue: q });
-        perf("[door_detector][perf] dequeue_send_next", {
-          next_event_id: String((next as any)?.event_id ?? ""),
-          next_type: String((next as any)?.type ?? ""),
-          remaining: q.length,
-          ts: Date.now(),
-        });
         sendEventOnce(next);
         scheduleResendLoop(next);
         return;
@@ -574,12 +514,6 @@ export function PdfJsViewer(props: ComponentProps) {
       const next = q.shift() ?? null;
       if (next) {
         persistPendingStore({ inFlight: next, queue: q });
-        perf("[door_detector][perf] promote_send", {
-          next_event_id: String((next as any)?.event_id ?? ""),
-          next_type: String((next as any)?.type ?? ""),
-          remaining: q.length,
-          ts: Date.now(),
-        });
         sendEventOnce(next);
         scheduleResendLoop(next);
       } else {
@@ -596,7 +530,6 @@ export function PdfJsViewer(props: ComponentProps) {
     // There is an in-flight event that is not acked: ensure resend loop is running,
     // but don't reset attempts if we're already resending this same event.
     if (inFlightId && resendForEventIdRef.current !== inFlightId) {
-      perf("[door_detector][perf] resume_resend_loop", { in_flight_event_id: inFlightId, ts: Date.now() });
       scheduleResendLoop(inFlightEventRef.current);
     }
   }, [clearResendTimer, lastAckEventId, pendingKey, persistPendingStore, scheduleResendLoop, sendEventOnce]);
@@ -877,8 +810,7 @@ export function PdfJsViewer(props: ComponentProps) {
     }
 
     run().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error("[door_detector] pdfjs load failed", err);
+      dbg("[door_detector] pdfjs load failed", { err: String(err ?? ""), ts: Date.now() });
     });
 
     return () => {
@@ -937,8 +869,7 @@ export function PdfJsViewer(props: ComponentProps) {
     }
 
     render().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error("[door_detector] pdfjs render failed", err);
+      dbg("[door_detector] pdfjs render failed", { err: String(err ?? ""), ts: Date.now() });
     });
 
     return () => {
@@ -1179,7 +1110,26 @@ export function PdfJsViewer(props: ComponentProps) {
     // attached elsewhere in the SVG, or they will persist across filter changes.
     try {
       const stale = svg.querySelectorAll<SVGRectElement>("rect[data-door-id]");
-      for (const r of stale) r.remove();
+      let removed = 0;
+      const ids: string[] = [];
+      for (const r of stale) {
+        if (ids.length < 12) {
+          const id = r.getAttribute("data-door-id") || "";
+          if (id) ids.push(id);
+        }
+        r.remove();
+        removed += 1;
+      }
+      if (removed > 0) {
+        // eslint-disable-next-line no-console
+        console.log("[door_detector] confirm_debug removed_stale_rects", {
+          fileId,
+          pdfHash,
+          removed,
+          ids_sample: ids,
+          ts: Date.now(),
+        });
+      }
     } catch {
       // ignore
     }
@@ -1248,75 +1198,8 @@ export function PdfJsViewer(props: ComponentProps) {
       renderedIds.add(String(d.id));
     }
 
-    // Desync diagnostics: if the server says a door is selected but we can't render its bbox,
-    // the right panel will refer to an id that is not highlighted in the viewer.
-    try {
-      const sid = selectedDoorId ? String(selectedDoorId) : "";
-      if (sid && viewerDisplayMode !== "off") {
-        const missingFromOverlay = !overlayIdsAll.has(sid);
-        const missingFromRendered = overlayIdsAll.has(sid) && !renderedIds.has(sid);
-        if (missingFromOverlay || missingFromRendered) {
-          const k = `__door_detectorSelectedOverlayMissing_${fileId}_${pdfHash}_${sid}_${viewerDisplayMode}_${missingFromOverlay ? "no_overlay" : "not_rendered"}`;
-          const already = (window as any)[k] === true;
-          if (!already) {
-            (window as any)[k] = true;
-            // eslint-disable-next-line no-console
-            console.warn("[door_detector] possible viewer/right-panel desync: selected door cannot be highlighted", {
-              fileId,
-              pdfHash,
-              pageNumber,
-              selectedDoorId: sid,
-              viewerDisplayMode,
-              overlayDoorsLen: overlayDoors.length,
-              overlayContainsSelected: overlayIdsAll.has(sid),
-              renderedContainsSelected: renderedIds.has(sid),
-              editMode,
-              confirmedLen: confirmedSet.size,
-              deletedLen: deletedSet.size,
-              lastAckEventId,
-              recentEmittedEvents: recentEmittedEventsRef.current.slice(-10),
-              hint: missingFromOverlay
-                ? "Python did not include the selected id in overlayDoors (likely bbox conversion/transform issue or filtering mismatch)."
-                : "Selected id was in overlayDoors but was not rendered (invalid/degenerate bbox after conversion).",
-              ts: Date.now(),
-            });
-          }
-        }
-      }
-    } catch {
-      // ignore
-    }
-
-    if (oobCount > 0) {
-      try {
-        const k = `__door_detectorPdfjsOobLogged_${fileId}_${pdfHash}`;
-        const already = (window as any)[k] === true;
-        // Only warn if it's significant, or if everything is off.
-        const n = overlayDoors.length;
-        const frac = n > 0 ? oobCount / n : 0;
-        if (!already && (oobCount >= 5 || frac >= 0.25)) {
-          (window as any)[k] = true;
-          // eslint-disable-next-line no-console
-          console.warn("[door_detector] pdfjs overlay bbox out-of-bounds", {
-            fileId,
-            pdfHash,
-            pageNumber,
-            overlayDoors: n,
-            oobCount,
-            oobFrac: frac,
-            pageSize,
-            viewBox: vb,
-            rotation: (vp as any)?.rotation ?? null,
-            samples: oobSamples,
-            hint:
-              "If most bboxes are off-page, suspect Step1 transform (pix↔pdf), cropbox/rotation handling, or bbox_pdf_xyxy coordinate convention.",
-            ts: Date.now(),
-          });
-        }
-      } catch {
-        // ignore
-      }
-    }
+    // Intentionally no console warnings here (noise). If the selected door cannot be
+    // highlighted due to missing/invalid bboxes, prefer server-side snapshots.
 
     // 2) Proposal/cycling overlays (always-on) + optional server overlays.
     const manualLayer = ensureLayer("pz_manual");
@@ -1406,6 +1289,13 @@ export function PdfJsViewer(props: ComponentProps) {
       const MIN_SNAP_IOU = 0.06;
       const MIN_CAND_COVERAGE = 0.25;
       const MIN_INTER_FRAC_OF_DRAWN = 0.06;
+      // Door tags/room numbers are often drawn inside the swing arc. Reviewers frequently
+      // draw a box that includes the tag bubble, making the drawn ROI much larger than
+      // the true door candidate bbox. Keep the anti-false-positive guardrail for generic
+      // symbols, but allow a weaker "candidate is inside ROI" snap for door-like types.
+      const MIN_INTER_FRAC_OF_DRAWN_DOORLIKE = 0.01;
+      const MIN_CONF_DOORLIKE_RELAX = 0.55;
+      const DOORLIKE_TYPES = new Set(["swing", "swing_arc", "double", "pocket", "bifold", "swing_leaf"]);
       const MIN_IOU_INTER_FRAC_OF_MAX_INTER = 0.72;
       // Conservative anti-false-positive rules:
       // - Treat near-square candidates as "symbol-like" and require stronger evidence,
@@ -1421,9 +1311,9 @@ export function PdfJsViewer(props: ComponentProps) {
       let bestIou = -1;
       let bestByIou: { id: string; bbox: BBox; iou: number; inter: number } | null = null;
       let bestInter = -1;
-      let bestByInter: { id: string; bbox: BBox; iou: number; inter: number } | null = null;
+      let bestByInter: { id: string; bbox: BBox; type: string; confidence: number; iou: number; inter: number } | null = null;
       let bestCoverage = -1;
-      let bestByCoverage: { id: string; bbox: BBox; iou: number; coverage: number; inter: number } | null = null;
+      let bestByCoverage: { id: string; bbox: BBox; type: string; confidence: number; iou: number; coverage: number; inter: number } | null = null;
 
       let skippedSquareWeak = 0;
 
@@ -1451,17 +1341,18 @@ export function PdfJsViewer(props: ComponentProps) {
             continue;
           }
           overlap.push({ id: did, type: rType, bbox: cand, iou, inter, coverage });
+          const rConf = Number((r as any)?.confidence ?? 0);
           if (iou > bestIou) {
             bestIou = iou;
             bestByIou = { id: did, bbox: cand, iou, inter };
           }
           if (inter > bestInter) {
             bestInter = inter;
-            bestByInter = { id: did, bbox: cand, iou, inter };
+            bestByInter = { id: did, bbox: cand, type: rType, confidence: rConf, iou, inter };
           }
           if (coverage > bestCoverage) {
             bestCoverage = coverage;
-            bestByCoverage = { id: did, bbox: cand, iou, coverage, inter };
+            bestByCoverage = { id: did, bbox: cand, type: rType, confidence: rConf, iou, coverage, inter };
           }
         }
       }
@@ -1477,15 +1368,24 @@ export function PdfJsViewer(props: ComponentProps) {
           MIN_SNAP_IOU,
           MIN_CAND_COVERAGE,
           MIN_INTER_FRAC_OF_DRAWN,
+          MIN_INTER_FRAC_OF_DRAWN_DOORLIKE,
+          MIN_CONF_DOORLIKE_RELAX,
           MIN_IOU_INTER_FRAC_OF_MAX_INTER,
           SQUARE_AR_MAX,
           MIN_SNAP_IOU_FOR_SQUARE,
         },
         skipped: { squareWeak: skippedSquareWeak },
         bestByIoU: bestByIou ? { id: bestByIou.id, iou: bestByIou.iou } : null,
-        bestByInter: bestByInter ? { id: bestByInter.id, inter: bestByInter.inter, iou: bestByInter.iou } : null,
+        bestByInter: bestByInter ? { id: bestByInter.id, type: bestByInter.type, conf: bestByInter.confidence, inter: bestByInter.inter, iou: bestByInter.iou } : null,
         bestByCoverage: bestByCoverage
-          ? { id: bestByCoverage.id, coverage: bestByCoverage.coverage, inter: bestByCoverage.inter, iou: bestByCoverage.iou }
+          ? {
+              id: bestByCoverage.id,
+              type: bestByCoverage.type,
+              conf: bestByCoverage.confidence,
+              coverage: bestByCoverage.coverage,
+              inter: bestByCoverage.inter,
+              iou: bestByCoverage.iou,
+            }
           : null,
         overlapSample: overlap.slice(0, 3).map((o) => ({ id: o.id, type: o.type, iou: o.iou, inter: o.inter, coverage: o.coverage, bbox: o.bbox })),
       });
@@ -1516,12 +1416,19 @@ export function PdfJsViewer(props: ComponentProps) {
         const interFrac = drawnArea > 0 ? bestByCoverage.inter / drawnArea : 0;
         // Guardrail: avoid snapping to a tiny candidate that happens to be fully contained
         // by a much larger drawn box (common false-positive near doors).
-        if (interFrac < MIN_INTER_FRAC_OF_DRAWN) {
+        const minInterFrac =
+          DOORLIKE_TYPES.has(bestByCoverage.type) && bestByCoverage.confidence >= MIN_CONF_DOORLIKE_RELAX
+            ? MIN_INTER_FRAC_OF_DRAWN_DOORLIKE
+            : MIN_INTER_FRAC_OF_DRAWN;
+        if (interFrac < minInterFrac) {
           // eslint-disable-next-line no-console
           console.log("[door_detector] snapCandidateForDrawPdf no match (coverage candidate too small)", {
             id: bestByCoverage.id,
+            type: bestByCoverage.type,
+            conf: bestByCoverage.confidence,
             coverage: bestByCoverage.coverage,
             interFracOfDrawn: interFrac,
+            minInterFrac,
             iou: bestByCoverage.iou,
           });
           return null;
@@ -1530,6 +1437,8 @@ export function PdfJsViewer(props: ComponentProps) {
         console.log("[door_detector] snapCandidateForDrawPdf chosen", {
           reason: "coverage",
           id: bestByCoverage.id,
+          type: bestByCoverage.type,
+          conf: bestByCoverage.confidence,
           coverage: bestByCoverage.coverage,
           iou: bestByCoverage.iou,
         });
@@ -1537,13 +1446,20 @@ export function PdfJsViewer(props: ComponentProps) {
       }
       if (bestByInter) {
         const interFrac = drawnArea > 0 ? bestByInter.inter / drawnArea : 0;
-        if (interFrac >= MIN_INTER_FRAC_OF_DRAWN) {
+        const minInterFrac =
+          DOORLIKE_TYPES.has(bestByInter.type) && bestByInter.confidence >= MIN_CONF_DOORLIKE_RELAX
+            ? MIN_INTER_FRAC_OF_DRAWN_DOORLIKE
+            : MIN_INTER_FRAC_OF_DRAWN;
+        if (interFrac >= minInterFrac) {
           // eslint-disable-next-line no-console
           console.log("[door_detector] snapCandidateForDrawPdf chosen", {
             reason: "max_intersection",
             id: bestByInter.id,
+            type: bestByInter.type,
+            conf: bestByInter.confidence,
             inter: bestByInter.inter,
             interFracOfDrawn: interFrac,
+            minInterFrac,
             iou: bestByInter.iou,
           });
           return bestByInter;
@@ -1563,6 +1479,30 @@ export function PdfJsViewer(props: ComponentProps) {
     renderOverlays();
     applyDoorStyles();
   }, [applyDoorStyles, renderOverlays]);
+
+  // Confirm/deny debugging: log when the styling inputs change.
+  const lastStyleSigRef = useRef<string>("");
+  useEffect(() => {
+    try {
+      const sig = `${fileId}::${pdfHash}::sel=${String(selectedDoorId ?? "")}::c=${confirmedSet.size}::d=${deletedSet.size}::ov=${overlayDoors.length}::mode=${viewerDisplayMode}`;
+      if (sig === lastStyleSigRef.current) return;
+      lastStyleSigRef.current = sig;
+      // eslint-disable-next-line no-console
+      console.log("[door_detector] confirm_debug style_inputs", {
+        fileId,
+        pdfHash,
+        selectedDoorId: selectedDoorId ? String(selectedDoorId) : "",
+        confirmedLen: confirmedSet.size,
+        deletedLen: deletedSet.size,
+        overlayDoorsLen: overlayDoors.length,
+        viewerDisplayMode,
+        editMode,
+        ts: Date.now(),
+      });
+    } catch {
+      // ignore
+    }
+  }, [confirmedSet.size, deletedSet.size, editMode, fileId, overlayDoors.length, pdfHash, selectedDoorId, viewerDisplayMode]);
 
   // Auto-focus when focusSeq changes (suppressed during edit mode).
   const focusToBBox = useCallback(

@@ -10,12 +10,15 @@ class Library:
     def __init__(self, root_dir: Path):
         self.root_dir = root_dir
         self.library_dir = root_dir / "library"
+        # Archived items are moved here (keeps labels.json for training).
+        self.archive_dir = root_dir / "archive"
         self.index_path = self.library_dir / "index.json"
         self._ensure_dirs()
         self.items = self._load_index()
 
     def _ensure_dirs(self):
         self.library_dir.mkdir(parents=True, exist_ok=True)
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_index(self) -> Dict[str, Any]:
         if self.index_path.exists():
@@ -59,6 +62,43 @@ class Library:
                 shutil.rmtree(file_dir)
             del self.items[file_id]
             self._save_index()
+
+    def archive_item(self, file_id: str) -> Optional[Path]:
+        """Soft-delete: remove item from library list but preserve artifacts on disk.
+
+        The item folder is moved from `root/library/<file_id>` to `root/archive/<file_id>`.
+        Returns the archive path on success, else None.
+        """
+        if file_id not in self.items:
+            return None
+
+        file_dir = Path(self.items[file_id].get("path") or "")
+        if not str(file_dir):
+            # Nothing sensible to move; behave like a delete from the index.
+            del self.items[file_id]
+            self._save_index()
+            return None
+
+        # Pick a destination that won't clobber an existing archive entry.
+        dest = self.archive_dir / str(file_id)
+        if dest.exists():
+            dest = self.archive_dir / f"{file_id}__archived_{int(time.time() * 1000)}"
+
+        try:
+            if file_dir.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(file_dir), str(dest))
+        except Exception:
+            # Best-effort: do not remove the index entry if the move failed.
+            return None
+
+        # Remove from the active library index so it disappears from the UI list.
+        try:
+            del self.items[file_id]
+        except Exception:
+            pass
+        self._save_index()
+        return dest
 
     def clear(self):
         """Remove all items from the library (deletes library/* contents)."""

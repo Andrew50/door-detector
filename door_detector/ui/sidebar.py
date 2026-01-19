@@ -83,13 +83,17 @@ def _label_files_signature(artifacts_root: Path) -> Tuple[Tuple[str, int, int], 
     """Stable signature for invalidating cached global sample counts."""
     out: list[Tuple[str, int, int]] = []
     try:
-        root = artifacts_root / "library"
-        for p in sorted(root.glob("**/labels.json")):
-            try:
-                stt = p.stat()
-                out.append((str(p), int(stt.st_mtime_ns), int(stt.st_size)))
-            except Exception:
+        # Include both active library items and archived items (soft-deleted).
+        roots = [artifacts_root / "library", artifacts_root / "archive"]
+        for root in roots:
+            if not root.exists():
                 continue
+            for p in sorted(root.glob("**/labels.json")):
+                try:
+                    stt = p.stat()
+                    out.append((str(p), int(stt.st_mtime_ns), int(stt.st_size)))
+                except Exception:
+                    continue
     except Exception:
         return tuple()
     return tuple(out)
@@ -235,9 +239,9 @@ def sidebar_library(lib: Library) -> None:
         use_container_width=True,
         disabled=train_disabled,
         help=(
-            "Fits per-type reweighters from all saved labels in the library."
+            "Fits per-type reweighters from all saved labels (library + archive)."
             if untrained > 0
-            else "Fits per-type reweighters from all saved labels in the library (no new samples since last retrain)."
+            else "Fits per-type reweighters from all saved labels (library + archive) (no new samples since last retrain)."
         ),
     )
 

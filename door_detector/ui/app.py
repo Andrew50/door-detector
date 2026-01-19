@@ -37,20 +37,11 @@ from door_detector.ui.review_panel import main_viewer_controls, right_panel_revi
 from door_detector.ui.sidebar import sidebar_library
 from door_detector.ui.viewer import _normalize_bbox_xyxy, main_viewer_canvas
 from door_detector.doors.detect import debug_explain_unmatched_box
-from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids
+from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids, ui_event_log
 from door_detector.perf import enabled as perf_enabled, span as perf_span, log as perf_log
 
 
 logger = logging.getLogger("door_detector.review_app")
-
-def _ui_log(event: str, payload: Dict[str, Any]) -> None:
-    """Structured UI debug logs (server-side)."""
-    try:
-        # Streamlit's default log level often hides INFO; use WARNING so these are visible
-        # during debugging sessions.
-        logger.warning("[door_detector][ui] %s %s", str(event), json.dumps(payload, sort_keys=True, default=str))
-    except Exception:
-        return
 
 
 def _default_config_path_str() -> str:
@@ -65,14 +56,6 @@ def _default_config_path_str() -> str:
     except Exception:
         return str(p)
 
-
-def _debug_log(msg: str, *args: Any) -> None:
-    """Optional debug logging to the server console (disabled in the UI)."""
-    try:
-        if st.session_state.get("debug_perf"):
-            logger.info(msg, *args)
-    except Exception:
-        return
 
 
 def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
@@ -362,6 +345,16 @@ def _snap_to_candidate(
     MIN_SNAP_IOU = 0.06
     MIN_CAND_COVERAGE = 0.25
     MIN_INTER_FRAC_OF_DRAWN = 0.06
+    # Reviewers often draw around a swing door including the room tag bubble
+    # (commonly placed inside the arc). That makes the drawn ROI much larger
+    # than the true door candidate bbox, producing tiny IoU and causing the
+    # anti-false-positive guardrail to reject snapping entirely.
+    #
+    # Keep the stricter threshold for generic symbol-like candidates, but allow
+    # a weaker "candidate is inside ROI" snap for door-like types with decent confidence.
+    MIN_INTER_FRAC_OF_DRAWN_DOORLIKE = 0.01
+    MIN_CONF_DOORLIKE_RELAX = 0.55
+    DOORLIKE_TYPES = {"swing", "swing_arc", "double", "pocket", "bifold", "swing_leaf"}
     if best_by_iou is not None and best_iou >= MIN_SNAP_IOU:
         # Heuristic: if the IoU-best candidate overlaps *far* less than another overlapping
         # candidate, prefer maximum intersection. This avoids snapping to small nearby
@@ -395,7 +388,18 @@ def _snap_to_candidate(
         # Guardrail: avoid snapping to a tiny candidate that happens to be fully contained
         # by a much larger drawn box (common false-positive near doors).
         inter_frac = (float(best_coverage_inter) / float(drawn_area)) if drawn_area > 0.0 else 0.0
-        if inter_frac < MIN_INTER_FRAC_OF_DRAWN:
+        try:
+            ctype = str(best_by_coverage.get("type") or "")
+        except Exception:
+            ctype = ""
+        try:
+            cconf = float(best_by_coverage.get("confidence", 0.0) or 0.0)
+        except Exception:
+            cconf = 0.0
+        min_inter_frac = MIN_INTER_FRAC_OF_DRAWN
+        if ctype in DOORLIKE_TYPES and cconf >= MIN_CONF_DOORLIKE_RELAX:
+            min_inter_frac = min(min_inter_frac, MIN_INTER_FRAC_OF_DRAWN_DOORLIKE)
+        if inter_frac < min_inter_frac:
             return None, 0.0
         cb = _normalize_bbox_xyxy(best_by_coverage.get("bbox_xyxy"))
         if cb is not None:
@@ -404,7 +408,18 @@ def _snap_to_candidate(
     # Fallback: max intersection area, but only if it is meaningful relative to the drawn box.
     if best_by_inter is not None and best_inter > 0.0:
         inter_frac = (float(best_inter) / float(drawn_area)) if drawn_area > 0.0 else 0.0
-        if inter_frac >= MIN_INTER_FRAC_OF_DRAWN:
+        try:
+            itype = str(best_by_inter.get("type") or "")
+        except Exception:
+            itype = ""
+        try:
+            iconf = float(best_by_inter.get("confidence", 0.0) or 0.0)
+        except Exception:
+            iconf = 0.0
+        min_inter_frac = MIN_INTER_FRAC_OF_DRAWN
+        if itype in DOORLIKE_TYPES and iconf >= MIN_CONF_DOORLIKE_RELAX:
+            min_inter_frac = min(min_inter_frac, MIN_INTER_FRAC_OF_DRAWN_DOORLIKE)
+        if inter_frac >= min_inter_frac:
             cb = _normalize_bbox_xyxy(best_by_inter.get("bbox_xyxy"))
             if cb is not None:
                 return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
@@ -1124,7 +1139,8 @@ def run_pipeline(file_id: str, file_dir: Path, config_path: str) -> None:
 
                 if stored_sig and current_sig and stored_sig == current_sig:
                     should_run_step1 = False
-                    logger.info("Skipping Step 1 for %s (signature match)", str(file_dir))
+                    # Logging intentionally suppressed (noise).
+                    pass
 
             if should_run_step1:
                 process_pdf(pdf_path, file_dir, dpi=step1_dpi, page_index=step1_page_index)
@@ -1461,6 +1477,39 @@ def main() -> None:
                 # never confuses it with historical widget keys (prevents odd resets).
                 door_filter_key = f"_door_detector_door_filter_state_{file_id}"
                 door_filter_widget_key = f"door_filter_widget_{file_id}"
+
+                # Apply action-expected filter first (Confirm/Reject/Delete actions set this).
+                # This prevents transient widget resets from affecting the filtered door list.
+                try:
+                    expected = st.session_state.pop(f"_door_filter_expected_{file_id}", None)
+                except Exception:
+                    expected = None
+                if expected not in (None, ""):
+                    try:
+                        st.session_state[door_filter_key] = str(expected)
+                        st.session_state[door_filter_widget_key] = str(expected)
+                        fstate["_door_filter"] = str(expected)
+                    except Exception:
+                        pass
+
+                # Apply user-driven filter changes (radio on_change sets these flags).
+                user_changed_key = f"_door_filter_user_changed_{file_id}"
+                try:
+                    user_changed = bool(st.session_state.pop(user_changed_key, False))
+                except Exception:
+                    user_changed = False
+                if user_changed:
+                    try:
+                        user_value = st.session_state.pop(f"_door_filter_user_value_{file_id}", None)
+                    except Exception:
+                        user_value = None
+                    if user_value not in (None, ""):
+                        try:
+                            st.session_state[door_filter_key] = str(user_value)
+                            fstate["_door_filter"] = str(user_value)
+                        except Exception:
+                            pass
+
                 if door_filter_key not in st.session_state:
                     try:
                         st.session_state[door_filter_key] = str(fstate.get("_door_filter") or "All")
@@ -1492,16 +1541,6 @@ def main() -> None:
                         except Exception:
                             pass
                         selected_filter = clicked_type
-                        _ui_log(
-                            "door_filter_auto_switch_on_click",
-                            {
-                                "file_id": str(file_id),
-                                "clicked_id": str(clicked_id),
-                                "clicked_type": str(clicked_type),
-                                "prev_filter": str(fstate.get("_door_filter") or ""),
-                                "new_filter": str(selected_filter),
-                            },
-                        )
                         push_breadcrumb(
                             fstate,
                             {
@@ -1523,6 +1562,75 @@ def main() -> None:
                     ]
                 else:
                     active_doors = active_doors_all
+
+                # If the user just performed a label action (Confirm/Reject/Delete), emit a
+                # post-rerun snapshot so we can see what the *server* thinks is visible/styled.
+                try:
+                    raw = st.session_state.pop(f"_door_detector_last_label_action_{file_id}", None)
+                except Exception:
+                    raw = None
+                if raw:
+                    try:
+                        act = json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
+                    except Exception:
+                        act = {}
+                    try:
+                        act_id = str((act or {}).get("door_id") or "")
+                    except Exception:
+                        act_id = ""
+                    try:
+                        confirmed_ids_now = set(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
+                    except Exception:
+                        confirmed_ids_now = set()
+                    try:
+                        hidden_ids_now = set(hidden_ids)
+                    except Exception:
+                        hidden_ids_now = set()
+                    try:
+                        active_ids_now = {str(d.get("id") or "") for d in active_doors if isinstance(d, dict)}
+                    except Exception:
+                        active_ids_now = set()
+                    try:
+                        all_ids_now = {str(d.get("id") or "") for d in active_doors_all if isinstance(d, dict)}
+                    except Exception:
+                        all_ids_now = set()
+
+                    act_obj = None
+                    try:
+                        if act_id:
+                            act_obj = next((d for d in active_doors_all if isinstance(d, dict) and str(d.get("id") or "") == act_id), None)
+                    except Exception:
+                        act_obj = None
+
+                    ui_event_log(
+                        "post_label_action_state",
+                        {
+                            "file_id": str(file_id),
+                            "action": str((act or {}).get("action") or ""),
+                            "door_id": act_id,
+                            "door_filter": str(selected_filter),
+                            "selected_door_id_fstate": str(fstate.get("selected_door_id") or ""),
+                            "confirmed_len": int(len(confirmed_ids_now)),
+                            "hidden_len": int(len(hidden_ids_now)),
+                            "active_len": int(len(active_ids_now)),
+                            "all_active_len": int(len(all_ids_now)),
+                            "door_in_confirmed": bool(act_id and act_id in confirmed_ids_now),
+                            "door_in_hidden": bool(act_id and act_id in hidden_ids_now),
+                            "door_in_active": bool(act_id and act_id in active_ids_now),
+                            "door_in_all_active": bool(act_id and act_id in all_ids_now),
+                            "door_obj": (
+                                {
+                                    "id": str(act_obj.get("id") or ""),
+                                    "type": str(act_obj.get("type") or ""),
+                                    "bbox_xyxy": act_obj.get("bbox_xyxy"),
+                                    "bbox_pdf_xyxy": act_obj.get("bbox_pdf_xyxy"),
+                                    "confidence": act_obj.get("confidence", None),
+                                }
+                                if isinstance(act_obj, dict)
+                                else None
+                            ),
+                        },
+                    )
 
                 # Sync selection state before rendering the viewer.
                 all_visible = active_doors.copy()
@@ -1548,19 +1656,8 @@ def main() -> None:
                 if sel_after_sync and sel_after_sync not in {str(d.get("id")) for d in all_visible if isinstance(d, dict)}:
                     k = f"desync_selected_not_in_visible::{file_id}::{sel_after_sync}::{selected_filter}"
                     if warn_once(fstate, k):
-                        logger.warning(
-                            "[door_detector] possible selection/sidebar desync: selected id not in visible list (post-sync)",
-                            extra={
-                                "file_id": str(file_id),
-                                "selected_door_id": sel_after_sync,
-                                "prev_selected_door_id": prev_sel_before_sync,
-                                "visible_count": int(len(all_visible)),
-                                "visible_id_sample": sample_ids([d.get("id") for d in all_visible if isinstance(d, dict)], limit=12),
-                                "door_filter": str(selected_filter),
-                                "proposal_active": bool(fstate.get("_proposal")),
-                                "breadcrumbs_tail": tail_breadcrumbs(fstate, n=12),
-                            },
-                        )
+                        # Logging intentionally suppressed (noise). Breadcrumbs capture this state.
+                        pass
 
                 # --- Sync viewer-affecting widget state BEFORE rendering the viewer ---
                 # Widgets live in the right panel, but their state is available at the start

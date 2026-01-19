@@ -1,14 +1,12 @@
-"""Lightweight opt-in performance logging.
+"""Performance helpers (logging currently disabled).
 
-Enable by setting environment variable:
-- DOOR_DETECTOR_PROFILE=1   (or true/yes/on)
-
-This module is intentionally dependency-free and safe to import anywhere.
+Historically this module printed `[door_detector][perf] ...` JSON lines when enabled via env vars.
+For current debugging work we intentionally keep *all perf logging disabled* to reduce noise.
+The public API remains so existing call sites don't need to change.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from contextlib import contextmanager
@@ -24,7 +22,8 @@ def _truthy_env(name: str) -> bool:
 
 
 def enabled() -> bool:
-    return _truthy_env("DOOR_DETECTOR_PROFILE") or _truthy_env("DOOR_DETECTOR_PERF")
+    # Logging disabled (keep API for compatibility).
+    return False
 
 
 def _safe(v: Any) -> Any:
@@ -44,19 +43,8 @@ def _safe(v: Any) -> Any:
 
 
 def log(name: str, **fields: Any) -> None:
-    if not enabled():
-        return
-    payload = {"name": str(name)}
-    for k, v in fields.items():
-        payload[str(k)] = _safe(v)
-    try:
-        print("[door_detector][perf]", json.dumps(payload, separators=(",", ":")))
-    except Exception:
-        # Never allow perf logging to break the app.
-        try:
-            print("[door_detector][perf]", str(payload))
-        except Exception:
-            pass
+    # Perf logging disabled.
+    return
 
 
 @contextmanager
@@ -69,5 +57,6 @@ def span(name: str, **fields: Any) -> Iterator[None]:
         yield
     finally:
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        log(name, ms=round(float(dt_ms), 3), **fields)
+        # No-op while logging disabled.
+        _ = (name, dt_ms, fields)
 

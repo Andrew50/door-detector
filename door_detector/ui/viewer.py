@@ -6,7 +6,6 @@ import base64
 import hashlib
 import html
 import json
-import logging
 import math
 from collections import Counter
 from pathlib import Path
@@ -20,11 +19,9 @@ from door_detector.ui.assets import sidebar_autopen_component_html
 from door_detector.ui.labels import flatten_confirmed_ids, flatten_rejected_ids, get_working_label_state as _get_working_label_state
 from door_detector.ui.pdfjs_component import pdfjs_viewer
 from door_detector.pdf.affine import apply_affine_bbox_xyxy, fitz_bbox_to_pdfjs_bbox_xyxy, normalize_bbox_xyxy
-from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids
+from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids, ui_event_log
 from door_detector.perf import enabled as perf_enabled, span as perf_span, log as perf_log
 
-
-logger = logging.getLogger("door_detector.review_app")
 
 # Increase PIL pixel limit
 Image.MAX_IMAGE_PIXELS = None
@@ -41,15 +38,6 @@ def _load_pdf_b64_and_hash(pdf_path: str, *, mtime_ns: int) -> tuple[str, str]:
     h = hashlib.sha256(raw).hexdigest()
     b64 = base64.b64encode(raw).decode("ascii")
     return h, b64
-
-
-def _debug_log(msg: str, *args: Any) -> None:
-    """Optional debug logging to the server console (disabled in the UI)."""
-    try:
-        if st.session_state.get("debug_perf"):
-            logger.info(msg, *args)
-    except Exception:
-        return
 
 
 def _bbox_intersects_bounds_xyxy(bbox_xyxy: List[float], bounds_xyxy: List[float], *, tol: float = 0.0) -> bool:
@@ -1904,11 +1892,7 @@ def _panzoom_image_viewer(
 }})();
 </script>
 """
-    try:
-        viewer_hash = hashlib.sha256(viewer_html.encode("utf-8")).hexdigest()[:12]
-        _debug_log("viewer key=%s html_hash=%s", str(key), viewer_hash)
-    except Exception:
-        pass
+    # Logging intentionally suppressed.
     components.html(viewer_html, height=height, scrolling=False)
 
 
@@ -2143,9 +2127,9 @@ def main_viewer_canvas(
                 except Exception:
                     selected_obj = None
                 missing = sorted(list(set(active_ids) - set(overlay_ids)))
-                logger.warning(
-                    "[door_detector] possible viewer/sidebar desync: selected door not present in PDF overlay list (cannot highlight)",
-                    extra={
+                ui_event_log(
+                    "viewer_missing_selected_overlay",
+                    {
                         "file_id": str(file_id),
                         "selected_door_id": selected_id,
                         "viewer_display_mode": str(viewer_display_tmp),
@@ -2164,7 +2148,6 @@ def main_viewer_canvas(
                         ),
                         "overlay_debug_meta": overlay_debug_meta,
                         "breadcrumbs_tail": tail_breadcrumbs(fstate, n=12),
-                        "hint": "If selected id is in the right panel but not drawn, suspect bbox_pdf conversion (schema_version/transform/cropbox/rotation) or missing bbox data for that candidate.",
                     },
                 )
                 push_breadcrumb(
@@ -2221,17 +2204,7 @@ def main_viewer_canvas(
                     if len(bad_pdf) >= 3:
                         break
 
-        if bad_pix or bad_pdf or ((cropbox_y0 == 0.0 and cropbox_y1 == 0.0) and overlay_doors_pdf):
-            logger.warning(
-                "PDF overlay diagnostics: file_id=%s cropbox=%s rotation=%s schema_v=%s pix_bounds=%s bad_pix=%s bad_pdf=%s",
-                str(file_id),
-                json.dumps(overlay_debug_meta.get("cropbox", {}), sort_keys=True),
-                str(rotation_deg),
-                str(doors_schema_version),
-                json.dumps({"w": pix_w, "h": pix_h}),
-                json.dumps(bad_pix, sort_keys=True),
-                json.dumps(bad_pdf, sort_keys=True),
-            )
+        # Logging intentionally suppressed (noise).
 
         # 3) Sanity-check transform round-trip on a couple of boxes (pixel → fitz → pixel).
         if pix_to_pdf_affine is not None and pdf_to_pix_affine is not None and (pix_w or 0) > 0 and (pix_h or 0) > 0:
@@ -2254,13 +2227,8 @@ def main_viewer_canvas(
                 except Exception:
                     continue
             if samples and max_err > 50.0:
-                logger.warning(
-                    "Transform round-trip large error: file_id=%s max_l1_err=%.1f samples=%d transform_meta=%s",
-                    str(file_id),
-                    float(max_err),
-                    int(samples),
-                    json.dumps(overlay_debug_meta, sort_keys=True),
-                )
+                # Logging intentionally suppressed (noise).
+                pass
     except Exception:
         pass
 

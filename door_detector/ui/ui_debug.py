@@ -5,8 +5,27 @@ Keep this module dependency-light to avoid import cycles between Streamlit UI mo
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Dict, List, Optional, Sequence
+
+
+def ui_event_log(event: str, payload: Dict[str, Any]) -> None:
+    """Print a single compact UI debug line.
+
+    This intentionally uses `print()` (not `logging`) so the output is visible in the
+    Streamlit server terminal without requiring logger configuration.
+
+    Prefix is stable for grep/copy:
+    - `[door_detector] ui_event ...`
+    """
+    try:
+        obj = {"event": str(event or "")}
+        if isinstance(payload, dict):
+            obj.update(payload)
+        print("[door_detector] ui_event", json.dumps(obj, separators=(",", ":"), sort_keys=True, default=str))
+    except Exception:
+        return
 
 
 def push_breadcrumb(

@@ -259,14 +259,13 @@ def _resolve_existing_path(path_str: str, *, base_dirs: List[Path]) -> Optional[
     except Exception:
         return None
 
-    # 1) As-is (relative to CWD).
-    try:
-        if p.exists():
-            return str(p)
-    except Exception:
-        pass
-
-    # 2) Relative to known base dirs (repo root, UI-provided base, etc).
+    # Prefer config-provided base dirs over CWD.
+    #
+    # Rationale:
+    # - In Door Detector, configs often reference `models/...` relative to the repo or an
+    #   artifacts root, while the process may be launched from an arbitrary CWD.
+    # - When multiple `models/...` exist (e.g. a real repo model + a temporary test
+    #   model), resolving relative-to-CWD first can silently pick the wrong file.
     for bd in base_dirs:
         try:
             cand = bd / p
@@ -274,6 +273,13 @@ def _resolve_existing_path(path_str: str, *, base_dirs: List[Path]) -> Optional[
                 return str(cand)
         except Exception:
             continue
+
+    # Fallback: as-is (relative to CWD).
+    try:
+        if p.exists():
+            return str(p)
+    except Exception:
+        pass
 
     return None
 
@@ -2411,6 +2417,22 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
 
     # Post-reweight threshold (actual keep/drop decision).
     kept = [c for c in filtered if float(c.get("confidence", 0.0) or 0.0) >= min_keep_conf]
+    if not kept and has_any_model:
+        # Safety fallback:
+        # If a model exists but would drop *everything*, fall back to the conservative
+        # strict selection so we don't regress to "no doors" due to an untrained /
+        # miscalibrated / out-of-domain reweighter.
+        #
+        # This does NOT mask reweighter-path resolution regressions in tests because
+        # those cases generally have no strict candidates to fall back to.
+        strict_src_fb = [c for c in strict_candidates_all if str(c.get("type") or "").strip().lower() in allowed_final_types]
+        strict_fb = [
+            c
+            for c in strict_src_fb
+            if float(c.get("heuristic_confidence", c.get("confidence", 0.0)) or 0.0) >= min_candidate_conf
+        ]
+        strict_fb.sort(key=lambda x: float(x.get("confidence", 0.0) or 0.0), reverse=True)
+        kept = [c for c in strict_fb if float(c.get("heuristic_confidence", 0.0) or 0.0) >= legacy_min_conf]
     if not kept:
         return {"doors": [], "candidates": exported_candidates}
 
