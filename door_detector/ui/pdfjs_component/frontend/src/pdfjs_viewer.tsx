@@ -349,15 +349,26 @@ export function PdfJsViewer(props: ComponentProps) {
           clearPendingEvent();
           return;
         }
-        // Retry a few times. The server dedupes by event_id, so resends are safe.
-        if (resendAttemptsRef.current >= 8) return;
+        // Retry a few times. The server dedupes by event_id, so resends are safe, but
+        // *each resend can still trigger a Streamlit rerun*. If the server is doing
+        // heavier work on a draw event (e.g. generating an ROI debug report), a too-fast
+        // resend loop can cause multiple reruns and collapse UI state (e.g. proposal menu).
+        if (resendAttemptsRef.current >= 6) return;
         resendAttemptsRef.current += 1;
         sendEventOnce(evt);
-        resendTimerRef.current = window.setTimeout(step, 260);
+        // Exponential-ish backoff. Draw events can be heavier server-side, so start slower.
+        const base =
+          String((evt as any)?.type ?? "") === "draw_rect"
+            ? 950
+            : 520;
+        const delay = Math.min(2600, Math.round(base * Math.pow(1.65, resendAttemptsRef.current - 1)));
+        resendTimerRef.current = window.setTimeout(step, delay);
       };
 
-      // First retry is slightly delayed so we don't immediately spam in the common case.
-      resendTimerRef.current = window.setTimeout(step, 260);
+      // First retry is delayed so we don't immediately spam in the common case.
+      // (Especially important for draw events which can legitimately take longer.)
+      const firstDelay = String((evt as any)?.type ?? "") === "draw_rect" ? 950 : 520;
+      resendTimerRef.current = window.setTimeout(step, firstDelay);
     },
     [clearPendingEvent, clearResendTimer, sendEventOnce]
   );
@@ -1158,7 +1169,14 @@ export function PdfJsViewer(props: ComponentProps) {
         drawBox(manualLayer, pdfBBoxToViewportBBox(vp, drawn as BBox), "rgb(0,255,255)", 2, "6,4", 0.47);
       }
       const snapped = (proposalOverlays as any)?.snapped_bbox_pdf_xyxy;
-      if (snapped && Array.isArray(snapped) && snapped.length === 4) {
+      // IMPORTANT:
+      // When cycling proposals (Prev/Next), the currently viewed proposal is driven by
+      // `cycleCandidateId`. `proposalOverlays.snapped_bbox_pdf_xyxy` is the *original* snap
+      // at draw time and does not change during cycling. Drawing it would leave a stale
+      // green box visible even when the user is viewing a different proposal.
+      //
+      // So only draw the proposal's snapped bbox when there is no cycle candidate id.
+      if (!cycleCandidateId && snapped && Array.isArray(snapped) && snapped.length === 4) {
         drawBox(manualLayer, pdfBBoxToViewportBBox(vp, snapped as BBox), "rgb(0,255,0)", 3, "4,3", 0.77);
       }
     } catch {
@@ -1206,8 +1224,12 @@ export function PdfJsViewer(props: ComponentProps) {
     (drawnPdf: BBox) => {
       // Mirror the legacy snap rules: only overlap candidates, then pick best by IoU
       // (>= MIN_SNAP_IOU), else fall back to max intersection area, else coverage.
-      const MIN_SNAP_IOU = 0.02;
-      const MIN_CAND_COVERAGE = 0.2;
+      // NOTE: IoU can be tiny when the user draws a big box around a small candidate.
+      // Prefer "candidate coverage" (intersection / candidate area) as a second signal,
+      // and avoid snapping on tiny corner overlaps.
+      const MIN_SNAP_IOU = 0.06;
+      const MIN_CAND_COVERAGE = 0.25;
+      const MIN_INTER_FRAC_OF_DRAWN = 0.06;
       const MIN_IOU_INTER_FRAC_OF_MAX_INTER = 0.72;
       // Conservative anti-false-positive rules:
       // - Treat near-square candidates as "symbol-like" and require stronger evidence,
@@ -1216,6 +1238,8 @@ export function PdfJsViewer(props: ComponentProps) {
       const MIN_SNAP_IOU_FOR_SQUARE = 0.10;
 
       const norm = normalizeBBox(drawnPdf);
+      const drawnWh = bboxWidthHeight(norm);
+      const drawnArea = Math.max(0, drawnWh.w) * Math.max(0, drawnWh.h);
       const overlap: Array<{ id: string; type: string; bbox: BBox; iou: number; inter: number; coverage: number }> = [];
 
       let bestIou = -1;
@@ -1270,11 +1294,13 @@ export function PdfJsViewer(props: ComponentProps) {
       // eslint-disable-next-line no-console
       console.log("[door_detector] snapCandidateForDrawPdf", {
         drawn: norm,
+        drawnArea,
         candidates: candidatePool.length,
         overlapCandidates: overlap.length,
         thresholds: {
           MIN_SNAP_IOU,
           MIN_CAND_COVERAGE,
+          MIN_INTER_FRAC_OF_DRAWN,
           MIN_IOU_INTER_FRAC_OF_MAX_INTER,
           SQUARE_AR_MAX,
           MIN_SNAP_IOU_FOR_SQUARE,
@@ -1310,16 +1336,6 @@ export function PdfJsViewer(props: ComponentProps) {
         console.log("[door_detector] snapCandidateForDrawPdf chosen", { reason: "iou", id: bestByIou.id, iou: bestByIou.iou });
         return bestByIou;
       }
-      if (bestByInter) {
-        // eslint-disable-next-line no-console
-        console.log("[door_detector] snapCandidateForDrawPdf chosen", {
-          reason: "max_intersection",
-          id: bestByInter.id,
-          inter: bestByInter.inter,
-          iou: bestByInter.iou,
-        });
-        return bestByInter;
-      }
       if (bestByCoverage && bestByCoverage.coverage >= MIN_CAND_COVERAGE) {
         // eslint-disable-next-line no-console
         console.log("[door_detector] snapCandidateForDrawPdf chosen", {
@@ -1329,6 +1345,20 @@ export function PdfJsViewer(props: ComponentProps) {
           iou: bestByCoverage.iou,
         });
         return bestByCoverage;
+      }
+      if (bestByInter) {
+        const interFrac = drawnArea > 0 ? bestByInter.inter / drawnArea : 0;
+        if (interFrac >= MIN_INTER_FRAC_OF_DRAWN) {
+          // eslint-disable-next-line no-console
+          console.log("[door_detector] snapCandidateForDrawPdf chosen", {
+            reason: "max_intersection",
+            id: bestByInter.id,
+            inter: bestByInter.inter,
+            interFracOfDrawn: interFrac,
+            iou: bestByInter.iou,
+          });
+          return bestByInter;
+        }
       }
       // eslint-disable-next-line no-console
       console.log("[door_detector] snapCandidateForDrawPdf no match (overlap too weak)", {
@@ -1487,16 +1517,31 @@ export function PdfJsViewer(props: ComponentProps) {
 
     const vp = viewportRef.current;
     if (!vp) return;
-    const snapped = (proposalOverlays as any)?.snapped_bbox_pdf_xyxy;
-    const drawn = (proposalOverlays as any)?.drawn_bbox_pdf_xyxy;
-    const bb = snapped && Array.isArray(snapped) && snapped.length === 4 ? (snapped as BBox) : drawn && Array.isArray(drawn) && drawn.length === 4 ? (drawn as BBox) : null;
-    if (!bb) return;
     try {
+      // Prefer focusing to the currently-cycled candidate when available.
+      if (cycleCandidateId) {
+        const cand = candidatePool.find((c) => String((c as any)?.id ?? "") === cycleCandidateId) as any;
+        const bb2 = cand?.bbox_pdf_xyxy && Array.isArray(cand.bbox_pdf_xyxy) ? (cand.bbox_pdf_xyxy as BBox) : null;
+        if (bb2 && bb2.length === 4) {
+          focusToBBox(pdfBBoxToViewportBBox(vp, bb2));
+          return;
+        }
+      }
+
+      const snapped = (proposalOverlays as any)?.snapped_bbox_pdf_xyxy;
+      const drawn = (proposalOverlays as any)?.drawn_bbox_pdf_xyxy;
+      const bb =
+        snapped && Array.isArray(snapped) && snapped.length === 4
+          ? (snapped as BBox)
+          : drawn && Array.isArray(drawn) && drawn.length === 4
+            ? (drawn as BBox)
+            : null;
+      if (!bb) return;
       focusToBBox(pdfBBoxToViewportBBox(vp, bb));
     } catch {
       // ignore
     }
-  }, [focusToBBox, proposalFocusSeq, proposalOverlays]);
+  }, [candidatePool, cycleCandidateId, focusToBBox, proposalFocusSeq, proposalOverlays]);
 
   // Wheel zoom + drag pan + shift+drag drawing.
   useEffect(() => {

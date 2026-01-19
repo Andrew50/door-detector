@@ -155,12 +155,15 @@ def _snap_to_candidate(
         return None, 0.0
     x0, y0, x1, y1 = nb
     drawn = [x0, y0, x1, y1]
+    drawn_area = max(0.0, float(x1 - x0)) * max(0.0, float(y1 - y0))
     # Only consider candidates that overlap the selection box (IoU>0).
     best_iou = -1.0
     best_by_iou: Optional[Dict[str, Any]] = None
     best_iou_inter = -1.0
     best_inter = -1.0
     best_by_inter: Optional[Dict[str, Any]] = None
+    best_coverage = -1.0
+    best_by_coverage: Optional[Dict[str, Any]] = None
     any_overlap = False
 
     # Conservative anti-symbol heuristics (circles often appear near doors).
@@ -187,6 +190,8 @@ def _snap_to_candidate(
         inter_w = max(0.0, inter_x1 - inter_x0)
         inter_h = max(0.0, inter_y1 - inter_y0)
         inter = inter_w * inter_h
+        c_area = max(0.0, float(cx1 - cx0)) * max(0.0, float(cy1 - cy0))
+        coverage = (float(inter) / float(c_area)) if c_area > 0.0 else 0.0
 
         # Penalize near-square candidates (often circles/symbols) unless match is strong.
         # Exception: `swing_arc` candidates (door arcs) are naturally square-ish; allow them.
@@ -219,12 +224,20 @@ def _snap_to_candidate(
         if inter > best_inter:
             best_inter = inter
             best_by_inter = cand
+        if coverage > best_coverage:
+            best_coverage = coverage
+            best_by_coverage = cand
 
     if not any_overlap:
         return None, 0.0
 
     # Primary: max IoU.
-    MIN_SNAP_IOU = 0.02
+    # NOTE: IoU can be tiny when the user draws a big box around a small candidate.
+    # Use candidate coverage (intersection / candidate area) as an alternate signal,
+    # and avoid snapping on tiny corner overlaps.
+    MIN_SNAP_IOU = 0.06
+    MIN_CAND_COVERAGE = 0.25
+    MIN_INTER_FRAC_OF_DRAWN = 0.06
     if best_by_iou is not None and best_iou >= MIN_SNAP_IOU:
         # Heuristic: if the IoU-best candidate overlaps *far* less than another overlapping
         # candidate, prefer maximum intersection. This avoids snapping to small nearby
@@ -241,11 +254,19 @@ def _snap_to_candidate(
                 return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
         return best_by_iou, max(0.0, float(best_iou))
 
-    # Fallback: max intersection area among overlapping candidates.
-    if best_by_inter is not None and best_inter > 0.0:
-        cb = _normalize_bbox_xyxy(best_by_inter.get("bbox_xyxy"))
+    # Fallback: candidate is mostly covered by the selection.
+    if best_by_coverage is not None and best_coverage >= MIN_CAND_COVERAGE:
+        cb = _normalize_bbox_xyxy(best_by_coverage.get("bbox_xyxy"))
         if cb is not None:
-            return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
+            return best_by_coverage, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
+
+    # Fallback: max intersection area, but only if it is meaningful relative to the drawn box.
+    if best_by_inter is not None and best_inter > 0.0:
+        inter_frac = (float(best_inter) / float(drawn_area)) if drawn_area > 0.0 else 0.0
+        if inter_frac >= MIN_INTER_FRAC_OF_DRAWN:
+            cb = _normalize_bbox_xyxy(best_by_inter.get("bbox_xyxy"))
+            if cb is not None:
+                return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
 
     return None, 0.0
 

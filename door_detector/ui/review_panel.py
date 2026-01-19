@@ -316,8 +316,16 @@ def main_viewer_controls(
     filter_options = ["All", "Confirmed", "Unconfirmed"] + type_values
     if door_filter_key not in st.session_state:
         st.session_state[door_filter_key] = "All"
-    if str(st.session_state.get(door_filter_key) or "All") not in filter_options:
-        st.session_state[door_filter_key] = "All"
+    # Preserve the user's filter choice even if its current count becomes 0.
+    #
+    # Streamlit radios require the current value be present in `options`; previously we
+    # "fixed" missing values by resetting to "All", which felt like the UI was randomly
+    # losing the filter after actions like confirm/reject/delete (those can remove the
+    # last remaining door of a type, temporarily making that type absent from `type_values`).
+    cur_filter = str(st.session_state.get(door_filter_key) or "All")
+    if cur_filter not in filter_options:
+        # Keep the filter visible (it will show "(0)" via format_func).
+        filter_options.append(cur_filter)
 
     st.radio(
         "Filter doors",
