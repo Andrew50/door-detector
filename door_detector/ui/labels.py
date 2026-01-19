@@ -34,6 +34,12 @@ def labels_v4_default() -> Dict[str, Any]:
         # "Not a door at all" (global negative). This is intentionally separate from
         # rejected_by_type (which means "not this type", and may still be a door).
         "deleted_ids": [],
+        # Optional: UI-generated candidates created from manual selections when no
+        # detector candidate exists. Stored here so snapping remains stable across
+        # reruns/sessions without modifying doors.json.
+        #
+        # NOTE: Not part of the required schema keys; safe for older labels.json.
+        "manual_candidates": [],
         "manual_additions": [],
         "unmatched_manual_boxes": [],
     }
@@ -225,6 +231,7 @@ def snapshot_label_state(src: Dict[str, Any]) -> Dict[str, Any]:
         "confirmed_by_type": coerce_confirmed_by_type(src.get("confirmed_by_type", {})),
         "rejected_by_type": coerce_rejected_by_type(src.get("rejected_by_type", {})),
         "deleted_ids": coerce_id_set(src.get("deleted_ids", set())),
+        "manual_candidates": copy.deepcopy(list(src.get("manual_candidates", []))),
         "manual_additions": copy.deepcopy(list(src.get("manual_additions", []))),
         "unmatched_manual_boxes": copy.deepcopy(list(src.get("unmatched_manual_boxes", []))),
     }
@@ -234,6 +241,7 @@ def apply_label_state(dst: Dict[str, Any], state: Dict[str, Any]) -> None:
     dst["confirmed_by_type"] = coerce_confirmed_by_type(state.get("confirmed_by_type", {}))
     dst["rejected_by_type"] = coerce_rejected_by_type(state.get("rejected_by_type", {}))
     dst["deleted_ids"] = coerce_id_set(state.get("deleted_ids", set()))
+    dst["manual_candidates"] = copy.deepcopy(list(state.get("manual_candidates", [])))
     dst["manual_additions"] = copy.deepcopy(list(state.get("manual_additions", [])))
     dst["unmatched_manual_boxes"] = copy.deepcopy(list(state.get("unmatched_manual_boxes", [])))
 
@@ -293,6 +301,7 @@ def make_labels_payload_from_fstate(fstate: Dict[str, Any]) -> Dict[str, Any]:
         "confirmed_by_type": {t: sorted(list(confirmed_by_type.get(t, set()))) for t in DOOR_TYPES},
         "rejected_by_type": {t: sorted(list(rejected_by_type.get(t, set()))) for t in DOOR_TYPES},
         "deleted_ids": sorted(list(coerce_id_set(fstate.get("deleted_ids", set())))),
+        "manual_candidates": list(fstate.get("manual_candidates", [])),
         "manual_additions": list(fstate.get("manual_additions", [])),
         "unmatched_manual_boxes": list(fstate.get("unmatched_manual_boxes", [])),
     }

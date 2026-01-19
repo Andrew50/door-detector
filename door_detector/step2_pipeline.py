@@ -10,7 +10,7 @@ from PIL import Image
 from door_detector.signatures import compute_analysis_signature
 from door_detector.doors.detect import detect_doors
 from door_detector.doors.overlay import create_door_overlay
-from door_detector.pdf.affine import apply_affine_bbox_xyxy, flip_bbox_y_xyxy, normalize_bbox_xyxy
+from door_detector.pdf.affine import apply_affine_bbox_xyxy, fitz_bbox_to_pdfjs_bbox_xyxy, normalize_bbox_xyxy
 
 
 def run_step2(
@@ -75,11 +75,6 @@ def run_step2(
         pix_to_pdf_affine = None
 
     if pix_to_pdf_affine is not None and isinstance(cropbox, dict):
-        try:
-            cb_y0 = float(cropbox.get("y0", 0.0))
-            cb_y1 = float(cropbox.get("y1", 0.0))
-        except Exception:
-            cb_y0, cb_y1 = 0.0, 0.0
         for seq in (doors, candidates):
             for d in seq:
                 try:
@@ -88,7 +83,7 @@ def run_step2(
                         continue
                     bb = normalize_bbox_xyxy(bb)
                     bbox_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
-                    d["bbox_pdf_xyxy"] = flip_bbox_y_xyxy(bbox_fitz, y0=cb_y0, y1=cb_y1)
+                    d["bbox_pdf_xyxy"] = fitz_bbox_to_pdfjs_bbox_xyxy(bbox_fitz, cropbox=cropbox)
                 except Exception:
                     continue
 

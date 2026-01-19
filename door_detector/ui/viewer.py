@@ -19,7 +19,7 @@ from PIL import Image
 from door_detector.ui.assets import sidebar_autopen_component_html
 from door_detector.ui.labels import flatten_confirmed_ids, flatten_rejected_ids, get_working_label_state as _get_working_label_state
 from door_detector.ui.pdfjs_component import pdfjs_viewer
-from door_detector.pdf.affine import apply_affine_bbox_xyxy, flip_bbox_y_xyxy, normalize_bbox_xyxy
+from door_detector.pdf.affine import apply_affine_bbox_xyxy, fitz_bbox_to_pdfjs_bbox_xyxy, normalize_bbox_xyxy
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -231,8 +231,7 @@ def _manual_overlay_payload_for_pdfjs(
     *,
     fstate: Dict[str, Any],
     pix_to_pdf_affine: List[float],
-    cropbox_y0: float,
-    cropbox_y1: float,
+    cropbox: Dict[str, float],
 ) -> Dict[str, Any]:
     """Return PDF-space overlays for the PDF.js component.
 
@@ -279,7 +278,7 @@ def _manual_overlay_payload_for_pdfjs(
             continue
         try:
             drawn_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(drawn_full))
-            drawn_pdf = flip_bbox_y_xyxy(drawn_fitz, y0=cropbox_y0, y1=cropbox_y1)
+            drawn_pdf = fitz_bbox_to_pdfjs_bbox_xyxy(drawn_fitz, cropbox=cropbox)
         except Exception:
             continue
 
@@ -288,7 +287,7 @@ def _manual_overlay_payload_for_pdfjs(
         if isinstance(snapped_full, list) and len(snapped_full) == 4:
             try:
                 snapped_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(snapped_full))
-                snapped_pdf = flip_bbox_y_xyxy(snapped_fitz, y0=cropbox_y0, y1=cropbox_y1)
+                snapped_pdf = fitz_bbox_to_pdfjs_bbox_xyxy(snapped_fitz, cropbox=cropbox)
             except Exception:
                 snapped_pdf = None
 
@@ -315,7 +314,7 @@ def _manual_overlay_payload_for_pdfjs(
             continue
         try:
             bb_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(bb_full))
-            bb_pdf = flip_bbox_y_xyxy(bb_fitz, y0=cropbox_y0, y1=cropbox_y1)
+            bb_pdf = fitz_bbox_to_pdfjs_bbox_xyxy(bb_fitz, cropbox=cropbox)
         except Exception:
             continue
         out_unmatched.append({"bbox_pdf_xyxy": bb_pdf, "note": rec.get("note") or "unmatched"})
@@ -1939,41 +1938,74 @@ def main_viewer_canvas(
         if isinstance(bbox_pdf_xyxy, list) and len(bbox_pdf_xyxy) == 4:
             try:
                 bb = [float(v) for v in bbox_pdf_xyxy]
-                # Back-compat: schema v1 stored bbox_pdf_xyxy in fitz coords (Y-down).
-                # However, older/corrupt artifacts sometimes have schema_version mismatches.
-                #
-                # If we also have bbox_xyxy + pix_to_pdf_affine, we can infer whether the stored
-                # bbox is closer to fitz coords (Y-down) or PDF coords (Y-up) by comparing against
-                # the computed pixel→fitz bbox.
-                if (
-                    pix_to_pdf_affine is not None
-                    and isinstance(bbox_xyxy, list)
-                    and len(bbox_xyxy) == 4
-                    and (cropbox_y1 > cropbox_y0)
-                ):
+                cb = {"x0": cropbox_x0, "y0": cropbox_y0, "x1": cropbox_x1, "y1": cropbox_y1}
+                h = float(cropbox_y1 - cropbox_y0)
+                shift = 0.5 * h if h > 0 else 0.0
+
+                # Detect centered PDF coordinate systems (negative y in PDF.js viewBox).
+                centered = False
+                try:
+                    pdf_cb = fitz_bbox_to_pdfjs_bbox_xyxy([cb["x0"], cb["y0"], cb["x1"], cb["y1"]], cropbox=cb)
+                    centered = float(min(pdf_cb[1], pdf_cb[3])) < -1e-6
+                except Exception:
+                    centered = False
+
+                def _as_is() -> List[float]:
+                    return normalize_bbox_xyxy(bb)
+
+                def _from_fitz_y_down() -> List[float]:
+                    return fitz_bbox_to_pdfjs_bbox_xyxy(bb, cropbox=cb)
+
+                def _shift_centered() -> List[float]:
+                    # Legacy bug: some artifacts stored PDF coords in [0, H] even when the
+                    # PDF's native coords are centered at [-H/2, H/2]. Fix by shifting Y.
+                    nb = normalize_bbox_xyxy(bb)
+                    return [float(nb[0]), float(nb[1] - shift), float(nb[2]), float(nb[3] - shift)]
+
+                # If we can compute the expected bbox from pixel-space, pick the closest
+                # interpretation of the stored bbox.
+                target_pdf: Optional[List[float]] = None
+                if pix_to_pdf_affine is not None and isinstance(bbox_xyxy, list) and len(bbox_xyxy) == 4 and (cropbox_y1 > cropbox_y0):
                     try:
                         bb_pix = normalize_bbox_xyxy(bbox_xyxy)
                         bb_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb_pix)  # Y-down
-                        bb_pdf = flip_bbox_y_xyxy(bb_fitz, y0=cropbox_y0, y1=cropbox_y1)  # Y-up
-                        # Compare stored bbox to both representations.
-                        d_fitz = _bbox_l1_distance(bb, bb_fitz)
-                        d_pdf = _bbox_l1_distance(bb, bb_pdf)
-                        # If stored looks like fitz, flip it for PDF.js.
-                        if d_fitz < d_pdf:
-                            return flip_bbox_y_xyxy(bb, y0=cropbox_y0, y1=cropbox_y1)
-                        return bb
+                        target_pdf = fitz_bbox_to_pdfjs_bbox_xyxy(bb_fitz, cropbox=cb)
                     except Exception:
-                        pass
+                        target_pdf = None
+
+                if target_pdf is not None:
+                    cands: List[Tuple[str, List[float]]] = [("as_is", _as_is())]
+                    # Always consider the fitz interpretation (schema mismatches exist).
+                    cands.append(("from_fitz", _from_fitz_y_down()))
+                    if centered and shift > 0:
+                        cands.append(("shift_center", _shift_centered()))
+
+                    best = cands[0][1]
+                    best_d = _bbox_l1_distance(best, target_pdf)
+                    for _name, cand in cands[1:]:
+                        d = _bbox_l1_distance(cand, target_pdf)
+                        if d < best_d:
+                            best, best_d = cand, d
+                    return best
+
+                # No pixel-space reference. Fall back to schema version + bounded heuristics.
                 if doors_schema_version <= 1:
-                    return flip_bbox_y_xyxy(bb, y0=cropbox_y0, y1=cropbox_y1)
-                return bb
+                    return _from_fitz_y_down()
+                if centered and shift > 0:
+                    nb = normalize_bbox_xyxy(bb)
+                    y0b, y1b = float(nb[1]), float(nb[3])
+                    # If bbox is out of the centered PDF y-range, it is likely in [0, H].
+                    if y1b > shift + 1e-6 or y0b < -shift - 1e-6:
+                        return _shift_centered()
+                return _as_is()
             except Exception:
                 return None
         if pix_to_pdf_affine is not None and isinstance(bbox_xyxy, list) and len(bbox_xyxy) == 4:
             try:
                 bb = normalize_bbox_xyxy(bbox_xyxy)
                 bbox_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb)
-                return flip_bbox_y_xyxy(bbox_fitz, y0=cropbox_y0, y1=cropbox_y1)
+                cb = {"x0": cropbox_x0, "y0": cropbox_y0, "x1": cropbox_x1, "y1": cropbox_y1}
+                return fitz_bbox_to_pdfjs_bbox_xyxy(bbox_fitz, cropbox=cb)
             except Exception:
                 return None
         return None
@@ -2005,7 +2037,12 @@ def main_viewer_canvas(
             pix_w = transform_pix_w
             pix_h = transform_pix_h
         pix_bounds = [0.0, 0.0, float(pix_w or 0), float(pix_h or 0)]
-        pdf_bounds = [float(cropbox_x0), float(cropbox_y0), float(cropbox_x1), float(cropbox_y1)]
+        # PDF.js uses PDF-spec coords that can have negative Y on centered pages.
+        try:
+            cb = {"x0": float(cropbox_x0), "y0": float(cropbox_y0), "x1": float(cropbox_x1), "y1": float(cropbox_y1)}
+            pdf_bounds = fitz_bbox_to_pdfjs_bbox_xyxy([cb["x0"], cb["y0"], cb["x1"], cb["y1"]], cropbox=cb)
+        except Exception:
+            pdf_bounds = [float(cropbox_x0), float(cropbox_y0), float(cropbox_x1), float(cropbox_y1)]
 
         # 1) Check pixel-space inputs (are detections already off the rendered raster?)
         bad_pix = []
@@ -2082,6 +2119,13 @@ def main_viewer_canvas(
     # Some artifacts only have `doors` (final detections) and omit `candidates`.
     # In that case, fall back to `doors` so Shift+drag snap still works.
     pool = list(doors_data.get("candidates") or doors_data.get("doors") or [])
+    # Also include UI-generated manual candidates (persisted in labels.json) so
+    # snapping works even when the detector produced no candidate.
+    try:
+        working = _get_working_label_state(fstate)
+        pool.extend(list((working or {}).get("manual_candidates", []) or []))
+    except Exception:
+        pass
 
     def _sample_pool_for_viewer(
         cands: List[Dict[str, Any]],
@@ -2214,8 +2258,7 @@ def main_viewer_canvas(
         manual_payload = _manual_overlay_payload_for_pdfjs(
             fstate=fstate,
             pix_to_pdf_affine=pix_to_pdf_affine,
-            cropbox_y0=cropbox_y0,
-            cropbox_y1=cropbox_y1,
+            cropbox={"x0": cropbox_x0, "y0": cropbox_y0, "x1": cropbox_x1, "y1": cropbox_y1},
         )
     else:
         manual_payload = {"manual_additions": [], "unmatched_manual_boxes": []}

@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import time
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,6 +60,7 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
             "confirmed_by_type": coerce_confirmed_by_type(labels_data.get("confirmed_by_type", {})),
             "rejected_by_type": coerce_rejected_by_type(labels_data.get("rejected_by_type", {})),
             "deleted_ids": coerce_id_set(labels_data.get("deleted_ids", [])),
+            "manual_candidates": list(labels_data.get("manual_candidates", [])),
             "manual_additions": list(labels_data.get("manual_additions", [])),
             "unmatched_manual_boxes": list(labels_data.get("unmatched_manual_boxes", [])),
             "selected_door_id": None,
@@ -95,6 +97,30 @@ def _clamp_bbox_xyxy(bbox_xyxy: List[float], *, w: Optional[int], h: Optional[in
         y0 = max(0.0, min(float(h), y0))
         y1 = max(0.0, min(float(h), y1))
     return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+
+
+def _manual_candidate_id_from_bbox(*, file_id: str, bbox_xyxy: List[float], quant_step_px: float = 1.0) -> str:
+    """Stable id for a UI-created manual candidate derived from bbox geometry."""
+    nb = _normalize_bbox_xyxy(bbox_xyxy) or [0.0, 0.0, 0.0, 0.0]
+    try:
+        q = [int(round(float(v) / float(quant_step_px))) for v in nb]
+    except Exception:
+        q = [int(round(float(v))) for v in nb]
+    payload = {"kind": "manual_box_v1", "file_id": str(file_id), "bbox": q}
+    stable = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "m_" + hashlib.sha1(stable).hexdigest()[:12]
+
+
+def _preferred_label_type_for_draw(*, file_id: str, default: str = "swing") -> str:
+    """Best-effort label type for a draw event based on the UI type filter (if touched)."""
+    try:
+        touched = bool(st.session_state.get(f"_draw_suggest_type_touched_{file_id}", False))
+        chosen = str(st.session_state.get(f"_draw_suggest_type_{file_id}", "") or "")
+    except Exception:
+        touched, chosen = False, ""
+    if touched and chosen and chosen != "All types":
+        return normalize_door_type(chosen, default=default)
+    return normalize_door_type(default, default="swing")
 
 
 def _snap_to_candidate(
@@ -305,15 +331,11 @@ def _process_draw_event_if_any(
         if not (isinstance(m, list) and len(m) == 6 and isinstance(cb, dict)):
             return
         # `pdf_to_pix_affine` expects fitz coordinates (Y-down). The PDF.js viewer emits
-        # PDF-spec coords (Y-up), so flip Y using the cropbox.
-        try:
-            cb_y0 = float(cb.get("y0", 0.0) or 0.0)
-            cb_y1 = float(cb.get("y1", 0.0) or 0.0)
-        except Exception:
-            cb_y0, cb_y1 = 0.0, 0.0
-        x0, y0, x1, y1 = [float(v) for v in bbox_pdf]
-        y_sum = cb_y0 + cb_y1
-        bbox_fitz = [x0, y_sum - y1, x1, y_sum - y0]
+        # PDF-spec coords (Y-up). Use our shared conversion logic which also handles
+        # "centered" PDF page boxes (negative coords) correctly.
+        from door_detector.pdf.affine import pdfjs_bbox_to_fitz_bbox_xyxy
+
+        bbox_fitz = pdfjs_bbox_to_fitz_bbox_xyxy([float(v) for v in bbox_pdf], cropbox=cb)
         drawn_full = _apply_affine_bbox_xyxy(m, bbox_fitz)
     except Exception:
         return
@@ -322,7 +344,12 @@ def _process_draw_event_if_any(
     full_h = full_dims[1] if full_dims else None
     drawn_full = _clamp_bbox_xyxy([float(v) for v in drawn_full], w=full_w, h=full_h)
 
+    # Candidate pool: detected candidates + any UI-generated manual candidates.
     candidates = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
+    try:
+        candidates.extend(list(draft.get("manual_candidates", []) or []))
+    except Exception:
+        pass
 
     # --- Build a ranked suggestion list for cycling (UI) ---
     # Users often need to cycle through overlapping candidates (e.g. double vs two swings,
@@ -334,6 +361,7 @@ def _process_draw_event_if_any(
         bcy = 0.5 * (by0 + by1)
 
         scored: List[Tuple[Tuple[float, float, float], Dict[str, Any]]] = []
+        nearest: List[Tuple[Tuple[float, float], Dict[str, Any]]] = []
         for cand in candidates:
             cid = cand.get("id")
             cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
@@ -346,12 +374,22 @@ def _process_draw_event_if_any(
             iy1 = min(by1, cy1)
             inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
             if inter <= 0.0:
+                # Track "nearby" candidates so the UI can still offer cycling when
+                # the selection box barely misses the right candidate bbox.
+                try:
+                    ccx = 0.5 * (cx0 + cx1)
+                    ccy = 0.5 * (cy0 + cy1)
+                    dist = float(math.hypot(ccx - bcx, ccy - bcy))
+                    nearest.append(((dist, float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)), cand))
+                except Exception:
+                    pass
                 continue
             iou_c = float(compute_iou([bx0, by0, bx1, by1], [cx0, cy0, cx1, cy1]))
             conf = float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)
             scored.append(((iou_c, inter, conf), cand))
 
         scored.sort(key=lambda x: x[0], reverse=True)
+        nearest.sort(key=lambda x: x[0])
 
         pool_map = {str(c.get("id")): c for c in candidates if c.get("id") is not None}
 
@@ -406,10 +444,29 @@ def _process_draw_event_if_any(
                 except Exception:
                     pass
 
-        # If nothing overlaps, do NOT auto-include nearby candidates.
-        # (Users found this confusing because it shows candidates that don't intersect
-        # the selection at all. If desired, we can add an explicit "Show nearby" toggle
-        # later, but default should be overlap-only.)
+        # If nothing overlaps, include a few nearby candidates (best-effort) so the
+        # reviewer can still cycle when bboxes are slightly mislocalized.
+        if not suggestions and nearest:
+            MAX_NEARBY = 12
+            MAX_NEARBY_DIST_PX = 320.0
+            for (dist, conf), cand in nearest[:MAX_NEARBY]:
+                if float(dist) > MAX_NEARBY_DIST_PX:
+                    continue
+                cid = str(cand.get("id") or "")
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                suggestions.append(
+                    {
+                        "id": cid,
+                        "type": str(cand.get("type") or ""),
+                        "iou": 0.0,
+                        "inter": 0.0,
+                        "confidence": float(conf),
+                        "source": "nearby",
+                        "dist_px": float(dist),
+                    }
+                )
 
         fstate["_last_draw_suggestions"] = {
             "event_id": str(event_id),
@@ -476,6 +533,53 @@ def _process_draw_event_if_any(
     except Exception:
         pass
 
+    # If nothing overlaps, create a UI-only manual candidate from the drawn box so
+    # the reviewer can still proceed (snap + confirm) even when detection missed.
+    if best is None:
+        try:
+            cid = _manual_candidate_id_from_bbox(file_id=str(file_id), bbox_xyxy=drawn_full, quant_step_px=1.0)
+            manual = {
+                "id": str(cid),
+                "type": "manual_box",
+                "bbox_xyxy": list(drawn_full),
+                "confidence": 0.0,
+                "heuristic_confidence": 0.0,
+                "pool": True,
+                "features": {},
+            }
+            draft.setdefault("manual_candidates", [])
+            # Deduplicate by id (keep first).
+            if not any(str(c.get("id") or "") == str(cid) for c in (draft.get("manual_candidates") or []) if isinstance(c, dict)):
+                draft["manual_candidates"].append(manual)
+            best = manual
+            iou = 1.0
+            # Ensure it shows up in Selection matches immediately.
+            try:
+                srec = fstate.get("_last_draw_suggestions") or {}
+                sugg = list(srec.get("suggestions") or [])
+                sugg = [r for r in sugg if str(r.get("id") or "") != str(cid)]
+                sugg.insert(
+                    0,
+                    {
+                        "id": str(cid),
+                        "type": "manual_box",
+                        "iou": 1.0,
+                        "inter": 0.0,
+                        "confidence": 0.0,
+                        "source": "manual_box",
+                    },
+                )
+                fstate["_last_draw_suggestions"] = {
+                    "event_id": str(event_id),
+                    "drawn_bbox_xyxy": [float(v) for v in drawn_full],
+                    "suggestions": sugg[:50],
+                }
+                st.session_state[f"_draw_suggest_idx_{file_id}"] = 0
+            except Exception:
+                pass
+        except Exception:
+            best = None
+
     if best is not None and best.get("id") is not None:
         cid = str(best["id"])
         # Align the cycling index to the chosen id (best effort).
@@ -488,7 +592,12 @@ def _process_draw_event_if_any(
         except Exception:
             pass
         snapped_full = _normalize_bbox_xyxy(best.get("bbox_xyxy")) or _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
-        label_type = normalize_door_type(best.get("type"), default="swing")
+        # Manual candidates are "type-less" by design; use the user's last type filter
+        # (if touched) to choose the intended label type.
+        if str(best.get("type") or "") == "manual_box":
+            label_type = _preferred_label_type_for_draw(file_id=str(file_id), default="swing")
+        else:
+            label_type = normalize_door_type(best.get("type"), default="swing")
         rec = {
             "drawn_bbox_xyxy": drawn_full,
             "snapped_candidate_id": cid,

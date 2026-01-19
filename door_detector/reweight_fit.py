@@ -4,7 +4,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -128,22 +128,66 @@ def fit_reweighter(
     base_reg_lambda: float = 1.0,
     reg_lambda_bias: float = 0.25,
     learning_rate: float = 0.1,
-) -> None:
-    """Fit one (or all) per-type binary reweighters from reviewer feedback."""
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Fit one (or all) per-type binary reweighters from reviewer feedback.
+
+    Returns a best-effort training report dict suitable for showing in the UI.
+    """
     types: List[str]
     if door_type:
         types = [normalize_door_type(door_type, default=str(door_type))]
     else:
         types = list(DOOR_TYPES)
 
+    started_at = time.time()
+    report: Dict[str, Any] = {
+        "schema_version": 1,
+        "artifacts_root": str(artifacts_root),
+        "output_dir": str(output_dir),
+        "types": list(types),
+        "thresholds": {
+            "min_samples": int(min_samples),
+            "min_pos": int(min_pos),
+            "min_neg": int(min_neg),
+        },
+        "label_files_found": 0,
+        "models_written": 0,
+        "by_type": {t: {"door_type": t, "status": "unknown"} for t in types},
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "duration_s": None,
+    }
+
+    def _emit(ev: Dict[str, Any]) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(dict(ev))
+        except Exception:
+            return
+
     # 1) Collect labeled examples by candidate type.
     X_by_type: Dict[str, List[List[float]]] = {t: [] for t in types}
     y_by_type: Dict[str, List[int]] = {t: [] for t in types}
 
     label_files = list(artifacts_root.glob("**/labels.json"))
+    report["label_files_found"] = int(len(label_files))
     if not label_files:
         print("No labels.json files found. Go review some detections first!")
-        return
+        for t in types:
+            report["by_type"][t] = {
+                "door_type": t,
+                "status": "skipped",
+                "reason": "no_labels",
+                "message": "No labels found.",
+                "num_samples": 0,
+                "num_pos": 0,
+                "num_neg": 0,
+                "model_written": False,
+                "output_path": str(output_dir / f"reweighter_{t}_v1.json"),
+            }
+        report["duration_s"] = float(max(0.0, time.time() - started_at))
+        return report
 
     for label_path in label_files:
         dir_path = label_path.parent
@@ -229,11 +273,25 @@ def fit_reweighter(
             y_by_type[cand_type].append(1 if is_pos else 0)
 
     # 2) Train one model per requested type.
-    for t in types:
+    total_types = int(len(types))
+    for i, t in enumerate(types):
+        _emit({"stage": "start_type", "door_type": t, "i": int(i), "total": total_types})
         X_list = X_by_type.get(t) or []
         y_list = y_by_type.get(t) or []
         if not X_list:
             print(f"[{t}] No labeled samples; skipping.")
+            report["by_type"][t] = {
+                "door_type": t,
+                "status": "skipped",
+                "reason": "no_labeled_samples",
+                "message": "No samples.",
+                "num_samples": 0,
+                "num_pos": 0,
+                "num_neg": 0,
+                "model_written": False,
+                "output_path": str(output_dir / f"reweighter_{t}_v1.json"),
+            }
+            _emit({"stage": "end_type", "door_type": t, "i": int(i), "total": total_types, "status": "skipped"})
             continue
 
         X = np.array(X_list, dtype=float)
@@ -250,6 +308,18 @@ def fit_reweighter(
                 f"(need N>={min_samples} and pos>={min_pos} and neg>={min_neg}). "
                 f"Got N={n}, pos={n_pos}, neg={n_neg}. Not writing a new model."
             )
+            report["by_type"][t] = {
+                "door_type": t,
+                "status": "skipped",
+                "reason": "not_enough_samples",
+                "message": f"Not enough samples (N={n}, pos={n_pos}, neg={n_neg}).",
+                "num_samples": int(n),
+                "num_pos": int(n_pos),
+                "num_neg": int(n_neg),
+                "model_written": False,
+                "output_path": str(output_dir / f"reweighter_{t}_v1.json"),
+            }
+            _emit({"stage": "end_type", "door_type": t, "i": int(i), "total": total_types, "status": "skipped"})
             continue
 
         feature_names = list(FEATURES_BY_TYPE.get(t, []))
@@ -315,6 +385,18 @@ def fit_reweighter(
         weights = best_w
         bias = best_b
 
+        # Small, UI-friendly training metrics ("score").
+        try:
+            z_final = np.dot(X_scaled, weights) + bias
+            probs_final = _sigmoid(z_final)
+            pred = (probs_final >= 0.5).astype(int)
+            train_acc = float(np.mean(pred == y))
+            eps = 1e-9
+            train_logloss = float(-np.mean(y * np.log(probs_final + eps) + (1 - y) * np.log(1 - probs_final + eps)))
+        except Exception:
+            train_acc = None
+            train_logloss = None
+
         output_dir.mkdir(parents=True, exist_ok=True)
         model_data = {
             "schema_version": 2,
@@ -332,6 +414,8 @@ def fit_reweighter(
             "num_samples": int(n),
             "num_pos": int(n_pos),
             "num_neg": int(n_neg),
+            "train_accuracy": train_acc,
+            "train_logloss": train_logloss,
             "warm_start_used": bool(warm_ok),
             "prior_path": str(out_path) if bool(warm_ok) else None,
             "reg_lambda": float(reg_lambda),
@@ -340,6 +424,25 @@ def fit_reweighter(
 
         out_path.write_text(json.dumps(model_data, indent=2), encoding="utf-8")
         print(f"[{t}] ✓ Model saved to {out_path}")
+        report["models_written"] = int(report.get("models_written") or 0) + 1
+        report["by_type"][t] = {
+            "door_type": t,
+            "status": "trained",
+            "reason": None,
+            "message": "Trained.",
+            "num_samples": int(n),
+            "num_pos": int(n_pos),
+            "num_neg": int(n_neg),
+            "model_written": True,
+            "output_path": str(out_path),
+            "warm_start_used": bool(warm_ok),
+            "train_accuracy": train_acc,
+            "train_logloss": train_logloss,
+        }
+        _emit({"stage": "end_type", "door_type": t, "i": int(i), "total": total_types, "status": "trained"})
+
+    report["duration_s"] = float(max(0.0, time.time() - started_at))
+    return report
 
 
 def main() -> None:

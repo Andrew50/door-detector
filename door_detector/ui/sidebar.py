@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import html
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -202,11 +203,10 @@ def sidebar_library(lib: Library) -> None:
     untrained = max(0, int(total_samples) - int(last_trained_total))
 
     st.sidebar.markdown("**Model training**")
-    st.sidebar.caption(f"Untrained samples: **{untrained}**")
-    st.sidebar.caption(f"Total samples: **{total_samples}** (across {num_label_files} PDF(s))")
+    st.sidebar.caption(f"**{untrained} / {total_samples}** untrained")
 
     train_disabled = total_samples <= 0
-    if st.sidebar.button(
+    train_clicked = st.sidebar.button(
         "Train Model",
         key="train_model_sidebar_btn",
         use_container_width=True,
@@ -216,11 +216,49 @@ def sidebar_library(lib: Library) -> None:
             if untrained > 0
             else "Fits per-type reweighters from all saved labels in the library (no new samples since last retrain)."
         ),
-    ):
+    )
+
+    # Result output should appear directly under the button, and not persist across reruns.
+    result_box = st.sidebar.container()
+
+    if train_clicked:
         with st.sidebar:
             with st.spinner("Training..."):
                 before = _models_signature(models_dir)
-                fit_reweighter(artifacts_root, models_dir)
+                progress = st.progress(0, text="Collecting labeled examples…")
+                live = st.empty()
+                last_lines: list[str] = []
+
+                def _cb(ev: Dict[str, Any]) -> None:
+                    try:
+                        stage = str(ev.get("stage") or "")
+                        t = str(ev.get("door_type") or "")
+                        i = int(ev.get("i") or 0)
+                        total = int(ev.get("total") or 0)
+                        done = i + (1 if stage == "end_type" else 0)
+                        pct = int(round(100.0 * float(done) / float(max(1, total))))
+                        if stage in ("start_type", "end_type") and t:
+                            status = str(ev.get("status") or "")
+                            if stage == "start_type":
+                                last_lines.append(f"{t.capitalize()}…")
+                            else:
+                                last_lines.append(f"{t.capitalize()}: {status or 'done'}")
+                            # Clip long lines in narrow sidebars.
+                            clipped = "\n".join(
+                                f"<div style='white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>{html.escape(x)}</div>"
+                                for x in last_lines[-6:]
+                            )
+                            live.markdown(clipped, unsafe_allow_html=True)
+                        progress.progress(min(100, max(0, pct)), text=f"Training progress: {pct}%")
+                    except Exception:
+                        return
+
+                report = fit_reweighter(artifacts_root, models_dir, progress_cb=_cb)
+                try:
+                    progress.empty()
+                    live.empty()
+                except Exception:
+                    pass
                 after = _models_signature(models_dir)
                 updated = False
                 try:
@@ -231,13 +269,72 @@ def sidebar_library(lib: Library) -> None:
 
                 if updated:
                     _save_last_trained_total_samples(models_dir=models_dir, total_samples=total_samples)
-                    st.success("Model updated!")
-                else:
-                    st.warning("Training ran, but no new model was written (need more labeled samples).")
+
+                # Render concise results directly under the button.
+                with result_box:
+                    by_type = report.get("by_type") if isinstance(report, dict) else None
+                    types = report.get("types") if isinstance(report, dict) else None
+                    if not (isinstance(by_type, dict) and isinstance(types, list) and types):
+                        st.error("Training failed.")
+                    else:
+                        thresholds = report.get("thresholds") if isinstance(report, dict) else None
+                        min_pos = int((thresholds or {}).get("min_pos") or 0) if isinstance(thresholds, dict) else 0
+                        min_neg = int((thresholds or {}).get("min_neg") or 0) if isinstance(thresholds, dict) else 0
+                        min_samples = int((thresholds or {}).get("min_samples") or 0) if isinstance(thresholds, dict) else 0
+
+                        lines: list[str] = []
+                        for t in types:
+                            tr = by_type.get(t) if isinstance(by_type.get(t), dict) else {}
+                            status = str(tr.get("status") or "unknown")
+                            reason = str(tr.get("reason") or "")
+                            label = f"{str(t).capitalize()}:"
+
+                            if status == "trained":
+                                acc = tr.get("train_accuracy")
+                                if isinstance(acc, (int, float)):
+                                    lines.append(f"{label} score = {float(acc):.2f}")
+                                else:
+                                    lines.append(f"{label} score = n/a")
+                                continue
+
+                            # Compute "need more" messaging when training didn't write a model.
+                            if reason in ("not_enough_samples", "no_labeled_samples"):
+                                n = int(tr.get("num_samples") or 0)
+                                n_pos = int(tr.get("num_pos") or 0)
+                                n_neg = int(tr.get("num_neg") or 0)
+                                need_pos = max(0, int(min_pos) - int(n_pos))
+                                need_neg = max(0, int(min_neg) - int(n_neg))
+                                need_total = max(0, int(min_samples) - int(n))
+
+                                if need_pos > 0 and need_pos >= need_neg:
+                                    lines.append(f"{label} Need {need_pos} more positive samples")
+                                elif need_neg > 0:
+                                    lines.append(f"{label} Need {need_neg} more negative samples")
+                                elif need_total > 0:
+                                    lines.append(f"{label} Need {need_total} more samples")
+                                else:
+                                    lines.append(f"{label} Not enough samples")
+                                continue
+
+                            if reason == "no_labels":
+                                lines.append(f"{label} No labels yet")
+                                continue
+
+                            if status == "skipped":
+                                lines.append(f"{label} Skipped")
+                                continue
+
+                            lines.append(f"{label} {status}")
+
+                        # Single-line per type, clipped if sidebar is narrow.
+                        clipped = "\n".join(
+                            f"<div style='white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>{html.escape(x)}</div>"
+                            for x in lines
+                        )
+                        st.markdown(clipped, unsafe_allow_html=True)
         st.cache_data.clear()
         try:
             st.cache_resource.clear()
         except Exception:
             pass
-        st.rerun()
 
