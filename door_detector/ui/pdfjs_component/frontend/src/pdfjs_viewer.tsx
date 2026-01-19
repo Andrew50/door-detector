@@ -1198,8 +1198,37 @@ export function PdfJsViewer(props: ComponentProps) {
       renderedIds.add(String(d.id));
     }
 
-    // Intentionally no console warnings here (noise). If the selected door cannot be
-    // highlighted due to missing/invalid bboxes, prefer server-side snapshots.
+    // Confirm/deny debugging: detect mismatches where the selected id can't be highlighted.
+    try {
+      const sid = selectedDoorId ? String(selectedDoorId) : "";
+      if (sid && viewerDisplayMode !== "off") {
+        const missingFromOverlay = !overlayIdsAll.has(sid);
+        const missingFromRendered = overlayIdsAll.has(sid) && !renderedIds.has(sid);
+        if (missingFromOverlay || missingFromRendered) {
+          const k = `__door_detectorConfirmSelectedMissing_${fileId}_${pdfHash}_${sid}_${viewerDisplayMode}_${missingFromOverlay ? "no_overlay" : "not_rendered"}`;
+          const already = (window as any)[k] === true;
+          if (!already) {
+            (window as any)[k] = true;
+            // eslint-disable-next-line no-console
+            console.log("[door_detector] confirm_debug selected_missing", {
+              fileId,
+              pdfHash,
+              pageNumber,
+              selectedDoorId: sid,
+              viewerDisplayMode,
+              overlayDoorsLen: overlayDoors.length,
+              overlayContainsSelected: overlayIdsAll.has(sid),
+              renderedContainsSelected: renderedIds.has(sid),
+              confirmedLen: confirmedSet.size,
+              deletedLen: deletedSet.size,
+              ts: Date.now(),
+            });
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
 
     // 2) Proposal/cycling overlays (always-on) + optional server overlays.
     const manualLayer = ensureLayer("pz_manual");
@@ -1487,11 +1516,32 @@ export function PdfJsViewer(props: ComponentProps) {
       const sig = `${fileId}::${pdfHash}::sel=${String(selectedDoorId ?? "")}::c=${confirmedSet.size}::d=${deletedSet.size}::ov=${overlayDoors.length}::mode=${viewerDisplayMode}`;
       if (sig === lastStyleSigRef.current) return;
       lastStyleSigRef.current = sig;
+
+      const sid = selectedDoorId ? String(selectedDoorId) : "";
+      let selectedOverlay: any = null;
+      try {
+        if (sid) {
+          const od = overlayDoors.find((d) => String((d as any)?.id ?? "") === sid) as any;
+          const bb = od?.bbox_pdf_xyxy && Array.isArray(od.bbox_pdf_xyxy) ? (normalizeBBox(od.bbox_pdf_xyxy) as BBox) : null;
+          const vp = viewportRef.current;
+          selectedOverlay = bb
+            ? {
+                id: sid,
+                bbox_pdf_xyxy: bb,
+                bbox_viewport_xyxy: vp ? (pdfBBoxToViewportBBox(vp, bb) as BBox) : null,
+              }
+            : null;
+        }
+      } catch {
+        selectedOverlay = null;
+      }
+
       // eslint-disable-next-line no-console
       console.log("[door_detector] confirm_debug style_inputs", {
         fileId,
         pdfHash,
-        selectedDoorId: selectedDoorId ? String(selectedDoorId) : "",
+        selectedDoorId: sid,
+        selectedOverlay,
         confirmedLen: confirmedSet.size,
         deletedLen: deletedSet.size,
         overlayDoorsLen: overlayDoors.length,

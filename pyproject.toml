@@ -16,6 +16,12 @@ dependencies = [
     "streamlit-drawable-canvas==0.9.3",
 ]
 
+[project.optional-dependencies]
+# Dev/test tooling (optional): `pip install -e ".[dev]"`
+dev = [
+    "pytest",
+]
+
 [project.scripts]
 door-detector-step1 = "door_detector.step1_pipeline:main"
 door-detector-step2 = "door_detector.step2_pipeline:main"

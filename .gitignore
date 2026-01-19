@@ -48,3 +48,8 @@ Thumbs.db
 node_modules/
 .npm-cache/
 _npm_cache/
+
+# Allow committing the bundled PDF.js component build output.
+# (Repo-wide `dist/` is ignored above; this is an explicit exception.)
+!door_detector/ui/pdfjs_component/frontend/dist/
+!door_detector/ui/pdfjs_component/frontend/dist/**

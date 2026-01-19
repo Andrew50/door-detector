@@ -587,6 +587,7 @@ def _process_draw_event_if_any(
         return
     event_id = evt.get("event_id")
     bbox_pdf = evt.get("bbox_pdf_xyxy")
+    bbox_xyxy = evt.get("bbox_xyxy")
     snapped_candidate_id = evt.get("snapped_candidate_id")
     if not event_id:
         return
@@ -612,25 +613,33 @@ def _process_draw_event_if_any(
         },
     )
 
+    drawn_full = None
     # PDF.js emits bbox_pdf_xyxy in PDF coords; convert PDF → pixel using Step1 transform.
-    if not (isinstance(bbox_pdf, list) and len(bbox_pdf) == 4):
-        return
-    try:
-        with perf_span("ui.draw_event.pdf_to_pix", file_id=str(file_id), event_id=str(event_id)):
-            tpath = file_dir / "transform.json"
-            tob = json.loads(tpath.read_text()) if tpath.exists() else {}
-            m = tob.get("pdf_to_pix_affine") if isinstance(tob, dict) else None
-            cb = tob.get("cropbox") if isinstance(tob, dict) else None
-            if not (isinstance(m, list) and len(m) == 6 and isinstance(cb, dict)):
-                return
-            # `pdf_to_pix_affine` expects fitz coordinates (Y-down). The PDF.js viewer emits
-            # PDF-spec coords (Y-up). Use our shared conversion logic which also handles
-            # "centered" PDF page boxes (negative coords) correctly.
-            from door_detector.pdf.affine import pdfjs_bbox_to_fitz_bbox_xyxy
+    if isinstance(bbox_pdf, list) and len(bbox_pdf) == 4:
+        try:
+            with perf_span("ui.draw_event.pdf_to_pix", file_id=str(file_id), event_id=str(event_id)):
+                tpath = file_dir / "transform.json"
+                tob = json.loads(tpath.read_text()) if tpath.exists() else {}
+                m = tob.get("pdf_to_pix_affine") if isinstance(tob, dict) else None
+                cb = tob.get("cropbox") if isinstance(tob, dict) else None
+                if not (isinstance(m, list) and len(m) == 6 and isinstance(cb, dict)):
+                    return
+                # `pdf_to_pix_affine` expects fitz coordinates (Y-down). The PDF.js viewer emits
+                # PDF-spec coords (Y-up). Use our shared conversion logic which also handles
+                # "centered" PDF page boxes (negative coords) correctly.
+                from door_detector.pdf.affine import pdfjs_bbox_to_fitz_bbox_xyxy
 
-            bbox_fitz = pdfjs_bbox_to_fitz_bbox_xyxy([float(v) for v in bbox_pdf], cropbox=cb)
-            drawn_full = _apply_affine_bbox_xyxy(m, bbox_fitz)
-    except Exception:
+                bbox_fitz = pdfjs_bbox_to_fitz_bbox_xyxy([float(v) for v in bbox_pdf], cropbox=cb)
+                drawn_full = _apply_affine_bbox_xyxy(m, bbox_fitz)
+        except Exception:
+            return
+    # Legacy viewer emits pixel-space bbox directly.
+    elif isinstance(bbox_xyxy, list) and len(bbox_xyxy) == 4:
+        try:
+            drawn_full = [float(v) for v in bbox_xyxy]
+        except Exception:
+            return
+    else:
         return
 
     full_w = full_dims[0] if full_dims else None
@@ -1618,6 +1627,19 @@ def main() -> None:
                             "door_in_hidden": bool(act_id and act_id in hidden_ids_now),
                             "door_in_active": bool(act_id and act_id in active_ids_now),
                             "door_in_all_active": bool(act_id and act_id in all_ids_now),
+                            "expected": {
+                                "door_in_confirmed": bool(str((act or {}).get("action") or "") == "confirm"),
+                                "door_in_hidden": bool(str((act or {}).get("action") or "") == "not_a_door_at_all"),
+                                "door_in_active": (
+                                    False
+                                    if str((act or {}).get("action") or "") == "not_a_door_at_all"
+                                    else (
+                                        False
+                                        if (str((act or {}).get("action") or "") == "confirm" and str(selected_filter) == "Unconfirmed")
+                                        else None
+                                    )
+                                ),
+                            },
                             "door_obj": (
                                 {
                                     "id": str(act_obj.get("id") or ""),

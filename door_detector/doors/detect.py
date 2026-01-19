@@ -1636,6 +1636,7 @@ def detect_swing_leaf_only_candidates(
     line_index: SpatialIndex,
     config: Dict[str, Any],
     line_indices: Optional[List[int]] = None,
+    debug_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Leaf-only swing candidates for cases where the arc is missing/raster.
 
@@ -1717,10 +1718,13 @@ def detect_swing_leaf_only_candidates(
         probe = max(float(corner_probe), float(snap_soft))
         q = [x - probe, y - probe, x + probe, y + probe]
         neigh = line_index.query(q)
-        has_h = False
-        has_v = False
-        has_h_strict = False
-        has_v_strict = False
+        # Aggregate support length (more robust than per-segment gates).
+        # Some plans represent walls as many short segments (often thin), so requiring
+        # a single long segment can miss real hinges.
+        sum_h_len_soft = 0.0
+        sum_v_len_soft = 0.0
+        sum_h_len_strict = 0.0
+        sum_v_len_strict = 0.0
         min_dist_any = float("inf")
         min_dist_support = float("inf")
         for j in neigh:
@@ -1732,14 +1736,17 @@ def detect_swing_leaf_only_candidates(
             p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
             p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
             L = float(dist_point_to_point(p0, p1))
-            # Allow thick, short wall fragments to count as support.
+            # Ignore extremely short segments; they are too noisy as "wall support".
+            # We still allow many short-ish segments to accumulate into support evidence.
+            if L < float(wall_support_min_len):
+                continue
+            # Weight thicker segments higher: thick wall edges are more reliable support
+            # than thin annotation strokes.
             try:
                 sw = float(ln.get("stroke_width") or 0.0)
             except Exception:
                 sw = 0.0
-            min_len_req = float(wall_support_min_len) if (sw >= wall_support_min_stroke) else float(min_axis_support_len)
-            if L < min_len_req:
-                continue
+            w = 1.0 if sw >= float(wall_support_min_stroke) else 0.5
             dx = p1[0] - p0[0]
             dy = p1[1] - p0[1]
             is_h, is_v = _is_axis_aligned(dx, dy)
@@ -1755,15 +1762,22 @@ def detect_swing_leaf_only_candidates(
             min_dist_support = min(min_dist_support, dseg)
 
             if is_h:
-                has_h = True
+                sum_h_len_soft += w * L
                 if dseg <= snap_strict:
-                    has_h_strict = True
+                    sum_h_len_strict += w * L
             if is_v:
-                has_v = True
+                sum_v_len_soft += w * L
                 if dseg <= snap_strict:
-                    has_v_strict = True
-            if has_h and has_v and has_h_strict and has_v_strict:
+                    sum_v_len_strict += w * L
+
+            # Early exit once we have strong support in both directions.
+            if sum_h_len_strict >= float(min_axis_support_len) and sum_v_len_strict >= float(min_axis_support_len):
                 break
+
+        has_h = bool(sum_h_len_soft >= float(min_axis_support_len))
+        has_v = bool(sum_v_len_soft >= float(min_axis_support_len))
+        has_h_strict = bool(sum_h_len_strict >= float(min_axis_support_len))
+        has_v_strict = bool(sum_v_len_strict >= float(min_axis_support_len))
 
         score = int(has_h) + int(has_v)
         strength = "none"
@@ -1776,19 +1790,37 @@ def detect_swing_leaf_only_candidates(
             "has_v": bool(has_v),
             "has_h_strict": bool(has_h_strict),
             "has_v_strict": bool(has_v_strict),
+            "sum_h_len_soft": float(sum_h_len_soft),
+            "sum_v_len_soft": float(sum_v_len_soft),
+            "sum_h_len_strict": float(sum_h_len_strict),
+            "sum_v_len_strict": float(sum_v_len_strict),
             "min_dist_any": float(min_dist_any) if math.isfinite(min_dist_any) else None,
             "min_dist_support": float(min_dist_support) if math.isfinite(min_dist_support) else None,
         }
 
     out: List[Dict[str, Any]] = []
+    # Optional debug counters (for unmatched debug reports).
+    dbg_counts: Dict[str, int] = {
+        "scanned_lines": 0,
+        "skipped_dashed": 0,
+        "skipped_len": 0,
+        "skipped_axis_aligned": 0,
+        "skipped_no_support": 0,
+        "skipped_midwall_tip_clearance": 0,
+        "skipped_midwall_angle_to_wall": 0,
+        "candidates_emitted": 0,
+    }
+    dbg_examples: Dict[str, List[Dict[str, Any]]] = {"no_support": [], "midwall_tip_clearance": [], "midwall_angle_to_wall": []}
     scan = line_indices if isinstance(line_indices, list) else list(range(len(lines)))
     for l_idx in scan:
+        dbg_counts["scanned_lines"] += 1
         try:
             ln = lines[int(l_idx)]
         except Exception:
             continue
         try:
             if _is_dashed_primitive(ln):
+                dbg_counts["skipped_dashed"] += 1
                 continue
             p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
             p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
@@ -1796,12 +1828,14 @@ def detect_swing_leaf_only_candidates(
             continue
         L = float(dist_point_to_point(p0, p1))
         if not (min_len <= L <= max_len):
+            dbg_counts["skipped_len"] += 1
             continue
         dx = p1[0] - p0[0]
         dy = p1[1] - p0[1]
         # Leaf line should be noticeably non-axis-aligned.
         is_h, is_v = _is_axis_aligned(dx, dy)
         if is_h or is_v:
+            dbg_counts["skipped_axis_aligned"] += 1
             continue
 
         sup0 = _axis_support(p0, skip_idx=l_idx)
@@ -1809,6 +1843,21 @@ def detect_swing_leaf_only_candidates(
         s0 = int(sup0.get("score") or 0)
         s1 = int(sup1.get("score") or 0)
         if s0 <= 0 and s1 <= 0:
+            dbg_counts["skipped_no_support"] += 1
+            try:
+                if len(dbg_examples["no_support"]) < 6:
+                    dbg_examples["no_support"].append(
+                        {
+                            "l_idx": int(l_idx),
+                            "leaf_len_px": float(L),
+                            "p0": [float(p0[0]), float(p0[1])],
+                            "p1": [float(p1[0]), float(p1[1])],
+                            "sup0": sup0,
+                            "sup1": sup1,
+                        }
+                    )
+            except Exception:
+                pass
             continue
 
         # Prefer a hinge endpoint with stronger axis support. Tie-break by proximity to support.
@@ -1842,6 +1891,22 @@ def detect_swing_leaf_only_candidates(
             except Exception:
                 tip_any_f = float("inf")
             if not (tip_any_f >= hinge_any_f + float(min_tip_clearance_px)):
+                dbg_counts["skipped_midwall_tip_clearance"] += 1
+                try:
+                    if len(dbg_examples["midwall_tip_clearance"]) < 6:
+                        dbg_examples["midwall_tip_clearance"].append(
+                            {
+                                "l_idx": int(l_idx),
+                                "leaf_len_px": float(L),
+                                "hinge_any_dist": float(hinge_any_f) if math.isfinite(hinge_any_f) else None,
+                                "tip_any_dist": float(tip_any_f) if math.isfinite(tip_any_f) else None,
+                                "min_tip_clearance_px": float(min_tip_clearance_px),
+                                "hinge_sup": hinge_sup,
+                                "tip_sup": tip_sup,
+                            }
+                        )
+                except Exception:
+                    pass
                 continue
 
             # Angle-to-wall gating.
@@ -1852,11 +1917,43 @@ def detect_swing_leaf_only_candidates(
                 # Horizontal wall: leaf must not be near-horizontal.
                 parallel_err = min(ang, 180.0 - ang)
                 if parallel_err < float(min_leaf_to_wall_angle_deg):
+                    dbg_counts["skipped_midwall_angle_to_wall"] += 1
+                    try:
+                        if len(dbg_examples["midwall_angle_to_wall"]) < 6:
+                            dbg_examples["midwall_angle_to_wall"].append(
+                                {
+                                    "l_idx": int(l_idx),
+                                    "leaf_len_px": float(L),
+                                    "wall_axis": "horizontal",
+                                    "leaf_angle_deg": float(ang),
+                                    "parallel_err_deg": float(parallel_err),
+                                    "min_leaf_to_wall_angle_deg": float(min_leaf_to_wall_angle_deg),
+                                    "hinge_sup": hinge_sup,
+                                }
+                            )
+                    except Exception:
+                        pass
                     continue
             elif has_v_wall and not has_h_wall:
                 # Vertical wall: leaf must not be near-vertical.
                 parallel_err = abs(ang - 90.0)
                 if parallel_err < float(min_leaf_to_wall_angle_deg):
+                    dbg_counts["skipped_midwall_angle_to_wall"] += 1
+                    try:
+                        if len(dbg_examples["midwall_angle_to_wall"]) < 6:
+                            dbg_examples["midwall_angle_to_wall"].append(
+                                {
+                                    "l_idx": int(l_idx),
+                                    "leaf_len_px": float(L),
+                                    "wall_axis": "vertical",
+                                    "leaf_angle_deg": float(ang),
+                                    "parallel_err_deg": float(parallel_err),
+                                    "min_leaf_to_wall_angle_deg": float(min_leaf_to_wall_angle_deg),
+                                    "hinge_sup": hinge_sup,
+                                }
+                            )
+                    except Exception:
+                        pass
                     continue
             # If both wall directions are present, treat as a corner and skip angle gating.
 
@@ -1889,9 +1986,42 @@ def detect_swing_leaf_only_candidates(
                 "primitives": {"lines": [int(l_idx)]},
             }
         )
+        dbg_counts["candidates_emitted"] += 1
 
     out.sort(key=lambda c: float(c.get("confidence", 0.0) or 0.0), reverse=True)
-    return out[: max(0, max_out)]
+    out2 = out[: max(0, max_out)]
+    if isinstance(debug_out, dict):
+        try:
+            debug_out.clear()
+            debug_out.update(
+                {
+                    "enabled": True,
+                    "params": {
+                        "min_leaf_length_px": float(min_len),
+                        "max_leaf_length_px": float(max_len),
+                        "corner_probe_px": float(corner_probe),
+                        "corner_endpoint_snap_px": float(corner_endpoint_snap),
+                        "min_axis_support_length_px": float(min_axis_support_len),
+                        "wall_support_min_stroke_width": float(wall_support_min_stroke),
+                        "wall_support_min_segment_length_px": float(wall_support_min_len),
+                        "axis_alignment_ratio": float(axis_ratio),
+                        "pad_frac_of_length": float(pad_frac),
+                        "max_candidates": int(max_out),
+                        "min_tip_clearance_px": float(min_tip_clearance_px),
+                        "min_leaf_to_wall_angle_deg": float(min_leaf_to_wall_angle_deg),
+                    },
+                    "counts": {k: int(v) for k, v in dbg_counts.items()},
+                    "examples": dbg_examples,
+                    "emitted_sample": [
+                        {"id": str(c.get("id") or ""), "bbox_xyxy": c.get("bbox_xyxy"), "features": c.get("features")}
+                        for c in out2[:5]
+                        if isinstance(c, dict)
+                    ],
+                }
+            )
+        except Exception:
+            pass
+    return out2
 
 
 def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2751,6 +2881,7 @@ def debug_explain_unmatched_box(
     # Leaf-only swing candidates (when enabled): quick signal for cases where the leaf is vector
     # but arcs are missing/rasterized. Evaluate only within ROI-adjacent lines to keep this fast.
     leaf_only_near: List[Dict[str, Any]] = []
+    leaf_only_dbg: Dict[str, Any] = {}
     try:
         leaf_only_conf = (swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}
         if bool(leaf_only_conf.get("enabled", False)):
@@ -2761,10 +2892,11 @@ def debug_explain_unmatched_box(
                 scan_lines=int(len(scan_idx)),
             ):
                 leaf_only_near = detect_swing_leaf_only_candidates(
-                    lines=lines, line_index=line_index, config=config, line_indices=scan_idx
+                    lines=lines, line_index=line_index, config=config, line_indices=scan_idx, debug_out=leaf_only_dbg
                 )
     except Exception:
         leaf_only_near = []
+        leaf_only_dbg = {}
 
     # Compute circle-cluster suppression over *near* arcs (bezier + polyline) so the debug report
     # can explain why an arc was filtered. (Scope is near-ROI; this is sufficient for label bubbles.)
@@ -3301,6 +3433,7 @@ def debug_explain_unmatched_box(
                     for c in (leaf_only_near[: max(0, min(int(max_examples), 5))])
                     if isinstance(c, dict)
                 ],
+                "debug": leaf_only_dbg if isinstance(leaf_only_dbg, dict) and leaf_only_dbg else None,
             },
             "leaf_pairings_verbose": {
                 "count": int(len(verbose_pairings)),
@@ -3406,13 +3539,23 @@ def debug_explain_unmatched_box(
         # polyline arcs exist but there are no bezier primitives near the ROI.
         # Only call this "no_arc_primitives" when there truly is no arc geometry nearby.
         # If polyline arc candidates exist but fail thresholds, prefer the threshold-based diagnosis below.
+        leaf_only_enabled = bool(((swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}).get("enabled", False))
+        leaf_only_count = int(len(leaf_only_near))
+
         if beziers_near <= 0 and len(poly_arcs) <= 0 and int(arc_pass_near) <= 0 and int(poly_pass) <= 0 and non_dashed_non_axis > 0:
             primary = "no_arc_primitives_near_roi"
-            hint = (
-                "No bezier arc primitives near ROI, but diagonal (leaf-like) linework exists. "
-                "If the swing arc is missing/rasterized, arc-first swing detection cannot produce a `swing` candidate. "
-                "Consider enabling `swing.leaf_only` candidates for snapping/labeling."
-            )
+            if leaf_only_enabled and leaf_only_count <= 0:
+                hint = (
+                    "No bezier arc primitives near ROI, but diagonal (leaf-like) linework exists. "
+                    "`swing.leaf_only` is enabled but produced 0 candidates near this ROI (see `summary.top_leaf_only_fail`). "
+                    "This usually means the leaf line's hinge endpoint lacked sufficient nearby axis-aligned wall support."
+                )
+            else:
+                hint = (
+                    "No bezier arc primitives near ROI, but diagonal (leaf-like) linework exists. "
+                    "If the swing arc is missing/rasterized, arc-first swing detection cannot produce a `swing` candidate. "
+                    "Consider enabling `swing.leaf_only` candidates for snapping/labeling."
+                )
         elif beziers_near <= 0 and int(poly_pass) <= 0 and len(poly_arcs) <= 0 and non_dashed_non_axis <= 0:
             primary = "no_vector_arc_or_leaf_near_roi"
             hint = (
@@ -3466,6 +3609,7 @@ def debug_explain_unmatched_box(
             },
             "top_leaf_pool_fail": None,
             "top_leaf_strict_fail": None,
+            "top_leaf_only_fail": None,
             "top_arc_fail": top_arc_fail or None,
             "top_polyline_arc_fail": top_poly_fail or None,
         }
@@ -3491,6 +3635,35 @@ def debug_explain_unmatched_box(
 
             report["summary"]["top_leaf_pool_fail"] = _top_fail(pool_fc)
             report["summary"]["top_leaf_strict_fail"] = _top_fail(strict_fc)
+        except Exception:
+            pass
+        try:
+            # Leaf-only failures: expose the most common reason (when enabled).
+            lo = swing.get("leaf_only_near") if isinstance(swing, dict) else None
+            lo_dbg = lo.get("debug") if isinstance(lo, dict) else None
+            lo_counts = lo_dbg.get("counts") if isinstance(lo_dbg, dict) else None
+            if isinstance(lo_counts, dict) and lo_counts:
+                # Prefer "no support" as the main actionable leaf-only failure.
+                order = [
+                    "skipped_no_support",
+                    "skipped_midwall_tip_clearance",
+                    "skipped_midwall_angle_to_wall",
+                    "skipped_len",
+                    "skipped_axis_aligned",
+                    "skipped_dashed",
+                ]
+                best_k = None
+                best_v = 0
+                for k in order:
+                    try:
+                        iv = int(lo_counts.get(k, 0) or 0)
+                    except Exception:
+                        iv = 0
+                    if iv > best_v:
+                        best_v = iv
+                        best_k = k
+                if best_k and best_v > 0:
+                    report["summary"]["top_leaf_only_fail"] = str(best_k)
         except Exception:
             pass
     except Exception:

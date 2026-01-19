@@ -18,6 +18,12 @@ source venv/bin/activate
 python3 -m pip install -e .
 ```
 
+Optional (dev / tests):
+
+```bash
+python3 -m pip install -e ".[dev]"
+```
+
 More details (incl. troubleshooting / optional PDF.js rebuild notes): see `docs/SETUP.md`.
 
 ## Run (recommended): Streamlit review app
@@ -65,6 +71,12 @@ For detection and learning details, see `docs/door_selection_process.md`.
 
 ```bash
 ./venv/bin/python tests/test_step2_smoke.py
+```
+
+If you prefer `pytest`, install the dev extra and run:
+
+```bash
+pytest -q
 ```
 
 More tests and local workflows: see `docs/TESTING.md`.

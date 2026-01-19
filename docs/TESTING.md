@@ -12,6 +12,11 @@
    ```bash
    pip install -e .
    ```
+
+   Optional (run with `pytest`):
+   ```bash
+   pip install -e ".[dev]"
+   ```
    
    If `pip` is not found, try:
    ```bash

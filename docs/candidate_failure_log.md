@@ -4,6 +4,22 @@ This file records concrete “door looked real but wasn’t in `doors.json["cand
 
 ---
 
+### 2026-01-19 — `f_1768798404156` — arc missing/rasterized; leaf-only enabled but hinge wall-support gate too brittle (thin short wall segments)
+
+- **Symptom (UI)**: Edit Doors → Shift+drag produced:
+  - `snapCandidateForDrawPdf no match (no overlap)`
+  - `unmatched_debug_report.summary.primary_failure: "no_arc_primitives_near_roi"`
+- **What geometry exists** (from `unmatched_debug_report.summary.counts`):
+  - `beziers_near_roi == 0` and `polyline_arc_candidates_near == 0` (no vector arc primitives near ROI)
+  - `non_dashed_non_axis_lines_near_roi > 0` (diagonal “leaf-like” linework exists)
+  - `leaf_only_candidates_near == 0` (leaf-only generator produced nothing in that ROI)
+- **Why it failed to become a candidate**:
+  - Arc-first swing detection requires an arc primitive (bezier or polyline) to seed a candidate; with no arc primitives, no `swing`/`swing_arc` candidate can be created.
+  - `swing.leaf_only` was enabled, but its hinge “wall support” evidence was too brittle when the wall/jamb near the hinge is represented as **many thin short axis-aligned segments**; no endpoint saw a single support segment long enough to satisfy the support gate, so no `swing_leaf` pool candidates were emitted.
+- **Detection change**:
+  - Updated `detect_swing_leaf_only_candidates._axis_support` to use **aggregate axis support length** (sum of nearby axis-aligned segment lengths within the hinge neighborhood), rather than requiring a single long support segment. This improves recall for leaf-only doors while keeping these candidates **pool-only** and low-confidence (snapping/labeling only).
+  - Augmented `unmatched_debug_report` to include `swing.leaf_only_near.debug` and `summary.top_leaf_only_fail` so future cases can immediately report which leaf-only gate blocked candidate creation.
+
 ### 2026-01-19 — (Edit Doors failing door) — swing arc drawn as **dashed polyline segments** → no swing candidate
 
 - **Symptom (UI)**: Edit Doors → Shift+drag around an obvious swing door produced `overlapCandidates: 0` and `snapCandidateForDrawPdf no match (no overlap)`. The intended door did not appear in **Selection matches** because it did not exist in `doors.json["candidates"]`.

@@ -168,7 +168,19 @@ If you run Streamlit directly with `streamlit run ...` and **no** proxy, there i
 
 The review UI uses a bundled **PDF.js** Streamlit component for a crisp, zoomable viewer.
 
-- **If you are just running the app** from this repo: the built component assets are already included; you do **not** need Node.\n+- **If you edit the viewer frontend** (TypeScript/React): rebuild it with Node.\n+\n+Build steps:\n+\n+```bash\n+cd door_detector/ui/pdfjs_component/frontend\n+npm install\n+npm run build\n+```\n+\n+This regenerates `door_detector/ui/pdfjs_component/frontend/dist/`.\n*** End Patch"}}]}%json"}"}"}/**
+- **If you are just running the app**: the UI will use the PDF.js viewer **if** the built assets exist at `door_detector/ui/pdfjs_component/frontend/dist/`.
+- **If the built assets are missing**: the app falls back to the legacy raster viewer (using `page.png` from Step 1). You can still review detections, but the PDF.js-specific overlay path won’t be used.
+- **If you edit the viewer frontend** (TypeScript/React): rebuild it with Node.
+
+Build steps:
+
+```bash
+cd door_detector/ui/pdfjs_component/frontend
+npm install
+npm run build
+```
+
+This regenerates `door_detector/ui/pdfjs_component/frontend/dist/`.
 
 **Streamlit / Drawable Canvas Compatibility (Pinned):**
 This project pins Streamlit to a compatible version because `streamlit-drawable-canvas==0.9.3` relies on Streamlit internals that changed in newer Streamlit releases.

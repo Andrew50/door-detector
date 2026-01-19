@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import logging
 import json
 import shutil
 from pathlib import Path
@@ -19,10 +18,6 @@ from door_detector.ui.labels import (
     migrate_labels_v3_to_v4,
     validate_labels_v4_or_raise,
 )
-
-
-logger = logging.getLogger("door_detector.review_app")
-
 
 def _mtime_ns(p: Path) -> int:
     try:
@@ -187,10 +182,7 @@ def _delete_invalid_library_item(*, file_dir: Path, err: BaseException) -> None:
     from image loading paths where we want to recover gracefully.
     """
     file_id = str(file_dir.name or "")
-    try:
-        logger.warning("Removing invalid library item %s due to preview error: %s", file_id, repr(err))
-    except Exception:
-        pass
+    _ = (file_id, err)  # Logging intentionally suppressed.
 
     # Remove from library index if possible (preferred).
     try:

@@ -78,6 +78,8 @@ High-signal fields:
 - `summary.primary_failure`
 - `summary.counts.beziers_near_roi`
 - `summary.counts.non_dashed_non_axis_lines_near_roi`
+- `summary.counts.leaf_only_candidates_near`
+- `summary.top_leaf_only_fail` (when leaf-only is enabled but produces 0 candidates)
 
 If you see:
 - `summary.primary_failure == "no_vector_arc_or_leaf_near_roi"` **and** both counts above are `0`,
@@ -86,6 +88,7 @@ If you see:
 - `summary.primary_failure == "no_arc_primitives_near_roi"` with `beziers_near_roi == 0` but `non_dashed_non_axis_lines_near_roi > 0`,
   that usually means the **leaf line is vector** but the **arc is missing/rasterized**. In that case, enable (or tune)
   `swing.leaf_only` candidates so the door becomes snap-selectable.
+  - If `swing.leaf_only` is already enabled but `leaf_only_candidates_near == 0`, check `summary.top_leaf_only_fail` and the verbose leaf-only debug block (`swing.leaf_only_near.debug`) to see which leaf-only gate blocked candidate creation (most commonly missing axis-aligned wall support near the hinge).
 
 ### Optional (enable only when needed)
 To enable PDF.js component lifecycle logs:

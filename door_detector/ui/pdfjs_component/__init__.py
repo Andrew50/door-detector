@@ -19,10 +19,23 @@ def _get_build_dir() -> Path:
     return Path(__file__).resolve().parent / "frontend" / "dist"
 
 
+def pdfjs_build_available() -> bool:
+    """Return True if the PDF.js component bundle exists on disk."""
+    try:
+        build_dir = _get_build_dir()
+        return build_dir.exists() and (build_dir / "index.html").exists()
+    except Exception:
+        return False
+
+
 def _declare() -> Any:
+    # This repository prefers bundled mode (no node dev server at runtime).
+    # However, the build output can be missing in some checkouts; in that case
+    # we avoid failing at import time and let the UI fall back to the legacy
+    # raster viewer.
+    if not pdfjs_build_available():
+        return None
     build_dir = _get_build_dir()
-    # We intentionally do not provide a dev-server URL here. This repository
-    # runs the component in bundled mode.
     return components.declare_component(_COMPONENT_NAME, path=str(build_dir))
 
 
@@ -59,6 +72,26 @@ def pdfjs_viewer(
     - {type: "door_click", event_id, door_id, ts}
     - {type: "draw_rect", event_id, bbox_pdf_xyxy, snapped_candidate_id?, ...}
     """
+
+    if _component_func is None:
+        # Keep this extremely small; the real fallback viewer is mounted by `viewer.py`.
+        # (This is just a safety net in case callers use pdfjs_viewer directly.)
+        try:
+            components.html(
+                """
+                <div style="padding: 10px 12px; border: 1px solid rgba(255,255,255,0.16); border-radius: 8px; font-size: 14px;">
+                  <div style="font-weight: 700; margin-bottom: 4px;">PDF.js viewer bundle not found</div>
+                  <div style="opacity: 0.85;">
+                    Build the frontend at <code>door_detector/ui/pdfjs_component/frontend</code> (run <code>npm install</code> then <code>npm run build</code>).
+                  </div>
+                </div>
+                """,
+                height=int(height),
+                scrolling=False,
+            )
+        except Exception:
+            pass
+        return None
 
     return _component_func(
         fileId=str(file_id),

@@ -353,7 +353,8 @@ def main_viewer_controls(
     except Exception:
         last_logged = ""
     if cur_filter != last_logged:
-        _ui_log(
+        # Keep this debug log cheap + visible (without logger config).
+        ui_event_log(
             "door_filter_effective",
             {
                 "file_id": str(file_id),

@@ -17,7 +17,7 @@ from PIL import Image
 
 from door_detector.ui.assets import sidebar_autopen_component_html
 from door_detector.ui.labels import flatten_confirmed_ids, flatten_rejected_ids, get_working_label_state as _get_working_label_state
-from door_detector.ui.pdfjs_component import pdfjs_viewer
+from door_detector.ui.pdfjs_component import pdfjs_build_available, pdfjs_viewer
 from door_detector.pdf.affine import apply_affine_bbox_xyxy, fitz_bbox_to_pdfjs_bbox_xyxy, normalize_bbox_xyxy
 from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids, ui_event_log
 from door_detector.perf import enabled as perf_enabled, span as perf_span, log as perf_log
@@ -599,6 +599,11 @@ def _panzoom_image_viewer(
   }}
   let autoFocus = getAutoFocus();
   let lastUnmatchedDebugRaw = null;
+
+  // Disable legacy viewer console logging by default.
+  // (If you ever need these logs again, set `window.__door_detectorLegacyViewerDebug = true` in the iframe console.)
+  const __door_detectorLegacyViewerDebug = (window.__door_detectorLegacyViewerDebug === true);
+  const console = __door_detectorLegacyViewerDebug ? window.console : {{ log: function(){{}}, warn: function(){{}}, error: function(){{}} }};
 
   try {{
     console.log("[door_detector] pz init", {{
@@ -2437,6 +2442,132 @@ def main_viewer_canvas(
     viewer_display = _viewer_display_mode_to_sink_value(str(fstate.get("viewer_display_mode") or "Highlight All"))
     viewer_key = f"pdfjs_viewer_{file_id}"
     last_ack = str(fstate.get("_last_viewer_event_id") or "")
+
+    # If the bundled PDF.js viewer assets are missing, fall back to the legacy
+    # pan/zoom raster viewer (page.png). This keeps local runs usable even when
+    # the node build output isn't present.
+    if not pdfjs_build_available():
+        # Provide the legacy viewer with the state it expects via hidden sinks.
+        # IMPORTANT: set session_state values *before* the sink widgets are created.
+        sink_values: Dict[str, str] = {}
+        sink_values[f"selected_door_sink_{file_id}"] = str(fstate.get("selected_door_id") or "")
+        sink_values[f"focus_seq_sink_{file_id}"] = str(int(fstate.get("_focus_seq") or 0))
+        sink_values[f"edit_mode_sink_{file_id}"] = "1" if bool(fstate.get("edit_mode")) else "0"
+        sink_values[f"viewer_display_sink_{file_id}"] = str(viewer_display)
+        sink_values[f"auto_focus_sink_{file_id}"] = "1" if bool(fstate.get("auto_focus", True)) else "0"
+        sink_values[f"unmatched_debug_sink_{file_id}"] = str(unmatched_debug_raw or "")
+
+        # Optional: door state + candidate pool help snapping and styling.
+        try:
+            sink_values[f"door_state_sink_{file_id}"] = json.dumps(door_state, separators=(",", ":"))
+        except Exception:
+            sink_values[f"door_state_sink_{file_id}"] = json.dumps({"confirmed_ids": [], "deleted_ids": []}, separators=(",", ":"))
+
+        try:
+            # Legacy viewer expects pixel-space bboxes.
+            pool_src = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
+            slim = []
+            for cand in pool_src[:1200]:
+                if not isinstance(cand, dict):
+                    continue
+                cid = cand.get("id")
+                bb = cand.get("bbox_xyxy")
+                if cid in (None, "") or not (isinstance(bb, list) and len(bb) == 4):
+                    continue
+                feats = cand.get("features") if isinstance(cand, dict) else None
+                slim_feats: Dict[str, Any] = {}
+                if isinstance(feats, dict):
+                    for k in ("arc_only", "angle_span", "radius", "rmse"):
+                        if k in feats:
+                            try:
+                                slim_feats[k] = float(feats.get(k))
+                            except Exception:
+                                continue
+                slim.append({"id": str(cid), "type": str(cand.get("type") or ""), "bbox_xyxy": bb, "features": slim_feats})
+            sink_values[f"candidate_pool_sink_{file_id}"] = json.dumps({"candidates": slim}, separators=(",", ":"))
+        except Exception:
+            sink_values[f"candidate_pool_sink_{file_id}"] = json.dumps({"candidates": []}, separators=(",", ":"))
+
+        # Manual overlays are stored in full-res pixel space in fstate.
+        try:
+            sink_values[f"manual_overlay_sink_{file_id}"] = json.dumps(
+                {
+                    "manual_additions": list((fstate.get("manual_additions") or [])),
+                    "unmatched_manual_boxes": list((fstate.get("unmatched_manual_boxes") or [])),
+                },
+                separators=(",", ":"),
+            )
+        except Exception:
+            sink_values[f"manual_overlay_sink_{file_id}"] = json.dumps({"manual_additions": [], "unmatched_manual_boxes": []}, separators=(",", ":"))
+
+        # Ensure all sink keys exist as widgets so the iframe JS can write into them.
+        sink_keys = [
+            f"door_click_sink_{file_id}",
+            f"selected_door_sink_{file_id}",
+            f"focus_seq_sink_{file_id}",
+            f"edit_mode_sink_{file_id}",
+            f"draw_event_sink_{file_id}",
+            f"manual_overlay_sink_{file_id}",
+            f"door_state_sink_{file_id}",
+            f"viewer_display_sink_{file_id}",
+            f"auto_focus_sink_{file_id}",
+            f"unmatched_debug_sink_{file_id}",
+            f"candidate_pool_sink_{file_id}",
+        ]
+        try:
+            for sk in sink_keys:
+                if sk in sink_values:
+                    st.session_state[str(sk)] = str(sink_values[sk])
+        except Exception:
+            pass
+        try:
+            for sk in sink_keys:
+                st.text_input(str(sk), key=str(sk), label_visibility="collapsed")
+        except Exception:
+            pass
+
+        page_png = file_dir / "page.png"
+        if not page_png.exists():
+            components.html(sidebar_autopen_component_html(), height=1, scrolling=False)
+            st.info(
+                "PDF.js viewer assets are not built (missing `door_detector/ui/pdfjs_component/frontend/dist/`). "
+                "To enable the crisp PDF viewer, run `npm install` + `npm run build` in "
+                "`door_detector/ui/pdfjs_component/frontend/`. Alternatively, run Step 1 to produce `page.png` "
+                "and the app will use the legacy raster viewer."
+            )
+            return None, active_doors
+
+        try:
+            img = Image.open(page_png)
+            img_w, img_h = int(img.width), int(img.height)
+            try:
+                img.close()
+            except Exception:
+                pass
+        except Exception:
+            img_w, img_h = (int(full_dims[0]) if full_dims else 0), (int(full_dims[1]) if full_dims else 0)
+        img_src = _image_path_to_streamlit_url(str(page_png))
+        rects_svg = _rects_to_svg(active_doors=active_doors or [], fstate=fstate, scale=1.0, img_width=img_w, img_height=img_h)
+        _panzoom_image_viewer(
+            img_src=str(img_src),
+            img_width=int(img_w),
+            img_height=int(img_h),
+            rects_svg=str(rects_svg),
+            height=int(viewer_height),
+            key=f"legacy_{file_id}",
+            click_sink_aria_label=f"door_click_sink_{file_id}",
+            selected_sink_aria_label=f"selected_door_sink_{file_id}",
+            focus_seq_sink_aria_label=f"focus_seq_sink_{file_id}",
+            edit_mode_sink_aria_label=f"edit_mode_sink_{file_id}",
+            draw_event_sink_aria_label=f"draw_event_sink_{file_id}",
+            manual_overlay_sink_aria_label=f"manual_overlay_sink_{file_id}",
+            door_state_sink_aria_label=f"door_state_sink_{file_id}",
+            viewer_display_sink_aria_label=f"viewer_display_sink_{file_id}",
+            auto_focus_sink_aria_label=f"auto_focus_sink_{file_id}",
+            unmatched_debug_sink_aria_label=f"unmatched_debug_sink_{file_id}",
+            candidate_pool_sink_aria_label=f"candidate_pool_sink_{file_id}",
+        )
+        return None, active_doors
 
     push_breadcrumb(
         fstate,
