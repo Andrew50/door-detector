@@ -50,6 +50,39 @@ def _debug_log(msg: str, *args: Any) -> None:
         return
 
 
+def _bbox_intersects_bounds_xyxy(bbox_xyxy: List[float], bounds_xyxy: List[float], *, tol: float = 0.0) -> bool:
+    """Return True if bbox intersects bounds (with tolerance)."""
+    try:
+        x0, y0, x1, y1 = [float(v) for v in bbox_xyxy]
+        bx0, by0, bx1, by1 = [float(v) for v in bounds_xyxy]
+    except Exception:
+        return False
+    if not all(map(math.isfinite, [x0, y0, x1, y1, bx0, by0, bx1, by1])):
+        return False
+    x0, x1 = (min(x0, x1), max(x0, x1))
+    y0, y1 = (min(y0, y1), max(y0, y1))
+    bx0, bx1 = (min(bx0, bx1), max(bx0, bx1))
+    by0, by1 = (min(by0, by1), max(by0, by1))
+    # No overlap if one is strictly to the left/right/above/below.
+    if x1 < bx0 - tol or x0 > bx1 + tol:
+        return False
+    if y1 < by0 - tol or y0 > by1 + tol:
+        return False
+    return True
+
+
+def _bbox_l1_distance(a: List[float], b: List[float]) -> float:
+    """Cheap distance metric for bbox similarity (order-insensitive)."""
+    try:
+        ax0, ay0, ax1, ay1 = [float(v) for v in a]
+        bx0, by0, bx1, by1 = [float(v) for v in b]
+    except Exception:
+        return float("inf")
+    if not all(map(math.isfinite, [ax0, ay0, ax1, ay1, bx0, by0, bx1, by1])):
+        return float("inf")
+    return abs(ax0 - bx0) + abs(ay0 - by0) + abs(ax1 - bx1) + abs(ay1 - by1)
+
+
 def _coerce_bool(v: Any, *, default: bool = False) -> bool:
     """Best-effort boolean coercion for values coming from Streamlit/session_state."""
     if isinstance(v, bool):
@@ -777,6 +810,9 @@ def _panzoom_image_viewer(
   let deletedSet = new Set();
   let lastViewerDisplay = null;
   let lastEditEnabled = null;
+  // Option A: do not maintain an optimistic local selection.
+  // Highlight should always reflect the Streamlit-canonical selection sink so
+  // right-panel actions can never apply to a different door than what's highlighted.
   let localSelectedId = null;
 
   function updateDoorStateFromSinks() {{
@@ -793,8 +829,8 @@ def _panzoom_image_viewer(
 
   function applyDoorStyles() {{
     if (!svg) return;
-    // Prefer local selection for immediate feedback; Streamlit selection takes over after rerun.
-    const selectedId = localSelectedId || getSelectedId();
+    // Option A: highlight only the server-canonical selection.
+    const selectedId = getSelectedId();
     const viewMode = getViewerDisplayMode();
 
     const rects = svg.querySelectorAll("rect[data-door-id]");
@@ -1621,10 +1657,8 @@ def _panzoom_image_viewer(
               `snapped (${{snap.id}}, iou=${{snap.iou}})`
             );
             try {{ console.log("[door_detector] draw_rect drew snap overlay", {{ id: snap.id }}); }} catch (_) {{}}
-            // Immediate UX: select the snapped door locally (server selection arrives on rerun).
-            // Auto-focus is suppressed in Edit Doors mode by `getEffectiveAutoFocus()`.
-            localSelectedId = String(snap.id || "");
-            try {{ applyDoorStyles(); }} catch (_) {{}}
+            // Option A: do not optimistically change selection/highlight here.
+            // The rerun will update the selected sink and then the highlight.
           }} catch (_) {{}}
         }} else {{
           try {{ console.log("[door_detector] draw_rect no snap overlay drawn", {{ hasSnap: !!snap, hasTempLayer: !!tempLayer }}); }} catch (_) {{}}
@@ -1745,7 +1779,6 @@ def _panzoom_image_viewer(
     let needsStyle = false;
     if (did !== lastSelectedId) {{
       lastSelectedId = did;
-      localSelectedId = null;
       needsStyle = true;
     }}
     if (viewMode !== lastViewerDisplay) {{
@@ -1805,10 +1838,8 @@ def _panzoom_image_viewer(
       if (!did) return;
       e.preventDefault();
       e.stopPropagation();
-      // Immediate UX: highlight/focus locally without waiting for the rerun.
-      localSelectedId = did;
-      applyDoorStyles();
-      if (getEffectiveAutoFocus()) focusToDoorId(did);
+      // Option A: do not optimistically change highlight/focus here.
+      // Let the rerun update selection + focus sequence.
       setSelectedDoorId(did);
     }});
   }}
@@ -1864,8 +1895,14 @@ def main_viewer_canvas(
 
     # Load Step1 transform so we can compute bbox_pdf_xyxy for any legacy data.
     pix_to_pdf_affine: Optional[List[float]] = None
+    pdf_to_pix_affine: Optional[List[float]] = None
     cropbox_y0 = 0.0
     cropbox_y1 = 0.0
+    cropbox_x0 = 0.0
+    cropbox_x1 = 0.0
+    transform_pix_w: Optional[int] = None
+    transform_pix_h: Optional[int] = None
+    rotation_deg: Optional[int] = None
     doors_schema_version = int(doors_data.get("schema_version") or 1) if isinstance(doors_data, dict) else 1
     try:
         tpath = file_dir / "transform.json"
@@ -1874,13 +1911,27 @@ def main_viewer_canvas(
             m = obj.get("pix_to_pdf_affine") if isinstance(obj, dict) else None
             if isinstance(m, list) and len(m) == 6:
                 pix_to_pdf_affine = [float(v) for v in m]
+            m2 = obj.get("pdf_to_pix_affine") if isinstance(obj, dict) else None
+            if isinstance(m2, list) and len(m2) == 6:
+                pdf_to_pix_affine = [float(v) for v in m2]
             cb = obj.get("cropbox") if isinstance(obj, dict) else None
             if isinstance(cb, dict):
                 try:
+                    cropbox_x0 = float(cb.get("x0", 0.0) or 0.0)
                     cropbox_y0 = float(cb.get("y0", 0.0) or 0.0)
+                    cropbox_x1 = float(cb.get("x1", 0.0) or 0.0)
                     cropbox_y1 = float(cb.get("y1", 0.0) or 0.0)
                 except Exception:
-                    cropbox_y0, cropbox_y1 = 0.0, 0.0
+                    cropbox_x0, cropbox_y0, cropbox_x1, cropbox_y1 = 0.0, 0.0, 0.0, 0.0
+            try:
+                rotation_deg = int(obj.get("rotation_deg")) if isinstance(obj, dict) and obj.get("rotation_deg") is not None else None
+            except Exception:
+                rotation_deg = None
+            try:
+                transform_pix_w = int(obj.get("pix_width")) if isinstance(obj, dict) and obj.get("pix_width") is not None else None
+                transform_pix_h = int(obj.get("pix_height")) if isinstance(obj, dict) and obj.get("pix_height") is not None else None
+            except Exception:
+                transform_pix_w, transform_pix_h = None, None
     except Exception:
         pix_to_pdf_affine = None
 
@@ -1889,6 +1940,30 @@ def main_viewer_canvas(
             try:
                 bb = [float(v) for v in bbox_pdf_xyxy]
                 # Back-compat: schema v1 stored bbox_pdf_xyxy in fitz coords (Y-down).
+                # However, older/corrupt artifacts sometimes have schema_version mismatches.
+                #
+                # If we also have bbox_xyxy + pix_to_pdf_affine, we can infer whether the stored
+                # bbox is closer to fitz coords (Y-down) or PDF coords (Y-up) by comparing against
+                # the computed pixel→fitz bbox.
+                if (
+                    pix_to_pdf_affine is not None
+                    and isinstance(bbox_xyxy, list)
+                    and len(bbox_xyxy) == 4
+                    and (cropbox_y1 > cropbox_y0)
+                ):
+                    try:
+                        bb_pix = normalize_bbox_xyxy(bbox_xyxy)
+                        bb_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, bb_pix)  # Y-down
+                        bb_pdf = flip_bbox_y_xyxy(bb_fitz, y0=cropbox_y0, y1=cropbox_y1)  # Y-up
+                        # Compare stored bbox to both representations.
+                        d_fitz = _bbox_l1_distance(bb, bb_fitz)
+                        d_pdf = _bbox_l1_distance(bb, bb_pdf)
+                        # If stored looks like fitz, flip it for PDF.js.
+                        if d_fitz < d_pdf:
+                            return flip_bbox_y_xyxy(bb, y0=cropbox_y0, y1=cropbox_y1)
+                        return bb
+                    except Exception:
+                        pass
                 if doors_schema_version <= 1:
                     return flip_bbox_y_xyxy(bb, y0=cropbox_y0, y1=cropbox_y1)
                 return bb
@@ -1904,6 +1979,14 @@ def main_viewer_canvas(
         return None
 
     overlay_doors_pdf: List[Dict[str, Any]] = []
+    overlay_debug_meta: Dict[str, Any] = {
+        "doors_schema_version": doors_schema_version,
+        "rotation_deg": rotation_deg,
+        "cropbox": {"x0": cropbox_x0, "y0": cropbox_y0, "x1": cropbox_x1, "y1": cropbox_y1},
+        "transform_pix": {"w": transform_pix_w, "h": transform_pix_h},
+        "has_pix_to_pdf_affine": pix_to_pdf_affine is not None,
+        "has_pdf_to_pix_affine": pdf_to_pix_affine is not None,
+    }
     for d in list(active_doors or []):
         did = d.get("id")
         if did is None:
@@ -1912,6 +1995,87 @@ def main_viewer_canvas(
         if not bb_pdf:
             continue
         overlay_doors_pdf.append({"id": str(did), "bbox_pdf_xyxy": bb_pdf})
+
+    # --- Diagnostics: are overlays landing off-page? ---
+    try:
+        # Prefer full_dims (actual page.png size). Fall back to transform.json.
+        pix_w = int(full_dims[0]) if isinstance(full_dims, tuple) and len(full_dims) == 2 and full_dims[0] is not None else None
+        pix_h = int(full_dims[1]) if isinstance(full_dims, tuple) and len(full_dims) == 2 and full_dims[1] is not None else None
+        if pix_w is None or pix_h is None:
+            pix_w = transform_pix_w
+            pix_h = transform_pix_h
+        pix_bounds = [0.0, 0.0, float(pix_w or 0), float(pix_h or 0)]
+        pdf_bounds = [float(cropbox_x0), float(cropbox_y0), float(cropbox_x1), float(cropbox_y1)]
+
+        # 1) Check pixel-space inputs (are detections already off the rendered raster?)
+        bad_pix = []
+        if (pix_w or 0) > 0 and (pix_h or 0) > 0:
+            for dd in list(active_doors or [])[:200]:
+                bb = dd.get("bbox_xyxy")
+                if not isinstance(bb, list) or len(bb) != 4:
+                    continue
+                nb = _normalize_bbox_xyxy(bb)
+                if nb is None:
+                    continue
+                if not _bbox_intersects_bounds_xyxy(list(nb), pix_bounds, tol=2.0):
+                    bad_pix.append({"id": str(dd.get("id")), "bbox_xyxy": list(nb)})
+                    if len(bad_pix) >= 3:
+                        break
+
+        # 2) Check PDF-space overlays against cropbox bounds.
+        bad_pdf = []
+        if (cropbox_x1 > cropbox_x0) and (cropbox_y1 > cropbox_y0):
+            for dd in overlay_doors_pdf[:400]:
+                bb = dd.get("bbox_pdf_xyxy")
+                if not isinstance(bb, list) or len(bb) != 4:
+                    continue
+                if not _bbox_intersects_bounds_xyxy([float(v) for v in bb], pdf_bounds, tol=0.5):
+                    bad_pdf.append({"id": str(dd.get("id")), "bbox_pdf_xyxy": [float(v) for v in bb]})
+                    if len(bad_pdf) >= 3:
+                        break
+
+        if bad_pix or bad_pdf or ((cropbox_y0 == 0.0 and cropbox_y1 == 0.0) and overlay_doors_pdf):
+            logger.warning(
+                "PDF overlay diagnostics: file_id=%s cropbox=%s rotation=%s schema_v=%s pix_bounds=%s bad_pix=%s bad_pdf=%s",
+                str(file_id),
+                json.dumps(overlay_debug_meta.get("cropbox", {}), sort_keys=True),
+                str(rotation_deg),
+                str(doors_schema_version),
+                json.dumps({"w": pix_w, "h": pix_h}),
+                json.dumps(bad_pix, sort_keys=True),
+                json.dumps(bad_pdf, sort_keys=True),
+            )
+
+        # 3) Sanity-check transform round-trip on a couple of boxes (pixel → fitz → pixel).
+        if pix_to_pdf_affine is not None and pdf_to_pix_affine is not None and (pix_w or 0) > 0 and (pix_h or 0) > 0:
+            max_err = 0.0
+            samples = 0
+            for dd in list(active_doors or [])[:30]:
+                bb = dd.get("bbox_xyxy")
+                if not isinstance(bb, list) or len(bb) != 4:
+                    continue
+                nb = _normalize_bbox_xyxy(bb)
+                if nb is None:
+                    continue
+                try:
+                    bb_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, list(nb))
+                    bb_pix2 = apply_affine_bbox_xyxy(pdf_to_pix_affine, bb_fitz)
+                    err = _bbox_l1_distance(list(nb), bb_pix2)
+                    if math.isfinite(err):
+                        max_err = max(max_err, float(err))
+                        samples += 1
+                except Exception:
+                    continue
+            if samples and max_err > 50.0:
+                logger.warning(
+                    "Transform round-trip large error: file_id=%s max_l1_err=%.1f samples=%d transform_meta=%s",
+                    str(file_id),
+                    float(max_err),
+                    int(samples),
+                    json.dumps(overlay_debug_meta, sort_keys=True),
+                )
+    except Exception:
+        pass
 
     # Candidate pool for snapping (PDF-space bboxes).
     #
@@ -2059,6 +2223,7 @@ def main_viewer_canvas(
     unmatched_debug_raw = str(fstate.get("_last_unmatched_debug") or "")
     viewer_display = _viewer_display_mode_to_sink_value(str(fstate.get("viewer_display_mode") or "Highlight All"))
     viewer_key = f"pdfjs_viewer_{file_id}"
+    last_ack = str(fstate.get("_last_viewer_event_id") or "")
 
     # NOTE: component value is stored in session_state under this key.
     pdfjs_viewer(
@@ -2079,6 +2244,7 @@ def main_viewer_canvas(
         door_state=door_state,
         manual_overlays=manual_payload,
         unmatched_debug_raw=unmatched_debug_raw,
+        last_ack_event_id=last_ack,
         key=viewer_key,
     )
     return None, active_doors

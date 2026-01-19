@@ -48,6 +48,7 @@ def pdfjs_viewer(
     door_state: Optional[Dict[str, Any]] = None,
     manual_overlays: Optional[Dict[str, Any]] = None,
     unmatched_debug_raw: Optional[str] = None,
+    last_ack_event_id: Optional[str] = None,
     key: Optional[str] = None,
 ) -> Any:
     """Render the PDF.js viewer and return the latest emitted event (or None).
@@ -75,6 +76,7 @@ def pdfjs_viewer(
         doorState=dict(door_state or {}),
         manualOverlays=dict(manual_overlays or {}),
         unmatchedDebugRaw=str(unmatched_debug_raw or ""),
+        lastAckEventId=str(last_ack_event_id or ""),
         default=None,
         key=key,
     )

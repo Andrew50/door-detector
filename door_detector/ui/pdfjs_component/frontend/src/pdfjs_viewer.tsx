@@ -102,6 +102,16 @@ function normalizeBBox(b: BBox): BBox {
   return [x0, y0, x1, y1];
 }
 
+function bboxIntersectsBounds(b: BBox, bounds: BBox, tol: number): boolean {
+  const [x0, y0, x1, y1] = normalizeBBox(b);
+  const [bx0, by0, bx1, by1] = normalizeBBox(bounds);
+  if (!Number.isFinite(x0) || !Number.isFinite(y0) || !Number.isFinite(x1) || !Number.isFinite(y1)) return false;
+  if (!Number.isFinite(bx0) || !Number.isFinite(by0) || !Number.isFinite(bx1) || !Number.isFinite(by1)) return false;
+  if (x1 < bx0 - tol || x0 > bx1 + tol) return false;
+  if (y1 < by0 - tol || y0 > by1 + tol) return false;
+  return true;
+}
+
 function pdfBBoxToViewportBBox(vp: any, pdfBBox: BBox): BBox {
   // Use point conversion rather than convertToViewportRectangle to avoid
   // confusion about output ordering across pdf.js versions.
@@ -171,6 +181,7 @@ export function PdfJsViewer(props: ComponentProps) {
   const pdfDataB64 = (args.pdfDataB64 ?? null) as string | null;
   const pageNumber = Number(args.pageNumber ?? 1);
   const unmatchedDebugRaw = String(args.unmatchedDebugRaw ?? "");
+  const lastAckEventId = String(args.lastAckEventId ?? "");
 
   const selectedDoorId = String(args.selectedDoorId ?? "");
   const focusSeq = Number(args.focusSeq ?? 0);
@@ -235,8 +246,6 @@ export function PdfJsViewer(props: ComponentProps) {
   const pendingFocusDoorIdRef = useRef<string | null>(null);
   const focusStateTimerRef = useRef<number | null>(null);
 
-  // Selection for immediate feedback (server catches up on rerun).
-  const localSelectedIdRef = useRef<string | null>(null);
   const lastSelectedIdRef = useRef<string | null>(null);
   const lastViewerDisplayRef = useRef<string | null>(null);
   const lastEditModeRef = useRef<boolean | null>(null);
@@ -248,9 +257,109 @@ export function PdfJsViewer(props: ComponentProps) {
   const confirmedSet = useMemo(() => new Set((doorState.confirmed_ids ?? []).map(String)), [confirmedKey]);
   const deletedSet = useMemo(() => new Set((doorState.deleted_ids ?? []).map(String)), [deletedKey]);
 
-  const emitEvent = useCallback((evt: ViewerEvent) => {
-    Streamlit.setComponentValue(evt);
+  // Streamlit can transiently unmount/remount custom component iframes during reruns.
+  // When that happens, messages can be dropped and the host may log:
+  // "Received component message for unregistered ComponentInstance".
+  //
+  // Make events robust by:
+  // - persisting the last emitted event (sessionStorage)
+  // - resending it until Python acks receipt via `lastAckEventId`
+  const mountedRef = useRef(true);
+  const lastAckRef = useRef<string>("");
+  const pendingEventRef = useRef<ViewerEvent | null>(null);
+  const resendTimerRef = useRef<number | null>(null);
+  const resendAttemptsRef = useRef<number>(0);
+
+  const pendingKey = useMemo(() => `door_detector_pdfjs_pending_evt_${fileId || "unknown"}`, [fileId]);
+
+  const clearResendTimer = useCallback(() => {
+    if (resendTimerRef.current) {
+      window.clearTimeout(resendTimerRef.current);
+      resendTimerRef.current = null;
+    }
   }, []);
+
+  const persistPendingEvent = useCallback(
+    (evt: ViewerEvent) => {
+      pendingEventRef.current = evt;
+      try {
+        sessionStorage.setItem(pendingKey, JSON.stringify(evt));
+      } catch {
+        // ignore
+      }
+    },
+    [pendingKey]
+  );
+
+  const tryLoadPendingEvent = useCallback(() => {
+    try {
+      const raw = sessionStorage.getItem(pendingKey);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== "object") return null;
+      if (typeof obj.event_id !== "string" || !obj.event_id) return null;
+      return obj as ViewerEvent;
+    } catch {
+      return null;
+    }
+  }, [pendingKey]);
+
+  const clearPendingEvent = useCallback(() => {
+    pendingEventRef.current = null;
+    resendAttemptsRef.current = 0;
+    clearResendTimer();
+    try {
+      sessionStorage.removeItem(pendingKey);
+    } catch {
+      // ignore
+    }
+  }, [clearResendTimer, pendingKey]);
+
+  const sendEventOnce = useCallback((evt: ViewerEvent) => {
+    if (!mountedRef.current) return;
+    try {
+      Streamlit.setComponentValue(evt);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const scheduleResendLoop = useCallback(
+    (evt: ViewerEvent) => {
+      clearResendTimer();
+      resendAttemptsRef.current = 0;
+
+      const step = () => {
+        if (!mountedRef.current) return;
+        const curAck = lastAckRef.current || "";
+        const eid = (evt as any)?.event_id ? String((evt as any).event_id) : "";
+        if (!eid) return;
+        if (curAck && curAck === eid) {
+          clearPendingEvent();
+          return;
+        }
+        // Retry a few times. The server dedupes by event_id, so resends are safe.
+        if (resendAttemptsRef.current >= 8) return;
+        resendAttemptsRef.current += 1;
+        sendEventOnce(evt);
+        resendTimerRef.current = window.setTimeout(step, 260);
+      };
+
+      // First retry is slightly delayed so we don't immediately spam in the common case.
+      resendTimerRef.current = window.setTimeout(step, 260);
+    },
+    [clearPendingEvent, clearResendTimer, sendEventOnce]
+  );
+
+  const emitEvent = useCallback(
+    (evt: ViewerEvent) => {
+      // Persist before sending so we can recover from an iframe swap.
+      persistPendingEvent(evt);
+      sendEventOnce(evt);
+      scheduleResendLoop(evt);
+    },
+    [persistPendingEvent, scheduleResendLoop, sendEventOnce]
+  );
 
   // High-signal lifecycle + prop-change logs (helps distinguish remount vs rerender).
   useEffect(() => {
@@ -274,6 +383,31 @@ export function PdfJsViewer(props: ComponentProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearResendTimer();
+    };
+  }, [clearResendTimer]);
+
+  // Track the latest server-side ack id so resends can stop ASAP after a rerun.
+  useEffect(() => {
+    lastAckRef.current = String(lastAckEventId || "");
+    const pending = pendingEventRef.current ?? tryLoadPendingEvent();
+    if (!pending) return;
+    const eid = String((pending as any)?.event_id || "");
+    if (!eid) return;
+    if (lastAckRef.current && lastAckRef.current === eid) {
+      clearPendingEvent();
+      return;
+    }
+    // If we have a pending event and it hasn't been acked, attempt a resend loop.
+    // This recovers from cases where Streamlit dropped the original message during rerun.
+    pendingEventRef.current = pending;
+    scheduleResendLoop(pending);
+  }, [clearPendingEvent, lastAckEventId, scheduleResendLoop, tryLoadPendingEvent]);
+
   const lastPropsRef = useRef<any>(null);
   useEffect(() => {
     const cur = {
@@ -292,6 +426,7 @@ export function PdfJsViewer(props: ComponentProps) {
       deletedLen: doorState?.deleted_ids?.length ?? 0,
       manualAddsLen: manualOverlays?.manual_additions?.length ?? 0,
       unmatchedLen: manualOverlays?.unmatched_manual_boxes?.length ?? 0,
+      lastAckEventId,
     };
     const prev = lastPropsRef.current;
     if (!prev) {
@@ -774,7 +909,10 @@ export function PdfJsViewer(props: ComponentProps) {
   const applyDoorStyles = useCallback(() => {
     const svg = svgRef.current;
     if (!svg) return;
-    const selectedId = localSelectedIdRef.current || (selectedDoorId ? selectedDoorId : null);
+    // IMPORTANT (Option A): highlight must reflect the server-canonical selection only.
+    // This prevents UI desync where the viewer highlights one door but right-panel actions
+    // apply to a different `selectedDoorId` until the next Streamlit rerun completes.
+    const selectedId = selectedDoorId ? selectedDoorId : null;
     const rects = svg.querySelectorAll<SVGRectElement>("rect[data-door-id]");
     for (const r of rects) {
       const did = r.getAttribute("data-door-id");
@@ -815,16 +953,6 @@ export function PdfJsViewer(props: ComponentProps) {
     }
   }, [confirmedSet, deletedSet, selectedDoorId, viewerDisplayMode]);
 
-  // If the server marks the currently locally-selected door as deleted, clear the
-  // local selection so the UI doesn't keep "sticking" to a removed candidate.
-  useEffect(() => {
-    const local = localSelectedIdRef.current;
-    if (local && deletedSet.has(local)) {
-      localSelectedIdRef.current = null;
-      applyDoorStyles();
-    }
-  }, [applyDoorStyles, deletedSet]);
-
   const renderOverlays = useCallback(() => {
     const svg = svgRef.current;
     if (!svg || !pageSize) return;
@@ -837,12 +965,47 @@ export function PdfJsViewer(props: ComponentProps) {
     // Keep them in their own group so edit overlays can layer above.
     const doorsLayer = ensureLayer("pz_doors");
     clearSvgLayer(doorsLayer);
+
+    // Diagnostics: detect the "everything is off page" failure mode.
+    // Only log once per file/hash to avoid noisy consoles.
+    let oobCount = 0;
+    const oobSamples: Array<any> = [];
+    const vb = (vp as any)?.viewBox && Array.isArray((vp as any).viewBox) ? ((vp as any).viewBox as number[]) : null;
+    const pdfBounds: BBox | null =
+      vb && vb.length === 4
+        ? ([
+            Number(vb[0]),
+            Number(vb[1]),
+            Number(vb[2]),
+            Number(vb[3]),
+          ] as BBox)
+        : null;
+    const viewportBounds: BBox = [0, 0, Number(pageSize.w), Number(pageSize.h)];
+
     for (const d of overlayDoors) {
       if (!d || !d.id || !d.bbox_pdf_xyxy) continue;
-      const [x0, y0, x1, y1] = pdfBBoxToViewportBBox(vp, d.bbox_pdf_xyxy);
+      const bbPdf = normalizeBBox(d.bbox_pdf_xyxy);
+      const [x0, y0, x1, y1] = pdfBBoxToViewportBBox(vp, bbPdf);
       const w = Math.max(0, x1 - x0);
       const h = Math.max(0, y1 - y0);
       if (!(w > 0) || !(h > 0)) continue;
+
+      // Count out-of-bounds bboxes (viewport space).
+      const bbVp: BBox = [x0, y0, x1, y1];
+      const vpOk = bboxIntersectsBounds(bbVp, viewportBounds, 0.5);
+      if (!vpOk) {
+        oobCount += 1;
+        if (oobSamples.length < 3) {
+          const pdfOk = pdfBounds ? bboxIntersectsBounds(bbPdf, pdfBounds, 0.01) : null;
+          oobSamples.push({
+            id: String(d.id),
+            bbox_pdf_xyxy: bbPdf,
+            bbox_viewport_xyxy: bbVp,
+            pdf_in_viewBox: pdfOk,
+          });
+        }
+      }
+
       const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
       r.setAttribute("x", x0.toFixed(2));
       r.setAttribute("y", y0.toFixed(2));
@@ -859,6 +1022,37 @@ export function PdfJsViewer(props: ComponentProps) {
       r.setAttribute("data-h", h.toFixed(2));
       r.setAttribute("style", "pointer-events: all; cursor: pointer;");
       doorsLayer?.appendChild(r);
+    }
+
+    if (oobCount > 0) {
+      try {
+        const k = `__door_detectorPdfjsOobLogged_${fileId}_${pdfHash}`;
+        const already = (window as any)[k] === true;
+        // Only warn if it's significant, or if everything is off.
+        const n = overlayDoors.length;
+        const frac = n > 0 ? oobCount / n : 0;
+        if (!already && (oobCount >= 5 || frac >= 0.25)) {
+          (window as any)[k] = true;
+          // eslint-disable-next-line no-console
+          console.warn("[door_detector] pdfjs overlay bbox out-of-bounds", {
+            fileId,
+            pdfHash,
+            pageNumber,
+            overlayDoors: n,
+            oobCount,
+            oobFrac: frac,
+            pageSize,
+            viewBox: vb,
+            rotation: (vp as any)?.rotation ?? null,
+            samples: oobSamples,
+            hint:
+              "If most bboxes are off-page, suspect Step1 transform (pix↔pdf), cropbox/rotation handling, or bbox_pdf_xyxy coordinate convention.",
+            ts: Date.now(),
+          });
+        }
+      } catch {
+        // ignore
+      }
     }
 
     // 2) Manual overlays (edit-mode only).
@@ -906,7 +1100,6 @@ export function PdfJsViewer(props: ComponentProps) {
       editMode,
       viewerDisplayMode,
       selectedDoorId,
-      localSelectedId: localSelectedIdRef.current,
       scale: scaleRef.current,
       tx: txRef.current,
       ty: tyRef.current,
@@ -1352,8 +1545,6 @@ export function PdfJsViewer(props: ComponentProps) {
           if (snap && temp) {
             try {
               drawBox(temp, pdfBBoxToViewportBBox(vp, snap.bbox), "rgb(0,255,0)", 3, "4,3", 0.77);
-              localSelectedIdRef.current = String(snap.id || "");
-              applyDoorStyles();
             } catch {
               // ignore
             }
@@ -1465,12 +1656,8 @@ export function PdfJsViewer(props: ComponentProps) {
       if (!did) return;
       e.preventDefault();
       e.stopPropagation();
-      localSelectedIdRef.current = String(did);
-      applyDoorStyles();
-      if (!editMode && autoFocus) {
-        pendingFocusDoorIdRef.current = String(did);
-        focusToDoorId(String(did));
-      }
+      // Option A: do not optimistically change highlight/focus here.
+      // Emit the click and let the Streamlit rerun update `selectedDoorId` + `focusSeq`.
       emitEvent({ type: "door_click", event_id: randEventId(), door_id: String(did), ts: Date.now() });
     };
 
@@ -1519,7 +1706,6 @@ export function PdfJsViewer(props: ComponentProps) {
       editMode !== lastEditModeRef.current;
     if (did !== lastSelectedIdRef.current) {
       lastSelectedIdRef.current = did;
-      localSelectedIdRef.current = null;
     }
     lastViewerDisplayRef.current = viewerDisplayMode;
     if (editMode !== lastEditModeRef.current) {
