@@ -135,9 +135,8 @@ def main_viewer_controls(
 
     task = st.session_state.get("door_detector_pipeline_task")
     is_running_for_file = bool(task and task.get("file_id") == str(file_id))
+    # Used as a stable label for the queued pipeline task.
     analysis_label = f"Analyzing {item.get('original_name', '')}".strip() or "Analyzing…"
-    if is_running_for_file:
-        st.info(f"{analysis_label} (running)")
 
     # Small top pad so the right panel aligns with the viewer window.
     st.markdown('<div class="door_detector-review-panel-top-pad"></div>', unsafe_allow_html=True)
@@ -536,14 +535,17 @@ def right_panel_review(
     task = st.session_state.get("door_detector_pipeline_task")
     is_running_for_file = bool(task and task.get("file_id") == str(file_id))
 
+    # While analysis is running, replace the normal menu contents with the existing
+    # "Analyzing…" state (same UX as first-time Analyze on an unprocessed file).
+    if is_running_for_file:
+        st.info("Analyzing…")
+        return
+
     # Don't show "Doors (0)" until analysis has been run at least once.
     status = item.get("status", "not_processed")
     has_run = (status == "done") or (file_dir / "doors.json").exists()
     if not has_run:
-        if is_running_for_file:
-            st.info("Analyzing…")
-        else:
-            st.info("Analyze to see doors.")
+        st.info("Analyze to see doors.")
         return
 
     # Use pre-calculated active_doors so the main viewer + right panel stay in sync.
