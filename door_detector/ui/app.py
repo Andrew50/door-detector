@@ -1473,18 +1473,17 @@ def main() -> None:
 
                 # If a pipeline run is queued for this file, keep rendering the *existing*
                 # viewer state while analysis runs (don't swap in a loader).
-                # We'll run the pipeline *after* the viewer/right panel have rendered so the
-                # previous state remains visible until results refresh.
+                #
+                # IMPORTANT: do NOT gate on a persisted "_started" flag here.
+                #
+                # Streamlit/browser reloads can interrupt a run after we've set "_started"
+                # but before `run_pipeline(...)` actually executes, which would leave
+                # `door_detector_pipeline_task` stuck and the UI showing "Analyzing…" forever.
+                #
+                # Instead, treat the presence of a queued task for this file as sufficient
+                # to run the pipeline once at the end of this render.
                 task = st.session_state.get("door_detector_pipeline_task")
-                should_run_pipeline_now = bool(
-                    task and task.get("file_id") == str(file_id) and not bool(task.get("_started"))
-                )
-                if should_run_pipeline_now:
-                    try:
-                        task["_started"] = True
-                        st.session_state.door_detector_pipeline_task = task
-                    except Exception:
-                        pass
+                should_run_pipeline_now = bool(task and task.get("file_id") == str(file_id))
 
                 try:
                     with perf_span("ui.load_file_artifacts", file_id=str(file_id)):
