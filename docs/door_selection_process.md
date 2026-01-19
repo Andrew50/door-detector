@@ -150,7 +150,7 @@ The Streamlit UI is implemented in:
 There are two snap computations:
 
 1) **Viewer-side snap (fast UX)**  
-Inside the HTML/JS pan+zoom viewer (`_panzoom_image_viewer`), `snapCandidateForDraw()` tries to pick the best candidate for the drawn box:
+Inside the PDF.js viewer (`door_detector/ui/pdfjs_component/frontend/src/pdfjs_viewer.tsx`), `snapCandidateForDrawPdf()` tries to pick the best candidate for the drawn box:
 
 - Prefer a **server-supplied candidate pool** (sent via a hidden Streamlit sink).
 - If unavailable, fall back to snapping against the currently rendered SVG overlay door boxes.
@@ -169,16 +169,18 @@ The server result is what gets written into `labels.json` as `snapped_candidate_
 
 ---
 
-## Label storage (`labels.json`, schema v3)
+## Label storage (`labels.json`, schema v4)
 
-Each artifacts directory can store a `labels.json` with schema version 3:
+Each artifacts directory can store a `labels.json` with schema version 4:
 
 - `confirmed_by_type`: typed positive labels (doors), keyed by door type
-- `deleted_ids`: negative labels (not doors)
+- `rejected_by_type`: typed “not this type” feedback (still may be a door)
+- `deleted_ids`: global negative labels (“not a door at all”)
+- `manual_candidates`: UI-created candidates (used when no detector candidate exists)
 - `manual_additions`: records of Shift+drag selections (includes drawn box + snapped candidate id + IoU)
 - `unmatched_manual_boxes`: selector boxes that did not match any candidate (UI-only; not used for training)
 
-The UI is **v3-first** and will migrate schema v2 labels on load (treating v2 `confirmed_ids` as swing confirmations).
+The UI is **v4-first** and will migrate schema v2/v3 labels on load (treating v2 `confirmed_ids` as swing confirmations).
 
 On re-analysis, the UI re-applies:
 
@@ -195,26 +197,28 @@ Training is implemented in:
 
 Inputs:
 
-- `artifacts/**/labels.json` (schema v3; v2 is migrated/accepted for backwards compatibility)
+- `artifacts/**/labels.json` (schema v4; v2/v3 are migrated on load)
 - corresponding `artifacts/**/doors.json`
 
 Training samples:
 
-- Positive: any candidate id in `confirmed_ids`
-- Negative: any candidate id in `deleted_ids`
-- Ignored: detected-but-unlabeled candidates, and unmatched manual boxes
+- Positive (per type): candidate ids in `confirmed_by_type[<type>]`
+- Negative (per type): candidate ids in:
+  - `deleted_ids` (global negatives)
+  - `rejected_by_type[<type>]`
+  - plus a conservative “not this type” rule: if an id is confirmed as another type, it is treated as negative for this type
+- Ignored: detected-but-unlabeled candidates, and `unmatched_manual_boxes`
 
 Feature vector:
 
-- The trainer uses a fixed feature list (currently):
-  `rmse`, `radius`, `angle_span`, `hinge_dist`, `len_ratio`, `center_dist`, `radial_angle_deg`, `tip_to_arc_dist`
+- The trainer uses per-type feature lists (see `door_detector/reweight_fit.py` → `FEATURES_BY_TYPE`)
 - It reads features from `doors.json["candidates"]` (fallback to `doors.json["doors"]`)
 
 Model:
 
 - standardize features (mean/std)
 - logistic regression with conservative training (warm start + regularization toward prior + minimum-data gating)
-- writes `models/reweighter_v1.json` (weights + scaler + bias)
+- writes `models/reweighter_<type>_v1.json` (one model per canonical door type)
 
 ---
 

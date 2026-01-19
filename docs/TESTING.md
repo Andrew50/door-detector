@@ -1,4 +1,4 @@
-# Testing Guide for Step 1
+# Testing Guide
 
 ## Prerequisites
 
@@ -28,13 +28,31 @@
    python3 --version  # Should show 3.10 or higher
    ```
 
-2. **Get test data:**
-   - Download floor plans from: https://drive.google.com/drive/folders/1QSsrLCr13xX6h-LYBolEslI369vtahwc?usp=sharing
+3. **Get test data (optional):**
+   - Download floor plans from the [Google Drive folder](https://drive.google.com/drive/folders/1QSsrLCr13xX6h-LYBolEslI369vtahwc?usp=sharing)
    - Create an `inputs/` directory and place PDF files there
 
-## Basic Testing
+## Fast sanity checks (recommended)
 
-### 1. Process a single PDF
+### 1) End-to-end smoke test (generated PDF)
+
+This runs Step 1 + Step 2 on a tiny programmatically generated PDF and validates outputs:
+
+```bash
+python3 tests/test_step2_smoke.py
+```
+
+### 2) Run the unit tests (optional)
+
+If you installed `.[dev]`:
+
+```bash
+pytest -q
+```
+
+## Manual CLI testing
+
+### 1) Step 1: process a single PDF
 
 ```bash
 door-detector-step1 inputs/floor_plan_01.pdf --out artifacts/test_01 --dpi 400
@@ -48,7 +66,7 @@ Successfully processed inputs/floor_plan_01.pdf
   Total time: 123.4ms
 ```
 
-### 2. Verify artifacts
+### 2) Step 1: verify artifacts
 
 Check that all files were created:
 ```bash
@@ -62,7 +80,7 @@ You should see:
 - `meta.json` - Metadata
 - `debug_overlay.png` - Debug visualization
 
-### 3. Run automated tests
+### 3) Step 1: validate artifacts schema
 
 ```bash
 python tests/test_step1.py artifacts/test_01
@@ -92,7 +110,7 @@ Open `artifacts/test_01/debug_overlay.png` in an image viewer. You should see:
 ### Check metadata
 
 ```bash
-cat artifacts/test_01/meta.json | python -m json.tool
+python -m json.tool artifacts/test_01/meta.json
 ```
 
 Look for:
@@ -174,4 +192,21 @@ For scanned floor plans:
 - Primitives: 0-100 segments
 - Mode: "scan"
 - Transform validation: May have fewer points to validate
+
+### 4) Step 2: run door detection on Step 1 artifacts
+
+```bash
+door-detector-step2 --artifacts artifacts/test_01 --config configs/door_rules.json
+```
+
+Expected output files in `artifacts/test_01/`:
+
+- `doors.json` (contains `doors` + broader `candidates`)
+- `doors_overlay.png` (visual overlay)
+
+### 5) UI run (optional)
+
+```bash
+streamlit run door_detector/review_app.py
+```
 

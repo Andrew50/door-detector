@@ -22,7 +22,7 @@ You should see something like `Python 3.10.x` or higher. If not, install Python 
 Navigate to the project directory and create a virtual environment:
 
 ```bash
-cd /home/aj/dev/door_detector
+cd /path/to/door_detector
 python3 -m venv venv
 ```
 
@@ -69,7 +69,7 @@ This installs the package in "editable" mode, so code changes are immediately av
 
 ### 6. Verify Installation
 
-Check that the CLI command is available:
+Check that the CLI commands are available:
 
 ```bash
 door-detector-step1 --help
@@ -78,6 +78,19 @@ door-detector-step1 --help
 You should see usage information. If you get a "command not found" error:
 - Make sure the virtual environment is activated
 - Try: `python3 -m door_detector.step1_pipeline --help`
+
+Also check:
+
+```bash
+door-detector-step2 --help
+door-detector-reweight --help
+```
+
+And the UI entrypoint:
+
+```bash
+streamlit run door_detector/review_app.py
+```
 
 ## Troubleshooting
 
@@ -123,7 +136,7 @@ virtualenv venv
 
 - Make sure you're in the project directory
 - Check that `venv` directory exists: `ls -la venv/`
-- Try the full path: `source /home/aj/dev/door_detector/venv/bin/activate`
+- Try the full path for your clone (e.g. `source /path/to/door_detector/venv/bin/activate`)
 
 ### Package Installation Fails
 

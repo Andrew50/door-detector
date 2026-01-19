@@ -2,6 +2,8 @@
 
 This file records concrete “door looked real but wasn’t in `doors.json["candidates"]`” cases, what geometric criterion failed, and what change was made to improve recall (without regressing previously-detected candidates).
 
+Note: the current Streamlit UI writes `labels.json` **schema v4** (and migrates older v2/v3 labels on load). Older entries below may reference earlier schemas as part of the historical debugging trail.
+
 ---
 
 ### 2026-01-19 — `f_1768798404156` — arc missing/rasterized; leaf-only enabled but hinge wall-support gate too brittle (thin short wall segments)

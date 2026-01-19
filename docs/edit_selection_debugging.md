@@ -1,19 +1,10 @@
-## your task:
-
-Ignore console warnings unless breaking, this is the prompt to be considered:
-for the proposed selection (only/closest valid snap/canddiate in green, user seelction box in blue) the door that was attempted to be proposed was not a candidate (although there could be candidates that were shown, none were of the actuall door that was trying to be selected). this is an issue with how candidates are generated. what caused the door to not be a candidate (what specific critera was missed for the doors gemotry that led to it not being a canddidate)? I have attached the logs, if they do not provide enough information then they need to be augmented. if you are going to modify the candidate criteria first read candidate failure logs.md, and then do it in a way that doesnt invalidate previously undedected candidadate. append the reason for the door not being in the candidate list to the candidate filaure log with a concise dscripton of the door geometry, why it failed to be a candidate, and how you changed the detection
-
-
-
-## context that might help:
-
-
-
 # Debugging Edit Doors selection/snapping issues
 
 This doc explains how to debug cases where **Edit Doors → Shift+drag** does **not** surface the door you intended in the **Selection matches** suggestions (or snaps to the wrong thing).
 
 It is written for the “PDF.js viewer + Streamlit server” flow currently used in Door Detector.
+
+Tip: if the intended door is genuinely missing from `doors.json["candidates"]`, capture the `unmatched_debug_report` and add a short entry to `docs/candidate_failure_log.md` so the root cause stays recorded.
 
 ---
 
@@ -142,7 +133,7 @@ Next step:
 2. Run:
 
 ```bash
-/home/aj/dev/door_detector/.venv/bin/python - <<'PY'
+python3 - <<'PY'
 import json
 from pathlib import Path
 

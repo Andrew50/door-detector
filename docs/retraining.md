@@ -7,7 +7,7 @@ This is intentionally lightweight:
 - **No deep learning required**
 - **Fast iteration** (seconds, CPU-only)
 - **Explainable** (you can show which geometric cues drove a decision)
-- Works especially well when PDFs are **true vector/CAD** (as observed in `docs/vector_vs_raster_analysis.md`)
+- Works especially well when pages are **vector/hybrid** (`meta.json` → `mode` is `vector` or `hybrid`)
 
 ### What “retraining” means here
 
@@ -70,37 +70,46 @@ The model only decides:
 
 ### `doors.json` (predictions)
 
-Recommended format (example):
+Approximate format (matches `door-detector-step2`, schema v2):
 
 ```json
 {
-  "schema_version": 1,
-  "page_id": "floor_plan_01",
-  "generated_at": "2026-01-14T12:34:56Z",
-  "detector": {
-    "name": "vector_candidate_v1",
-    "reweighters": {
-      "swing": "models/reweighter_swing_v1.json"
-    }
-  },
+  "schema_version": 2,
+  "page_id": "floor_plan_p0",
+  "source_artifacts_dir": "artifacts/floor_plan",
+  "config_path": "configs/door_rules.json",
+  "analysis_signature": "sha1:…",
+  "mode": "vector",
+  "detect_ms": 123.4,
   "doors": [
     {
-      "id": "d_000123",
+      "id": "d_…",
+      "type": "swing",
       "bbox_xyxy": [120.5, 340.2, 220.1, 430.9],
+      "bbox_pdf_xyxy": [12.3, 45.6, 78.9, 101.1],
       "confidence": 0.92,
-      "source": "vector",
-      "candidate": {
-        "arc_refs": ["bezier:4812"],
-        "leaf_refs": ["line:10291"]
-      },
+      "heuristic_confidence": 0.78,
+      "legacy_ids": [],
       "features": {
-        "arc_radius_px": 42.1,
-        "arc_angle_deg": 88.3,
-        "arc_fit_error": 0.012,
-        "leaf_length_px": 39.9,
-        "hinge_gap_px": 1.6,
-        "stroke_width_ratio": 1.02,
-        "local_line_density": 0.31
+        "rmse": 0.4,
+        "radius": 55.0,
+        "angle_span": 90.0
+      }
+    }
+  ],
+  "candidates": [
+    {
+      "id": "d_…",
+      "type": "swing",
+      "bbox_xyxy": [120.5, 340.2, 220.1, 430.9],
+      "bbox_pdf_xyxy": [12.3, 45.6, 78.9, 101.1],
+      "confidence": 0.66,
+      "heuristic_confidence": 0.66,
+      "legacy_ids": ["d_legacy…"],
+      "features": {
+        "rmse": 0.9,
+        "radius": 60.0,
+        "angle_span": 82.0
       }
     }
   ]
@@ -110,18 +119,30 @@ Recommended format (example):
 Notes:
 
 - Keeping `features` in the output makes the system **auditable** and helps debugging.
-- `candidate.arc_refs` / `leaf_refs` are optional but useful when investigating failures.
+- `bbox_pdf_xyxy` is added by Step 2 when `transform.json` is present and is used by the PDF.js viewer overlay.
 
 ### `labels.json` (feedback)
 
-Keep it intentionally simple:
+Current format (schema v4; written by the Streamlit UI):
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "reviewed_at": "2026-01-14T12:40:00Z",
-  "confirmed_ids": ["d_000123", "d_000130"],
+  "confirmed_by_type": {
+    "swing": ["d_000123"],
+    "double": [],
+    "pocket": [],
+    "bifold": []
+  },
+  "rejected_by_type": {
+    "swing": [],
+    "double": [],
+    "pocket": [],
+    "bifold": []
+  },
   "deleted_ids": ["d_000124"],
+  "manual_candidates": [],
   "manual_additions": [
     {
       "drawn_bbox_xyxy": [512.0, 220.0, 605.0, 310.0],
@@ -141,10 +162,11 @@ Keep it intentionally simple:
 
 Interpretation:
 
-- **confirmed_ids** → positive examples (vector features)
-- **deleted_ids** → negative examples (vector features)
-- **manual_additions** are snapped to existing candidates; they contribute via the snapped candidate IDs.
-- **unmatched_manual_boxes** are UI-only visibility; they are ignored for training (no candidate/features).
+- **confirmed_by_type** → positive examples for that door type
+- **rejected_by_type** → “not this type” feedback (kept separate from global deletions)
+- **deleted_ids** → global negative examples (“not a door at all”)
+- **manual_additions** record Shift+drag selections and may snap to an existing candidate id
+- **unmatched_manual_boxes** are UI-only visibility; they are ignored for training unless you turn them into candidates
 
 ## Feature design (what to learn weights over)
 
@@ -266,6 +288,12 @@ Given a folder of reviewed artifacts:
 - Fit model weights (warm-started + regularized toward the prior for stability on small data)
 - Apply minimum-data gating (don’t write a new model unless both classes exist and there is enough labeled data)
 - Save `models/reweighter_<type>_v1.json` (one model per door type)
+
+CLI:
+
+```bash
+door-detector-reweight --artifacts artifacts --out-dir models
+```
 
 Deployment tuning (precision/recall) is controlled via `configs/door_rules.json`:
 

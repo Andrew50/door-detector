@@ -74,6 +74,12 @@ def _extract_id_records(doors_data: Dict[str, Any]) -> list[Dict[str, Any]]:
                     "bbox_pdf_xyxy": _norm_bbox(c, "bbox_pdf_xyxy"),
                     "bbox_xyxy": _norm_bbox(c, "bbox_xyxy"),
                     "legacy_ids": _coerce_str_list(c.get("legacy_ids")),
+                    # Some candidates (notably `double`) have stable identity via components.
+                    "components": (
+                        list(map(str, (c.get("components") or {}).get("swing_ids") or []))
+                        if isinstance(c.get("components"), dict)
+                        else []
+                    ),
                 }
             )
     return out
@@ -114,6 +120,11 @@ def _attach_legacy_ids_from_previous_doors_json(
                 "type": str(c.get("type") or "").strip(),
                 "bbox_pdf_xyxy": _norm_bbox(c, "bbox_pdf_xyxy"),
                 "bbox_xyxy": _norm_bbox(c, "bbox_xyxy"),
+                "components": (
+                    list(map(str, (c.get("components") or {}).get("swing_ids") or []))
+                    if isinstance(c.get("components"), dict)
+                    else []
+                ),
             }
         )
 
@@ -156,6 +167,59 @@ def _attach_legacy_ids_from_previous_doors_json(
 
     old_to_new: dict[str, str] = {}
 
+    # Pass 0: component-based matching for `double`.
+    #
+    # `double` candidates are unions of two swing candidates. Their bbox can shift across
+    # reanalysis (Step 1 changes or detector tweaks), which can cause IoU-based remapping
+    # to miss. But their identity is the pair of component swings, so match on that first.
+    #
+    # We also allow swing ids to change by mapping old swing ids via the new swings' legacy_ids.
+    try:
+        current_swing_ids: set[str] = {str(r.get("id") or "") for r in new_recs if str(r.get("type") or "") == "swing" and str(r.get("id") or "")}
+        swing_legacy_to_current: dict[str, str] = {sid: sid for sid in current_swing_ids}
+        for c in new_candidates:
+            if not (isinstance(c, dict) and str(c.get("type") or "") == "swing" and c.get("id") is not None):
+                continue
+            sid = str(c.get("id") or "")
+            if not sid:
+                continue
+            for lid in _coerce_str_list(c.get("legacy_ids")):
+                if lid in current_swing_ids:
+                    continue
+                swing_legacy_to_current.setdefault(str(lid), sid)
+
+        new_double_by_comps: dict[tuple[str, str], str] = {}
+        for r in new_recs:
+            if str(r.get("type") or "") != "double":
+                continue
+            nid = str(r.get("id") or "")
+            comps = r.get("components") or []
+            if not (nid and isinstance(comps, list) and len(comps) == 2):
+                continue
+            a, b = sorted([str(comps[0]), str(comps[1])])
+            new_double_by_comps.setdefault((a, b), nid)
+
+        for old in prev_recs_sorted:
+            if str(old.get("type") or "") != "double":
+                continue
+            oid = str(old.get("id") or "")
+            if not oid or oid in old_to_new:
+                continue
+            comps = old.get("components") or []
+            if not (isinstance(comps, list) and len(comps) == 2):
+                continue
+            a0 = swing_legacy_to_current.get(str(comps[0]) or "")
+            b0 = swing_legacy_to_current.get(str(comps[1]) or "")
+            if not (a0 and b0):
+                continue
+            key = tuple(sorted([str(a0), str(b0)]))
+            nid = new_double_by_comps.get(key)
+            if nid and nid not in used_new:
+                old_to_new[oid] = nid
+                used_new.add(nid)
+    except Exception:
+        pass
+
     def _find_best(old: Dict[str, Any], pool: list[Dict[str, Any]]) -> Tuple[float, Optional[Dict[str, Any]]]:
         best_i = 0.0
         best_r: Optional[Dict[str, Any]] = None
@@ -171,6 +235,9 @@ def _attach_legacy_ids_from_previous_doors_json(
 
     # Pass 1: same-type matching.
     for old in prev_recs_sorted:
+        oid = str(old.get("id") or "")
+        if oid and oid in old_to_new:
+            continue
         ot = str(old.get("type") or "")
         pool = new_by_type.get(ot) or []
         if not pool:
@@ -178,7 +245,6 @@ def _attach_legacy_ids_from_previous_doors_json(
         best_i, best_r = _find_best(old, pool)
         if best_r is not None and best_i >= MIN_IOU_SAME_TYPE:
             nid = str(best_r.get("id") or "")
-            oid = str(old.get("id") or "")
             if oid and nid:
                 old_to_new[oid] = nid
                 used_new.add(nid)
