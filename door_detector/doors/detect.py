@@ -18,6 +18,7 @@ from door_detector.doors.geometry import (
     get_bbox,
     sample_bezier,
 )
+from door_detector.perf import enabled as perf_enabled, span as perf_span, log as perf_log
 
 
 class SpatialIndex:
@@ -376,12 +377,27 @@ def _extract_polyline_arcs_from_lines(
     min_segments = int(poly_conf.get("min_segments", 4) or 4)
     max_segments = int(poly_conf.get("max_segments", 36) or 36)
     max_seg_len = float(poly_conf.get("max_segment_length_px", 85.0) or 85.0)
-    allow_branches = bool(poly_conf.get("allow_branches", True))
-    max_paths_per_component = int(poly_conf.get("max_paths_per_component", 200) or 200)
+    allow_dashed = bool(poly_conf.get("allow_dashed", False))
     allow_branches = bool(poly_conf.get("allow_branches", True))
     max_paths_per_component = int(poly_conf.get("max_paths_per_component", 200) or 200)
     # Fit tolerance: reuse arc's circle fit constraint if present, else a mild default.
     max_circle_fit_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
+    # Optional relative RMSE tolerance (RMSE / radius). Useful for large-radius polylines where
+    # absolute pixel RMSE naturally grows with scale, even when the arc is visually correct.
+    # If <=0, disabled.
+    max_circle_fit_rmse_ratio = float(arc_conf.get("max_circle_fit_rmse_ratio", 0.0) or 0.0)
+
+    def _rmse_ok(rmse: float, radius: float) -> bool:
+        try:
+            rmse_f = float(rmse)
+            r_f = float(radius)
+        except Exception:
+            return False
+        if rmse_f <= float(max_circle_fit_rmse):
+            return True
+        if max_circle_fit_rmse_ratio and max_circle_fit_rmse_ratio > 0 and r_f > 1e-6:
+            return (rmse_f / r_f) <= float(max_circle_fit_rmse_ratio)
+        return False
 
     # Use the same arc thresholds as bezier arcs (in pixel space).
     min_radius_px = float(arc_conf.get("min_radius_px", 0.0) or 0.0)
@@ -402,12 +418,23 @@ def _extract_polyline_arcs_from_lines(
     ends: Dict[int, Tuple[Tuple[float, float], Tuple[float, float], Tuple[int, int], Tuple[int, int]]] = {}
     end_to_lines: Dict[Tuple[int, int], List[int]] = {}
     for i, ln in enumerate(lines):
-        if _is_dashed_primitive(ln):
+        if _is_dashed_primitive(ln) and not allow_dashed:
             continue
         try:
             p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
             p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
         except Exception:
+            continue
+        # Exclude perfectly axis-aligned segments from polyline-arc extraction.
+        # These are overwhelmingly wall/leaf stubs and can connect components into huge
+        # graphs, hiding the actual curved arc chain. (The leaf pairing stage still uses
+        # all lines, so excluding axis-aligned segments here is safe.)
+        try:
+            dx = abs(float(p1[0]) - float(p0[0]))
+            dy = abs(float(p1[1]) - float(p0[1]))
+        except Exception:
+            dx, dy = 0.0, 0.0
+        if dx < 1e-3 or dy < 1e-3:
             continue
         seg_len = float(dist_point_to_point(p0, p1))
         if not (0.5 <= seg_len <= max_seg_len):
@@ -458,41 +485,176 @@ def _extract_polyline_arcs_from_lines(
 
         # Node degrees within this component.
         node_deg: Dict[Tuple[int, int], int] = {}
+        comp_edges: List[Tuple[int, Tuple[int, int], Tuple[int, int]]] = []
         for li in comp:
             _, _, b0, b1 = ends[li]
             node_deg[b0] = node_deg.get(b0, 0) + 1
             node_deg[b1] = node_deg.get(b1, 0) + 1
+            comp_edges.append((int(li), b0, b1))
 
         end_nodes = [n for n, d in node_deg.items() if d == 1]
-        if len(end_nodes) != 2:
-            continue  # ignore loops/branches
-
-        # Walk the chain in order from one endpoint.
-        start_node = end_nodes[0]
         ordered: List[int] = []
-        used_lines: set[int] = set()
-        current_node = start_node
-        prev_line: Optional[int] = None
+        start_node: Tuple[int, int]
+        if len(end_nodes) != 2:
+            # In real plans, door swing arcs (polylines) are frequently "attached" to other
+            # short geometry (door leaf/wall stubs) near their endpoints. That creates a
+            # branched component with != 2 endpoints. When enabled, recover a simple path
+            # through the component that still fits a plausible arc.
+            #
+            # For cycle components with no degree-1 endpoints:
+            # - reject loops to avoid label bubbles/circles
+            if not allow_branches:
+                continue
+            if len(end_nodes) == 0:
+                continue
 
-        for _ in range(len(comp)):
-            candidates = [li for li in end_to_lines.get(current_node, []) if li in comp and li not in used_lines]
-            if not candidates:
-                break
-            nxt = candidates[0]
-            if prev_line is not None and len(candidates) > 1:
-                # Prefer not to immediately backtrack.
-                for cand in candidates:
-                    if cand != prev_line:
-                        nxt = cand
+            # Performance guardrails: only attempt recovery for small-ish components.
+            # Highly-branched components create a combinatorial explosion of paths and
+            # are rarely door swing arcs anyway.
+            if len(comp) > 20:
+                continue
+            if len(end_nodes) > 6:
+                continue
+
+            # Build node -> incident component lines map.
+            node_to_lines: Dict[Tuple[int, int], List[int]] = {}
+            for li, b0, b1 in comp_edges:
+                node_to_lines.setdefault(b0, []).append(li)
+                node_to_lines.setdefault(b1, []).append(li)
+
+            # Helper: given (node, line) return the other node.
+            other_node: Dict[int, Tuple[Tuple[int, int], Tuple[int, int]]] = {li: (b0, b1) for li, b0, b1 in comp_edges}
+
+            best_path: Optional[List[int]] = None
+            best_start: Optional[Tuple[int, int]] = None
+            best_score = -1e18
+            paths_tried = 0
+            max_paths = min(int(max_paths_per_component), 160)
+
+            def _score_path(path_lines: List[int], start_node: Tuple[int, int]) -> Optional[Tuple[float, List[Tuple[float, float]]]]:
+                # Build ordered point chain for this path and compute circle fit.
+                pts: List[Tuple[float, float]] = []
+                cur_node = start_node
+                for li in path_lines:
+                    try:
+                        p0, p1, b0, b1 = ends[li]
+                    except Exception:
+                        return None
+                    if cur_node == b0:
+                        a, b = p0, p1
+                        cur_node = b1
+                    else:
+                        a, b = p1, p0
+                        cur_node = b0
+                    if not pts:
+                        pts.append((float(a[0]), float(a[1])))
+                    if pts[-1] != (float(b[0]), float(b[1])):
+                        pts.append((float(b[0]), float(b[1])))
+                if len(pts) < 3:
+                    return None
+                try:
+                    center, radius, rmse = fit_circle(pts)
+                    angle_span = float(get_arc_angle_span(pts, center))
+                except Exception:
+                    return None
+                radius = float(radius)
+                rmse = float(rmse)
+                if not (min_radius_px <= radius <= max_radius_px):
+                    return None
+                if not _rmse_ok(rmse, radius):
+                    return None
+                if not (min_angle_deg <= angle_span <= max_angle_deg):
+                    return None
+                fit_score = max(0.0, 1.0 - (rmse / max(1e-6, max_circle_fit_rmse)))
+                score = float(angle_span) * 1.0 + float(fit_score) * 50.0 + float(len(path_lines)) * 0.5
+                return score, pts
+
+            def _dfs(cur_node: Tuple[int, int], target: Tuple[int, int], used: set[int], path: List[int], path_start: Tuple[int, int]) -> None:
+                nonlocal best_path, best_start, best_score, paths_tried
+                if paths_tried >= max_paths:
+                    return
+                if len(path) > max_segments:
+                    return
+                if cur_node == target:
+                    paths_tried += 1
+                    if len(path) < min_segments:
+                        return
+                    res = _score_path(path, start_node=path_start)
+                    if res is None:
+                        return
+                    score, _pts = res
+                    if score > best_score:
+                        best_score = score
+                        best_path = list(path)
+                        best_start = path_start
+                    return
+                for li in node_to_lines.get(cur_node, []):
+                    if li in used:
+                        continue
+                    used.add(li)
+                    path.append(li)
+                    b0, b1 = other_node[li]
+                    nxt_node = b1 if cur_node == b0 else b0
+                    _dfs(nxt_node, target, used, path, path_start)
+                    path.pop()
+                    used.remove(li)
+
+            # Target nodes:
+            # - Prefer other endpoints (when present) or junction-ish nodes (deg != 2).
+            #   This helps the common case where one arc endpoint is attached to a wall/leaf stub,
+            #   yielding only one true degree-1 endpoint in the short-segment component.
+            start_candidates = list(end_nodes)
+            for start in start_candidates:
+                targets: List[Tuple[int, int]] = []
+                if len(end_nodes) >= 2:
+                    targets = [t for t in end_nodes if t != start]
+                else:
+                    targets = [t for t, d in node_deg.items() if t != start and int(d) != 2]
+                    if not targets:
+                        targets = [t for t in node_deg.keys() if t != start]
+
+                # Cap targets to avoid pathological blow-ups in noisy drawings.
+                if len(targets) > 24:
+                    targets = targets[:24]
+
+                for target in targets:
+                    _dfs(start, target, set(), [], start)
+                    if paths_tried >= max_paths:
                         break
-            ordered.append(nxt)
-            used_lines.add(nxt)
-            p0, p1, b0, b1 = ends[nxt]
-            current_node = b1 if current_node == b0 else b0
-            prev_line = nxt
+                if paths_tried >= max_paths:
+                    break
 
-        if len(ordered) != len(comp):
-            continue
+            if best_path is None or best_start is None:
+                continue
+
+            ordered = best_path
+            start_node = best_start
+        else:
+            # Walk the chain in order from one endpoint.
+            start_node = end_nodes[0]
+            used_lines: set[int] = set()
+            current_node = start_node
+            prev_line: Optional[int] = None
+
+            for _ in range(len(comp)):
+                candidates = [li for li in end_to_lines.get(current_node, []) if li in comp and li not in used_lines]
+                if not candidates:
+                    break
+                nxt = candidates[0]
+                if prev_line is not None and len(candidates) > 1:
+                    # Prefer not to immediately backtrack.
+                    for cand in candidates:
+                        if cand != prev_line:
+                            nxt = cand
+                            break
+                ordered.append(nxt)
+                used_lines.add(nxt)
+                p0, p1, b0, b1 = ends[nxt]
+                current_node = b1 if current_node == b0 else b0
+                prev_line = nxt
+
+            if len(ordered) != len(comp):
+                continue
 
         # Build ordered point chain (dedupe consecutive identical points).
         pts: List[Tuple[float, float]] = []
@@ -513,14 +675,66 @@ def _extract_polyline_arcs_from_lines(
         if len(pts) < 3:
             continue
 
-        center, radius, rmse = fit_circle(pts)
-        if not (min_radius_px <= radius <= max_radius_px):
-            continue
-        if rmse > max_circle_fit_rmse:
+        # First attempt: fit the full chain.
+        try:
+            center, radius, rmse = fit_circle(pts)
+            radius = float(radius)
+            rmse = float(rmse)
+            angle_span = float(get_arc_angle_span(pts, center))
+        except Exception:
             continue
 
-        angle_span = get_arc_angle_span(pts, center)
-        if not (min_angle_deg <= angle_span <= max_angle_deg):
+        ok_full = bool((min_radius_px <= radius <= max_radius_px) and _rmse_ok(rmse, radius) and (min_angle_deg <= angle_span <= max_angle_deg))
+
+        # If the full chain fails, try to recover a good sub-arc from a contiguous subpath.
+        # This helps for components that concatenate two door arcs (double doors / double-acting doors),
+        # or when a small amount of extra geometry is attached at one end.
+        if not ok_full and len(ordered) >= max(min_segments + 1, 6):
+            best = None  # (score, i0, j0, center, radius, rmse, angle_span)
+            paths_tried = 0
+            MAX_WINDOWS = 3200
+            m = len(ordered)
+            # Prefer longer windows first (more stable fits).
+            for win_len in range(m, min_segments - 1, -1):
+                if paths_tried >= MAX_WINDOWS:
+                    break
+                for i0 in range(0, m - win_len + 1):
+                    j0 = i0 + win_len - 1
+                    paths_tried += 1
+                    if paths_tried >= MAX_WINDOWS:
+                        break
+                    pts_w = pts[i0 : j0 + 2]
+                    if len(pts_w) < 3:
+                        continue
+                    try:
+                        c2, r2, e2 = fit_circle(pts_w)
+                        r2 = float(r2)
+                        e2 = float(e2)
+                        a2 = float(get_arc_angle_span(pts_w, c2))
+                    except Exception:
+                        continue
+                    if not (min_radius_px <= r2 <= max_radius_px):
+                        continue
+                    if not _rmse_ok(e2, r2):
+                        continue
+                    if not (min_angle_deg <= a2 <= max_angle_deg):
+                        continue
+                    # Score: prefer ~90deg-ish arcs, larger angle spans, and better fits.
+                    fit_score = max(0.0, 1.0 - (e2 / max(1e-6, float(max_circle_fit_rmse))))
+                    score = (a2 * 1.0) + (fit_score * 40.0) + (float(win_len) * 0.35)
+                    if best is None or score > best[0]:
+                        best = (score, i0, j0, c2, r2, e2, a2)
+                if best is not None and win_len >= max(min_segments + 2, 10):
+                    # We found a reasonably long valid sub-arc; don't keep searching tiny windows.
+                    break
+
+            if best is not None:
+                _, i0, j0, center, radius, rmse, angle_span = best
+                ordered = ordered[i0 : j0 + 1]
+                pts = pts[i0 : j0 + 2]
+                ok_full = True
+
+        if not ok_full:
             continue
 
         out.append(
@@ -573,15 +787,29 @@ def _debug_polyline_arcs_from_lines_subset(
     min_segments = int(poly_conf.get("min_segments", 4) or 4)
     max_segments = int(poly_conf.get("max_segments", 36) or 36)
     max_seg_len = float(poly_conf.get("max_segment_length_px", 85.0) or 85.0)
+    allow_dashed = bool(poly_conf.get("allow_dashed", False))
     allow_branches = bool(poly_conf.get("allow_branches", True))
     max_paths_per_component = int(poly_conf.get("max_paths_per_component", 200) or 200)
 
     # Fit/arc thresholds (same as swing.arc).
     max_circle_fit_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
+    max_circle_fit_rmse_ratio = float(arc_conf.get("max_circle_fit_rmse_ratio", 0.0) or 0.0)
     min_radius_px = float(arc_conf.get("min_radius_px", 0.0) or 0.0)
     max_radius_px = float(arc_conf.get("max_radius_px", 1e9) or 1e9)
     min_angle_deg = float(arc_conf.get("min_angle_deg", 0.0) or 0.0)
     max_angle_deg = float(arc_conf.get("max_angle_deg", 1e9) or 1e9)
+
+    def _rmse_ok(rmse: float, radius: float) -> bool:
+        try:
+            rmse_f = float(rmse)
+            r_f = float(radius)
+        except Exception:
+            return False
+        if rmse_f <= float(max_circle_fit_rmse):
+            return True
+        if max_circle_fit_rmse_ratio and max_circle_fit_rmse_ratio > 0 and r_f > 1e-6:
+            return (rmse_f / r_f) <= float(max_circle_fit_rmse_ratio)
+        return False
 
     if not (endpoint_snap_px > 0):
         endpoint_snap_px = 3.0
@@ -599,12 +827,20 @@ def _debug_polyline_arcs_from_lines_subset(
             ln = lines[int(i)]
         except Exception:
             continue
-        if _is_dashed_primitive(ln):
+        if _is_dashed_primitive(ln) and not allow_dashed:
             continue
         try:
             p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
             p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
         except Exception:
+            continue
+        # Match `_extract_polyline_arcs_from_lines`: exclude perfectly axis-aligned segments.
+        try:
+            dx = abs(float(p1[0]) - float(p0[0]))
+            dy = abs(float(p1[1]) - float(p0[1]))
+        except Exception:
+            dx, dy = 0.0, 0.0
+        if dx < 1e-3 or dy < 1e-3:
             continue
         seg_len = float(dist_point_to_point(p0, p1))
         if not (0.5 <= seg_len <= max_seg_len):
@@ -619,6 +855,7 @@ def _debug_polyline_arcs_from_lines_subset(
     if not usable:
         return {
             "enabled": True,
+            "allow_dashed": bool(allow_dashed),
             "usable_short_segments": 0,
             "component_sizes": [],
             "rejected_components": [],
@@ -694,8 +931,10 @@ def _debug_polyline_arcs_from_lines_subset(
         if len(end_nodes) != 2:
             # Many door arcs get "branched" where a wall/leaf line touches the arc polyline,
             # producing 3+ endpoints. In that case, try to recover a simple path that still
-            # fits a plausible arc. Keep loops (end_nodes==0) rejected to avoid label bubbles.
-            if not allow_branches or len(end_nodes) < 2:
+            # fits a plausible arc.
+            #
+            # Note: loops (0 endpoints) are intentionally rejected to avoid label bubbles/circles.
+            if not allow_branches or len(end_nodes) == 0:
                 _reject(comp=comp, reason="component.topology", detail={"end_nodes": int(len(end_nodes))})
                 continue  # ignore loops/branches unless enabled
 
@@ -783,16 +1022,38 @@ def _debug_polyline_arcs_from_lines_subset(
                     path.pop()
                     used.remove(li)
 
-            # Enumerate simple paths between endpoint pairs, keep the best arc-like one.
-            for i in range(len(end_nodes)):
-                for j in range(i + 1, len(end_nodes)):
-                    path_start = end_nodes[i]
-                    target = end_nodes[j]
-                    _dfs(path_start, target, set(), [])
+            # Search for an arc-like path.
+            #
+            # - Normal branchy case: try paths between endpoint pairs.
+            # - Loop-with-branch case (no endpoints): start from junction nodes (deg != 2) and
+            #   try targets within the component (capped) — this recovers door arcs connected
+            #   to a leaf line while still rejecting pure loops like circles.
+            if len(end_nodes) >= 2:
+                for i in range(len(end_nodes)):
+                    for j in range(i + 1, len(end_nodes)):
+                        path_start = end_nodes[i]
+                        target = end_nodes[j]
+                        _dfs(path_start, target, set(), [])
+                        if paths_tried >= max_paths_per_component:
+                            break
                     if paths_tried >= max_paths_per_component:
                         break
-                if paths_tried >= max_paths_per_component:
-                    break
+            else:
+                starts = [n for n, d in node_deg.items() if int(d) != 2]
+                if len(starts) > 8:
+                    starts = starts[:8]
+                for path_start in starts:
+                    targets = [t for t, d in node_deg.items() if t != path_start and int(d) != 2]
+                    if not targets:
+                        targets = [t for t in node_deg.keys() if t != path_start]
+                    if len(targets) > 24:
+                        targets = targets[:24]
+                    for target in targets:
+                        _dfs(path_start, target, set(), [])
+                        if paths_tried >= max_paths_per_component:
+                            break
+                    if paths_tried >= max_paths_per_component:
+                        break
 
             if best_path is None or best_start is None:
                 _reject(
@@ -870,10 +1131,67 @@ def _debug_polyline_arcs_from_lines_subset(
         fails: List[str] = []
         if not (min_radius_px <= radius <= max_radius_px):
             fails.append("arc.radius")
-        if rmse > max_circle_fit_rmse:
+        if not _rmse_ok(rmse, radius):
             fails.append("arc.rmse")
         if not (min_angle_deg <= angle_span <= max_angle_deg):
             fails.append("arc.angle_span")
+
+        # Sub-arc recovery: if full path fails, attempt to find a contiguous subpath that passes.
+        # This mirrors the non-debug extractor and helps diagnose (and fix) double-door / double-acting symbols.
+        if fails and len(ordered) >= max(min_segments + 1, 6):
+            best = None  # (score, i0, j0, center, radius, rmse, angle_span)
+            paths_tried = 0
+            MAX_WINDOWS = 3200
+            m = len(ordered)
+            # Reconstruct a points list aligned with ordered segments (same as extractor).
+            pts_full = pts
+            for win_len in range(m, min_segments - 1, -1):
+                if paths_tried >= MAX_WINDOWS:
+                    break
+                for i0 in range(0, m - win_len + 1):
+                    j0 = i0 + win_len - 1
+                    paths_tried += 1
+                    if paths_tried >= MAX_WINDOWS:
+                        break
+                    pts_w = pts_full[i0 : j0 + 2]
+                    if len(pts_w) < 3:
+                        continue
+                    try:
+                        c2, r2, e2 = fit_circle(pts_w)
+                        r2 = float(r2)
+                        e2 = float(e2)
+                        a2 = float(get_arc_angle_span(pts_w, c2))
+                    except Exception:
+                        continue
+                    if not (min_radius_px <= r2 <= max_radius_px):
+                        continue
+                    if not _rmse_ok(e2, r2):
+                        continue
+                    if not (min_angle_deg <= a2 <= max_angle_deg):
+                        continue
+                    fit_score = max(0.0, 1.0 - (e2 / max(1e-6, float(max_circle_fit_rmse))))
+                    score = (a2 * 1.0) + (fit_score * 40.0) + (float(win_len) * 0.35)
+                    if best is None or score > best[0]:
+                        best = (score, i0, j0, c2, r2, e2, a2)
+                if best is not None and win_len >= max(min_segments + 2, 10):
+                    break
+
+            if best is not None:
+                _, i0, j0, c2, r2, e2, a2 = best
+                ordered2 = ordered[i0 : j0 + 1]
+                center = c2
+                radius = float(r2)
+                rmse = float(e2)
+                angle_span = float(a2)
+                fails = []
+                if not (min_radius_px <= radius <= max_radius_px):
+                    fails.append("arc.radius")
+                if not _rmse_ok(rmse, radius):
+                    fails.append("arc.rmse")
+                if not (min_angle_deg <= angle_span <= max_angle_deg):
+                    fails.append("arc.angle_span")
+                if not fails:
+                    ordered = ordered2
 
         arc_candidates.append(
             {
@@ -889,6 +1207,7 @@ def _debug_polyline_arcs_from_lines_subset(
                     "min_radius_px": float(min_radius_px),
                     "max_radius_px": float(max_radius_px),
                     "max_rmse": float(max_circle_fit_rmse),
+                    "max_rmse_ratio": float(max_circle_fit_rmse_ratio),
                     "min_angle_deg": float(min_angle_deg),
                     "max_angle_deg": float(max_angle_deg),
                 },
@@ -901,6 +1220,7 @@ def _debug_polyline_arcs_from_lines_subset(
         "min_segments": int(min_segments),
         "max_segments": int(max_segments),
         "max_segment_length_px": float(max_seg_len),
+        "allow_dashed": bool(allow_dashed),
         "usable_short_segments": int(len(usable)),
         "component_sizes": [int(x) for x in component_sizes],
         "rejected_components": rejected_components,
@@ -979,7 +1299,17 @@ def detect_swing_candidates(
 
         if not (arc_conf["min_radius_px"] <= radius <= arc_conf["max_radius_px"]):
             continue
-        if rmse > arc_conf["max_circle_fit_rmse"]:
+        # Mirror `_extract_polyline_arcs_from_lines`: allow relative RMSE tolerance for large-radius arcs.
+        try:
+            max_rmse = float(arc_conf.get("max_circle_fit_rmse", 2.5) or 2.5)
+        except Exception:
+            max_rmse = float(arc_conf["max_circle_fit_rmse"])
+        try:
+            max_rmse_ratio = float(arc_conf.get("max_circle_fit_rmse_ratio", 0.0) or 0.0)
+        except Exception:
+            max_rmse_ratio = 0.0
+        rmse_ok = bool(rmse <= max_rmse) or bool(max_rmse_ratio > 0 and radius > 1e-6 and (rmse / radius) <= max_rmse_ratio)
+        if not rmse_ok:
             continue
         if not (arc_conf["min_angle_deg"] <= angle_span <= arc_conf["max_angle_deg"]):
             continue
@@ -1292,6 +1622,270 @@ def detect_swing_candidates(
         cand.pop("_circle_key", None)
 
     return strict_candidates, candidate_pool
+
+
+def detect_swing_leaf_only_candidates(
+    *,
+    lines: List[Dict[str, Any]],
+    line_index: SpatialIndex,
+    config: Dict[str, Any],
+    line_indices: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    """Leaf-only swing candidates for cases where the arc is missing/raster.
+
+    Motivation:
+    - Some “vector” PDFs still rasterize the curved swing arc while keeping the leaf line as a vector.
+    - Our main swing detector is arc-first; without an arc primitive, no `swing` candidate can exist.
+    - This helper proposes **candidate-only** `swing_leaf` boxes from diagonal leaf-like lines whose
+      hinge endpoint is near a wall corner (axis-aligned linework).
+
+    These candidates are intended for snapping / interactive labeling, not auto-selection.
+    """
+    swing_conf = (config.get("swing") or {}) if isinstance(config, dict) else {}
+    leaf_only = (swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}
+    if not bool(leaf_only.get("enabled", False)):
+        return []
+
+    min_len = float(leaf_only.get("min_leaf_length_px", 40.0) or 40.0)
+    max_len = float(leaf_only.get("max_leaf_length_px", 420.0) or 420.0)
+    corner_probe = float(leaf_only.get("corner_probe_px", 8.0) or 8.0)
+    corner_endpoint_snap = float(leaf_only.get("corner_endpoint_snap_px", corner_probe) or corner_probe)
+    min_axis_support_len = float(leaf_only.get("min_axis_support_length_px", 40.0) or 40.0)
+    # Some plans render thick wall edges as many short axis-aligned segments (often “dashed” visually).
+    # To avoid missing hinge support in these cases, allow *thick* short segments to count as wall support.
+    wall_support_min_stroke = float(leaf_only.get("wall_support_min_stroke_width", 1.0) or 1.0)
+    wall_support_min_len = float(leaf_only.get("wall_support_min_segment_length_px", 12.0) or 12.0)
+    axis_ratio = float(leaf_only.get("axis_alignment_ratio", 0.20) or 0.20)  # <=0.2 means "mostly axis-aligned"
+    pad_frac = float(leaf_only.get("pad_frac_of_length", 0.22) or 0.22)
+    max_out = int(leaf_only.get("max_candidates", 600) or 600)
+    # When the hinge lies on the interior of a wall segment (not at a corner),
+    # we still want a candidate, but we need extra guardrails to avoid flooding
+    # the pool with diagonal annotation lines.
+    min_tip_clearance_px = float(leaf_only.get("min_tip_clearance_px", 3.0) or 3.0)
+    min_leaf_to_wall_angle_deg = float(leaf_only.get("min_leaf_to_wall_angle_deg", 18.0) or 18.0)
+
+    snap_strict = float(corner_endpoint_snap)
+    # Soft snap tolerates wall thickness / quantization / slight drafting offsets.
+    # Use a larger neighborhood than the "corner probe" so we don't miss hinges that sit
+    # on the interior of thick walls (common in drafted plans).
+    snap_soft = max(float(corner_probe) * 2.0, float(corner_endpoint_snap) * 2.0, 12.0)
+
+    def _is_axis_aligned(dx: float, dy: float) -> Tuple[bool, bool]:
+        """Return (mostly_horizontal, mostly_vertical)."""
+        adx = abs(dx)
+        ady = abs(dy)
+        if adx <= 1e-6 and ady <= 1e-6:
+            return False, False
+        mostly_h = ady <= axis_ratio * max(1e-6, adx)
+        mostly_v = adx <= axis_ratio * max(1e-6, ady)
+        return bool(mostly_h), bool(mostly_v)
+
+    def _dist_point_to_segment(p: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        """Euclidean distance from p to segment ab."""
+        px, py = float(p[0]), float(p[1])
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        vx = bx - ax
+        vy = by - ay
+        wx = px - ax
+        wy = py - ay
+        c2 = vx * vx + vy * vy
+        if c2 <= 1e-12:
+            return float(dist_point_to_point((px, py), (ax, ay)))
+        t = (wx * vx + wy * vy) / c2
+        if t <= 0.0:
+            return float(dist_point_to_point((px, py), (ax, ay)))
+        if t >= 1.0:
+            return float(dist_point_to_point((px, py), (bx, by)))
+        proj = (ax + t * vx, ay + t * vy)
+        return float(dist_point_to_point((px, py), proj))
+
+    def _axis_support(pt: Tuple[float, float], *, skip_idx: int) -> Dict[str, Any]:
+        """Return nearby axis-aligned support evidence for a hinge point.
+
+        We treat this as a *candidate-pool* heuristic:
+        - Strong (corner-like) evidence: both horizontal and vertical support nearby.
+        - Weak (mid-wall) evidence: one axis support nearby, with extra guardrails later.
+        """
+        x, y = float(pt[0]), float(pt[1])
+        probe = max(float(corner_probe), float(snap_soft))
+        q = [x - probe, y - probe, x + probe, y + probe]
+        neigh = line_index.query(q)
+        has_h = False
+        has_v = False
+        has_h_strict = False
+        has_v_strict = False
+        min_dist_any = float("inf")
+        min_dist_support = float("inf")
+        for j in neigh:
+            if int(j) == int(skip_idx):
+                continue
+            ln = lines[int(j)]
+            if _is_dashed_primitive(ln):
+                continue
+            p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
+            p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
+            L = float(dist_point_to_point(p0, p1))
+            # Allow thick, short wall fragments to count as support.
+            try:
+                sw = float(ln.get("stroke_width") or 0.0)
+            except Exception:
+                sw = 0.0
+            min_len_req = float(wall_support_min_len) if (sw >= wall_support_min_stroke) else float(min_axis_support_len)
+            if L < min_len_req:
+                continue
+            dx = p1[0] - p0[0]
+            dy = p1[1] - p0[1]
+            is_h, is_v = _is_axis_aligned(dx, dy)
+            if not (is_h or is_v):
+                continue
+
+            dseg = float(_dist_point_to_segment((x, y), p0, p1))
+            min_dist_any = min(min_dist_any, dseg)
+            # The hinge may land on the interior of a long wall segment (not just endpoints).
+            # Use a "soft" snap distance to tolerate wall thickness and rounding.
+            if dseg > snap_soft:
+                continue
+            min_dist_support = min(min_dist_support, dseg)
+
+            if is_h:
+                has_h = True
+                if dseg <= snap_strict:
+                    has_h_strict = True
+            if is_v:
+                has_v = True
+                if dseg <= snap_strict:
+                    has_v_strict = True
+            if has_h and has_v and has_h_strict and has_v_strict:
+                break
+
+        score = int(has_h) + int(has_v)
+        strength = "none"
+        if score > 0:
+            strength = "strict" if (has_h_strict or has_v_strict) else "soft"
+        return {
+            "score": int(score),
+            "strength": str(strength),
+            "has_h": bool(has_h),
+            "has_v": bool(has_v),
+            "has_h_strict": bool(has_h_strict),
+            "has_v_strict": bool(has_v_strict),
+            "min_dist_any": float(min_dist_any) if math.isfinite(min_dist_any) else None,
+            "min_dist_support": float(min_dist_support) if math.isfinite(min_dist_support) else None,
+        }
+
+    out: List[Dict[str, Any]] = []
+    scan = line_indices if isinstance(line_indices, list) else list(range(len(lines)))
+    for l_idx in scan:
+        try:
+            ln = lines[int(l_idx)]
+        except Exception:
+            continue
+        try:
+            if _is_dashed_primitive(ln):
+                continue
+            p0 = (float(ln["p0"]["x"]), float(ln["p0"]["y"]))
+            p1 = (float(ln["p1"]["x"]), float(ln["p1"]["y"]))
+        except Exception:
+            continue
+        L = float(dist_point_to_point(p0, p1))
+        if not (min_len <= L <= max_len):
+            continue
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        # Leaf line should be noticeably non-axis-aligned.
+        is_h, is_v = _is_axis_aligned(dx, dy)
+        if is_h or is_v:
+            continue
+
+        sup0 = _axis_support(p0, skip_idx=l_idx)
+        sup1 = _axis_support(p1, skip_idx=l_idx)
+        s0 = int(sup0.get("score") or 0)
+        s1 = int(sup1.get("score") or 0)
+        if s0 <= 0 and s1 <= 0:
+            continue
+
+        # Prefer a hinge endpoint with stronger axis support. Tie-break by proximity to support.
+        d0 = float(sup0.get("min_dist_support") or 1e18)
+        d1 = float(sup1.get("min_dist_support") or 1e18)
+        if s0 > s1 or (s0 == s1 and d0 <= d1):
+            hinge = p0
+            tip = p1
+            hinge_sup = sup0
+            tip_sup = sup1
+        else:
+            hinge = p1
+            tip = p0
+            hinge_sup = sup1
+            tip_sup = sup0
+        corner_score = int(hinge_sup.get("score") or 0)
+        support_strength = str(hinge_sup.get("strength") or "none")
+
+        # Guardrails for mid-wall hinges: allow score==1 (single axis-aligned wall support),
+        # but require the leaf to "stick out" away from wall geometry and not be near-parallel
+        # to the supporting wall direction.
+        if corner_score < 2:
+            try:
+                hinge_any = hinge_sup.get("min_dist_any")
+                hinge_any_f = float(hinge_any) if hinge_any is not None else float("inf")
+            except Exception:
+                hinge_any_f = float("inf")
+            try:
+                tip_any = tip_sup.get("min_dist_any")
+                tip_any_f = float(tip_any) if tip_any is not None else float("inf")
+            except Exception:
+                tip_any_f = float("inf")
+            if not (tip_any_f >= hinge_any_f + float(min_tip_clearance_px)):
+                continue
+
+            # Angle-to-wall gating.
+            ang = abs(math.degrees(math.atan2(dy, dx))) % 180.0
+            has_h_wall = bool(hinge_sup.get("has_h"))
+            has_v_wall = bool(hinge_sup.get("has_v"))
+            if has_h_wall and not has_v_wall:
+                # Horizontal wall: leaf must not be near-horizontal.
+                parallel_err = min(ang, 180.0 - ang)
+                if parallel_err < float(min_leaf_to_wall_angle_deg):
+                    continue
+            elif has_v_wall and not has_h_wall:
+                # Vertical wall: leaf must not be near-vertical.
+                parallel_err = abs(ang - 90.0)
+                if parallel_err < float(min_leaf_to_wall_angle_deg):
+                    continue
+            # If both wall directions are present, treat as a corner and skip angle gating.
+
+        pad = max(6.0, pad_frac * L)
+        bbox = [min(p0[0], p1[0]) - pad, min(p0[1], p1[1]) - pad, max(p0[0], p1[0]) + pad, max(p0[1], p1[1]) + pad]
+        cid = _stable_line_candidate_id(cand_type="swing_leaf", p0=p0, p1=p1, bbox_xyxy=bbox, quant_step_px=1.0)
+
+        # Conservative heuristic confidence (kept low; intended for UI snapping only).
+        # - Corner support gets a small boost.
+        # - Strict distance gets a small boost (soft support can be noisier).
+        conf_h = 0.16 + (0.08 if corner_score >= 2 else 0.02) + (0.04 if support_strength == "strict" else 0.0)
+        conf_h = max(0.0, min(0.32, float(conf_h)))
+
+        out.append(
+            {
+                "id": cid,
+                "legacy_ids": [],
+                "type": "swing_leaf",
+                "bbox_xyxy": bbox,
+                "geom": {"hinge_xy": [float(hinge[0]), float(hinge[1])], "tip_xy": [float(tip[0]), float(tip[1])]},
+                "heuristic_confidence": float(conf_h),
+                "confidence": float(conf_h),
+                "pool": True,
+                "features": {
+                    "leaf_only": 1.0,
+                    "leaf_length_px": float(L),
+                    "corner_support": float(corner_score),
+                    "axis_support_strength": 1.0 if support_strength == "strict" else 0.5 if support_strength == "soft" else 0.0,
+                },
+                "primitives": {"lines": [int(l_idx)]},
+            }
+        )
+
+    out.sort(key=lambda c: float(c.get("confidence", 0.0) or 0.0), reverse=True)
+    return out[: max(0, max_out)]
 
 
 def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1685,6 +2279,16 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
         strict_swing, pool_swing = detect_swing_candidates(lines=lines, beziers=beziers, line_index=line_index, config=config)
         strict_candidates_all.extend(strict_swing)
         candidate_pool_all.extend(pool_swing)
+        # Optional: leaf-only swing candidates (for cases where the leaf is vector but the arc is missing/raster).
+        try:
+            swing_conf = (config.get("swing") or {}) if isinstance(config, dict) else {}
+            leaf_only_conf = (swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}
+            if bool(leaf_only_conf.get("enabled", False)):
+                candidate_pool_all.extend(
+                    detect_swing_leaf_only_candidates(lines=lines, line_index=line_index, config=config)
+                )
+        except Exception:
+            pass
 
     # --- Double (pair swing candidates) ---
     if bool((config.get("double") or {}).get("enabled")) and candidate_pool_all:
@@ -1836,6 +2440,7 @@ def debug_explain_unmatched_box(
     config: Dict[str, Any],
     pad_px: float = 20.0,
     max_examples: int = 12,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """Return a structured report explaining why a region produced no snap candidate.
 
@@ -1855,30 +2460,40 @@ def debug_explain_unmatched_box(
 
     lines: List[Dict[str, Any]] = list(primitives.get("lines", []) or [])
     beziers: List[Dict[str, Any]] = list(primitives.get("beziers", []) or [])
+    if perf_enabled():
+        perf_log(
+            "doors.debug_explain.inputs",
+            verbose=bool(verbose),
+            lines_total=int(len(lines)),
+            beziers_total=int(len(beziers)),
+            roi_full_xyxy=[float(v) for v in roi],
+        )
 
     # Cheap "nearby" filtering using control-point bbox.
     near_lines: List[int] = []
-    for i, ln in enumerate(lines):
-        try:
-            x0 = float(min(ln["p0"]["x"], ln["p1"]["x"]))
-            y0 = float(min(ln["p0"]["y"], ln["p1"]["y"]))
-            x1 = float(max(ln["p0"]["x"], ln["p1"]["x"]))
-            y1 = float(max(ln["p0"]["y"], ln["p1"]["y"]))
-        except Exception:
-            continue
-        if _bbox_intersects([x0, y0, x1, y1], roi):
-            near_lines.append(i)
+    with perf_span("doors.debug_explain.filter_lines", verbose=bool(verbose), lines_total=int(len(lines))):
+        for i, ln in enumerate(lines):
+            try:
+                x0 = float(min(ln["p0"]["x"], ln["p1"]["x"]))
+                y0 = float(min(ln["p0"]["y"], ln["p1"]["y"]))
+                x1 = float(max(ln["p0"]["x"], ln["p1"]["x"]))
+                y1 = float(max(ln["p0"]["y"], ln["p1"]["y"]))
+            except Exception:
+                continue
+            if _bbox_intersects([x0, y0, x1, y1], roi):
+                near_lines.append(i)
 
     near_beziers: List[int] = []
-    for i, bz in enumerate(beziers):
-        try:
-            xs = [float(bz["p0"]["x"]), float(bz["p1"]["x"]), float(bz["p2"]["x"]), float(bz["p3"]["x"])]
-            ys = [float(bz["p0"]["y"]), float(bz["p1"]["y"]), float(bz["p2"]["y"]), float(bz["p3"]["y"])]
-        except Exception:
-            continue
-        bb = [min(xs), min(ys), max(xs), max(ys)]
-        if _bbox_intersects(bb, roi):
-            near_beziers.append(i)
+    with perf_span("doors.debug_explain.filter_beziers", verbose=bool(verbose), beziers_total=int(len(beziers))):
+        for i, bz in enumerate(beziers):
+            try:
+                xs = [float(bz["p0"]["x"]), float(bz["p1"]["x"]), float(bz["p2"]["x"]), float(bz["p3"]["x"])]
+                ys = [float(bz["p0"]["y"]), float(bz["p1"]["y"]), float(bz["p2"]["y"]), float(bz["p3"]["y"])]
+            except Exception:
+                continue
+            bb = [min(xs), min(ys), max(xs), max(ys)]
+            if _bbox_intersects(bb, roi):
+                near_beziers.append(i)
 
     swing_conf = (config.get("swing") or {}) if isinstance(config, dict) else {}
     arc_conf = (swing_conf.get("arc") or {}) if isinstance(swing_conf, dict) else {}
@@ -1956,10 +2571,10 @@ def debug_explain_unmatched_box(
     }
 
     # Always-verbose additions (bounded with truncation guards).
-    MAX_NEAR_LINES = 2000
-    MAX_NEAR_BEZIERS = 2000
-    MAX_PAIRINGS_VERBOSE = 20000
-    MAX_POLY_ARCS_VERBOSE = 300
+    MAX_NEAR_LINES = 2000 if verbose else 650
+    MAX_NEAR_BEZIERS = 2000 if verbose else 650
+    MAX_PAIRINGS_VERBOSE = 20000 if verbose else 0
+    MAX_POLY_ARCS_VERBOSE = 300 if verbose else 80
     verbose_pairings: List[Dict[str, Any]] = []
     verbose_truncated = False
 
@@ -1989,8 +2604,18 @@ def debug_explain_unmatched_box(
         strict_max_tip_ratio = None
 
     # Build a line spatial index so we can test pairings near each arc quickly.
+    #
+    # IMPORTANT:
+    # In "summary-only" mode (`verbose=False`), avoid indexing the entire page's line set
+    # (can be hundreds of thousands). Restrict to the ROI-adjacent lines, which is sufficient
+    # to answer "why did swing candidate generation fail near this box?"
     line_index = SpatialIndex(cell_size=200.0)
-    for i, ln in enumerate(lines):
+    iter_line_indices = range(len(lines)) if verbose else near_lines
+    for i in iter_line_indices:
+        try:
+            ln = lines[int(i)]
+        except Exception:
+            continue
         try:
             x0 = float(min(ln["p0"]["x"], ln["p1"]["x"]))
             y0 = float(min(ln["p0"]["y"], ln["p1"]["y"]))
@@ -1998,7 +2623,7 @@ def debug_explain_unmatched_box(
             y1 = float(max(ln["p0"]["y"], ln["p1"]["y"]))
         except Exception:
             continue
-        line_index.add(i, [x0, y0, x1, y1])
+        line_index.add(int(i), [x0, y0, x1, y1])
 
     # Verbose listing of near primitives.
     near_lines_truncated = False
@@ -2023,48 +2648,58 @@ def debug_explain_unmatched_box(
         near_primitives["lines_truncated"] = True
     if near_beziers_truncated:
         near_primitives["beziers_truncated"] = True
-    for l_idx in near_lines_list:
-        ln = lines[l_idx]
-        try:
-            p0 = {"x": float(ln["p0"]["x"]), "y": float(ln["p0"]["y"])}
-            p1 = {"x": float(ln["p1"]["x"]), "y": float(ln["p1"]["y"])}
-            x0, y0 = min(p0["x"], p1["x"]), min(p0["y"], p1["y"])
-            x1, y1 = max(p0["x"], p1["x"]), max(p0["y"], p1["y"])
-            rec = {
-                "l_idx": int(l_idx),
-                "p0": p0,
-                "p1": p1,
-                "len_px": float(dist_point_to_point((p0["x"], p0["y"]), (p1["x"], p1["y"]))),
-                "bbox_xyxy": [float(x0), float(y0), float(x1), float(y1)],
-                "is_dashed": bool(_is_dashed_primitive(ln)),
-            }
-            near_primitives["lines"].append(rec)
-        except Exception:
-            continue
+    if verbose:
+        for l_idx in near_lines_list:
+            ln = lines[l_idx]
+            try:
+                p0 = {"x": float(ln["p0"]["x"]), "y": float(ln["p0"]["y"])}
+                p1 = {"x": float(ln["p1"]["x"]), "y": float(ln["p1"]["y"])}
+                x0, y0 = min(p0["x"], p1["x"]), min(p0["y"], p1["y"])
+                x1, y1 = max(p0["x"], p1["x"]), max(p0["y"], p1["y"])
+                rec = {
+                    "l_idx": int(l_idx),
+                    "p0": p0,
+                    "p1": p1,
+                    "len_px": float(dist_point_to_point((p0["x"], p0["y"]), (p1["x"], p1["y"]))),
+                    "bbox_xyxy": [float(x0), float(y0), float(x1), float(y1)],
+                    "is_dashed": bool(_is_dashed_primitive(ln)),
+                }
+                near_primitives["lines"].append(rec)
+            except Exception:
+                continue
 
-    for b_idx in near_beziers_list:
-        bz = beziers[b_idx]
-        try:
-            p0 = {"x": float(bz["p0"]["x"]), "y": float(bz["p0"]["y"])}
-            p1 = {"x": float(bz["p1"]["x"]), "y": float(bz["p1"]["y"])}
-            p2 = {"x": float(bz["p2"]["x"]), "y": float(bz["p2"]["y"])}
-            p3 = {"x": float(bz["p3"]["x"]), "y": float(bz["p3"]["y"])}
-            xs = [p0["x"], p1["x"], p2["x"], p3["x"]]
-            ys = [p0["y"], p1["y"], p2["y"], p3["y"]]
-            rec = {
-                "b_idx": int(b_idx),
-                "p0": p0,
-                "p1": p1,
-                "p2": p2,
-                "p3": p3,
-                "bbox_xyxy": [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))],
-            }
-            near_primitives["beziers"].append(rec)
-        except Exception:
-            continue
+    if verbose:
+        for b_idx in near_beziers_list:
+            bz = beziers[b_idx]
+            try:
+                p0 = {"x": float(bz["p0"]["x"]), "y": float(bz["p0"]["y"])}
+                p1 = {"x": float(bz["p1"]["x"]), "y": float(bz["p1"]["y"])}
+                p2 = {"x": float(bz["p2"]["x"]), "y": float(bz["p2"]["y"])}
+                p3 = {"x": float(bz["p3"]["x"]), "y": float(bz["p3"]["y"])}
+                xs = [p0["x"], p1["x"], p2["x"], p3["x"]]
+                ys = [p0["y"], p1["y"], p2["y"], p3["y"]]
+                rec = {
+                    "b_idx": int(b_idx),
+                    "p0": p0,
+                    "p1": p1,
+                    "p2": p2,
+                    "p3": p3,
+                    "bbox_xyxy": [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))],
+                }
+                near_primitives["beziers"].append(rec)
+            except Exception:
+                continue
 
-    # Polyline-arc diagnostics within the ROI subset of lines (always verbose).
-    poly_dbg = _debug_polyline_arcs_from_lines_subset(lines=lines, line_indices=near_lines, config=config)
+    # Polyline-arc diagnostics within the ROI subset of lines.
+    # This can be non-trivial (path search in branched components), so time it when profiling is enabled.
+    with perf_span(
+        "doors.debug_explain.polyline_arc_debug",
+        verbose=bool(verbose),
+        near_lines=int(len(near_lines)),
+    ):
+        poly_dbg = _debug_polyline_arcs_from_lines_subset(
+            lines=lines, line_indices=near_lines, config=config, max_rejected_examples=(25 if verbose else 0)
+        )
     poly_arc_candidates = list(poly_dbg.get("arc_candidates", []) or [])
     if len(poly_arc_candidates) > MAX_POLY_ARCS_VERBOSE:
         poly_dbg["arc_candidates"] = poly_arc_candidates[:MAX_POLY_ARCS_VERBOSE]
@@ -2090,6 +2725,24 @@ def debug_explain_unmatched_box(
         if "arc.angle_span" in fails:
             poly_fail_counts["angle"] += 1
     poly_dbg["arc_fail_counts_near"] = poly_fail_counts
+
+    # Leaf-only swing candidates (when enabled): quick signal for cases where the leaf is vector
+    # but arcs are missing/rasterized. Evaluate only within ROI-adjacent lines to keep this fast.
+    leaf_only_near: List[Dict[str, Any]] = []
+    try:
+        leaf_only_conf = (swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}
+        if bool(leaf_only_conf.get("enabled", False)):
+            scan_idx = list(near_lines)[: (2000 if verbose else 900)]
+            with perf_span(
+                "doors.debug_explain.leaf_only",
+                verbose=bool(verbose),
+                scan_lines=int(len(scan_idx)),
+            ):
+                leaf_only_near = detect_swing_leaf_only_candidates(
+                    lines=lines, line_index=line_index, config=config, line_indices=scan_idx
+                )
+    except Exception:
+        leaf_only_near = []
 
     # Compute circle-cluster suppression over *near* arcs (bezier + polyline) so the debug report
     # can explain why an arc was filtered. (Scope is near-ROI; this is sufficient for label bubbles.)
@@ -2216,7 +2869,7 @@ def debug_explain_unmatched_box(
             "fails": fails,
             "arc_conf": {"min_radius_px": min_r, "max_radius_px": max_r, "max_rmse": max_rmse, "min_angle_deg": min_a, "max_angle_deg": max_a},
         }
-        if len(arc_examples) < max_examples:
+        if len(arc_examples) < max_examples and verbose:
             arc_examples.append(ex)
 
         if fails:
@@ -2332,45 +2985,46 @@ def debug_explain_unmatched_box(
             if strict_ok:
                 pair_stats["strict_pass"] += 1
 
-            # Always-verbose per-pair record (bounded).
-            if len(verbose_pairings) < MAX_PAIRINGS_VERBOSE:
-                verbose_pairings.append(
-                    {
-                        "arc_source": "bezier",
-                        "b_idx": int(b_idx),
-                        "l_idx": int(l_idx),
-                        "radius": float(radius),
-                        "rmse": float(rmse),
-                        "angle_span_deg": float(angle_span),
-                        "len_ratio": float(len_ratio),
-                        "hinge_dist": float(min_hinge_dist),
-                        "center_dist": float(min(d0_center, d1_center)),
-                        "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
-                        "tip_to_arc_dist": float(tip_to_arc_dist),
-                        "pool_fail": pool_fail,
-                        "strict_fail": strict_fail,
-                    }
-                )
-            else:
-                verbose_truncated = True
+            if verbose:
+                # Always-verbose per-pair record (bounded).
+                if len(verbose_pairings) < MAX_PAIRINGS_VERBOSE:
+                    verbose_pairings.append(
+                        {
+                            "arc_source": "bezier",
+                            "b_idx": int(b_idx),
+                            "l_idx": int(l_idx),
+                            "radius": float(radius),
+                            "rmse": float(rmse),
+                            "angle_span_deg": float(angle_span),
+                            "len_ratio": float(len_ratio),
+                            "hinge_dist": float(min_hinge_dist),
+                            "center_dist": float(min(d0_center, d1_center)),
+                            "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
+                            "tip_to_arc_dist": float(tip_to_arc_dist),
+                            "pool_fail": pool_fail,
+                            "strict_fail": strict_fail,
+                        }
+                    )
+                else:
+                    verbose_truncated = True
 
-            if len(pair_stats["examples"]) < max_examples and (not pool_ok or not strict_ok):
-                pair_stats["examples"].append(
-                    {
-                        "b_idx": int(b_idx),
-                        "l_idx": int(l_idx),
-                        "radius": float(radius),
-                        "rmse": float(rmse),
-                        "angle_span_deg": float(angle_span),
-                        "len_ratio": float(len_ratio),
-                        "hinge_dist": float(min_hinge_dist),
-                        "center_dist": float(min(d0_center, d1_center)),
-                        "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
-                        "tip_to_arc_dist": float(tip_to_arc_dist),
-                        "pool_fail": pool_fail,
-                        "strict_fail": strict_fail,
-                    }
-                )
+                if len(pair_stats["examples"]) < max_examples and (not pool_ok or not strict_ok):
+                    pair_stats["examples"].append(
+                        {
+                            "b_idx": int(b_idx),
+                            "l_idx": int(l_idx),
+                            "radius": float(radius),
+                            "rmse": float(rmse),
+                            "angle_span_deg": float(angle_span),
+                            "len_ratio": float(len_ratio),
+                            "hinge_dist": float(min_hinge_dist),
+                            "center_dist": float(min(d0_center, d1_center)),
+                            "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
+                            "tip_to_arc_dist": float(tip_to_arc_dist),
+                            "pool_fail": pool_fail,
+                            "strict_fail": strict_fail,
+                        }
+                    )
 
     # Leaf pairing for polyline arcs that pass arc filters (always-verbose).
     # We mimic detect_swing_candidates by skipping leaf lines that are part of the arc polyline itself.
@@ -2503,24 +3157,25 @@ def debug_explain_unmatched_box(
             if strict_ok:
                 pair_stats["strict_pass"] += 1
 
-            if len(verbose_pairings) < MAX_PAIRINGS_VERBOSE:
-                verbose_pairings.append(
-                    {
-                        "arc_source": "polyline",
-                        "comp_idx": int(comp_idx),
-                        "l_idx": int(l_idx),
-                        "radius": float(radius),
-                        "len_ratio": float(len_ratio),
-                        "hinge_dist": float(min_hinge_dist),
-                        "center_dist": float(min(d0_center, d1_center)),
-                        "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
-                        "tip_to_arc_dist": float(tip_to_arc_dist),
-                        "pool_fail": pool_fail,
-                        "strict_fail": strict_fail,
-                    }
-                )
-            else:
-                verbose_truncated = True
+            if verbose:
+                if len(verbose_pairings) < MAX_PAIRINGS_VERBOSE:
+                    verbose_pairings.append(
+                        {
+                            "arc_source": "polyline",
+                            "comp_idx": int(comp_idx),
+                            "l_idx": int(l_idx),
+                            "radius": float(radius),
+                            "len_ratio": float(len_ratio),
+                            "hinge_dist": float(min_hinge_dist),
+                            "center_dist": float(min(d0_center, d1_center)),
+                            "radial_angle_deg": float(radial_angle_deg) if radial_angle_deg is not None else None,
+                            "tip_to_arc_dist": float(tip_to_arc_dist),
+                            "pool_fail": pool_fail,
+                            "strict_fail": strict_fail,
+                        }
+                    )
+                else:
+                    verbose_truncated = True
 
     # Pocket-line quick check (useful when swing arcs are absent).
     pocket_conf = (config.get("pocket") or {}) if isinstance(config, dict) else {}
@@ -2548,7 +3203,7 @@ def debug_explain_unmatched_box(
 
     report: Dict[str, Any] = {
         "kind": "unmatched_box_debug_v1",
-        "verbose": True,
+        "verbose": bool(verbose),
         "truncation": {
             "near_primitives_truncated": bool(near_primitives.get("truncated")),
             "polyline_arc_near_truncated": bool(poly_dbg.get("truncated")),
@@ -2594,6 +3249,11 @@ def debug_explain_unmatched_box(
                     "max_radial_angle_deg": float(pool_max_radial_angle_deg),
                     "max_tip_to_arc_ratio": float(pool_max_tip_to_arc_ratio),
                 },
+                "leaf_only": {
+                    "enabled": bool(((swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}).get("enabled", False)),
+                    "corner_probe_px": float((((swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}).get("corner_probe_px", 8.0) or 8.0)),
+                    "corner_endpoint_snap_px": float((((swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}).get("corner_endpoint_snap_px", 6.0) or 6.0)),
+                },
             }
         },
         "near_primitives": near_primitives,
@@ -2611,6 +3271,15 @@ def debug_explain_unmatched_box(
             "arc_circle_cluster_suppression": arc_suppression,
             "leaf_pair_stats_near": pair_stats,
             "polyline_arc_near": poly_dbg,
+            "leaf_only_near": {
+                "enabled": bool(((swing_conf.get("leaf_only") or {}) if isinstance(swing_conf, dict) else {}).get("enabled", False)),
+                "near_count": int(len(leaf_only_near)),
+                "near_examples": [
+                    {"id": str(c.get("id") or ""), "bbox_xyxy": c.get("bbox_xyxy"), "features": c.get("features")}
+                    for c in (leaf_only_near[: max(0, min(int(max_examples), 5))])
+                    if isinstance(c, dict)
+                ],
+            },
             "leaf_pairings_verbose": {
                 "count": int(len(verbose_pairings)),
                 "truncated": bool(verbose_truncated),
@@ -2626,5 +3295,183 @@ def debug_explain_unmatched_box(
         },
         "note": "Verbose report: includes near primitives and per-(arc,line) exclusion reasons. If beziers_near_roi is 0, the door swing may be rasterized or drawn as polylines; if arc_fail_counts are high, loosen swing.arc thresholds (especially max_radius_px).",
     }
+
+    # Add a concise, copy-friendly summary so logs don’t require expanding huge arrays.
+    try:
+        counts = report.get("counts") if isinstance(report.get("counts"), dict) else {}
+        swing = report.get("swing") if isinstance(report.get("swing"), dict) else {}
+        poly = swing.get("polyline_arc_near") if isinstance(swing.get("polyline_arc_near"), dict) else {}
+        poly_arcs = list(poly.get("arc_candidates") or []) if isinstance(poly.get("arc_candidates"), list) else []
+        poly_pass = 0
+        poly_fail = 0
+        poly_fail_counts: dict[str, int] = {"radius": 0, "rmse": 0, "angle": 0}
+        for a in poly_arcs:
+            fails = a.get("fails") if isinstance(a, dict) else None
+            if isinstance(fails, list) and len(fails) == 0:
+                poly_pass += 1
+            else:
+                poly_fail += 1
+                try:
+                    if isinstance(fails, list):
+                        for f in fails:
+                            sf = str(f or "")
+                            if "arc.radius" in sf:
+                                poly_fail_counts["radius"] = int(poly_fail_counts.get("radius", 0)) + 1
+                            elif "arc.rmse" in sf:
+                                poly_fail_counts["rmse"] = int(poly_fail_counts.get("rmse", 0)) + 1
+                            elif "arc.angle" in sf:
+                                poly_fail_counts["angle"] = int(poly_fail_counts.get("angle", 0)) + 1
+                except Exception:
+                    pass
+
+        # NOTE: `arc_pass_near_count` historically tracked only bezier-pass arcs in some builds.
+        # Use it as informational, but rely on `poly_pass`/`beziers_near` for primary diagnosis.
+        arc_pass_near = int(swing.get("arc_pass_near_count") or 0)
+        arc_fail_counts_near = swing.get("arc_fail_counts_near") if isinstance(swing.get("arc_fail_counts_near"), dict) else {}
+        leaf_stats = swing.get("leaf_pair_stats_near") if isinstance(swing.get("leaf_pair_stats_near"), dict) else {}
+        pool_pass = int(leaf_stats.get("pool_pass") or 0)
+        strict_pass = int(leaf_stats.get("strict_pass") or 0)
+
+        # Extra “is there any obvious swing geometry?” signals.
+        non_dashed_non_axis = 0
+        try:
+            for l_idx in list(near_lines)[: max(0, min(len(near_lines), 800))]:
+                ln = lines[int(l_idx)]
+                if bool(_is_dashed_primitive(ln)):
+                    continue
+                p0x = float(ln["p0"]["x"])
+                p0y = float(ln["p0"]["y"])
+                p1x = float(ln["p1"]["x"])
+                p1y = float(ln["p1"]["y"])
+                dx = p1x - p0x
+                dy = p1y - p0y
+                if math.hypot(dx, dy) < 2.0:
+                    continue
+                ang = abs(math.degrees(math.atan2(dy, dx))) % 180.0
+                if abs(ang - 0.0) < 5.0 or abs(ang - 90.0) < 5.0:
+                    continue
+                non_dashed_non_axis += 1
+        except Exception:
+            non_dashed_non_axis = 0
+
+        # Derive a single “what likely went wrong” label.
+        primary = "unknown"
+        hint: str | None = None
+        top_arc_fail = ""
+        try:
+            if isinstance(arc_fail_counts_near, dict) and arc_fail_counts_near:
+                # Only report a top fail if there is a non-zero winner.
+                k, v = max(arc_fail_counts_near.items(), key=lambda kv: int(kv[1] or 0))
+                top_arc_fail = str(k) if int(v or 0) > 0 else ""
+        except Exception:
+            top_arc_fail = ""
+
+        top_poly_fail = ""
+        try:
+            if isinstance(poly_fail_counts, dict) and poly_fail_counts:
+                k2, v2 = max(poly_fail_counts.items(), key=lambda kv: int(kv[1] or 0))
+                top_poly_fail = str(k2) if int(v2 or 0) > 0 else ""
+        except Exception:
+            top_poly_fail = ""
+
+        beziers_near = int(counts.get("beziers_near_roi") or 0)
+        # Common failure mode: leaf line exists, but the curved arc is missing (often rasterized).
+        # The main swing detector is arc-first, so this yields no `swing` candidate unless
+        # leaf-only candidates are enabled.
+        # NOTE:
+        # `arc_pass_near_count` historically tracked only *bezier* arcs in some builds.
+        # Use `poly_pass` as the polyline-arc analogue so we don't misclassify cases where
+        # polyline arcs exist but there are no bezier primitives near the ROI.
+        # Only call this "no_arc_primitives" when there truly is no arc geometry nearby.
+        # If polyline arc candidates exist but fail thresholds, prefer the threshold-based diagnosis below.
+        if beziers_near <= 0 and len(poly_arcs) <= 0 and int(arc_pass_near) <= 0 and int(poly_pass) <= 0 and non_dashed_non_axis > 0:
+            primary = "no_arc_primitives_near_roi"
+            hint = (
+                "No bezier arc primitives near ROI, but diagonal (leaf-like) linework exists. "
+                "If the swing arc is missing/rasterized, arc-first swing detection cannot produce a `swing` candidate. "
+                "Consider enabling `swing.leaf_only` candidates for snapping/labeling."
+            )
+        elif beziers_near <= 0 and int(poly_pass) <= 0 and len(poly_arcs) <= 0 and non_dashed_non_axis <= 0:
+            primary = "no_vector_arc_or_leaf_near_roi"
+            hint = (
+                "No bezier arcs and no non-dashed, non-axis linework near ROI. "
+                "The intended swing door symbol may be rasterized (or otherwise absent from vector primitives), "
+                "so arc/leaf-based candidate generation cannot produce a swing candidate."
+            )
+        elif arc_pass_near <= 0 and poly_pass <= 0:
+            if beziers_near <= 0 and len(poly_arcs) <= 0:
+                primary = "no_arc_geometry_near_roi"
+                hint = "No bezier or polyline arcs near ROI; swing door arcs may be rasterized or absent from primitives."
+            else:
+                # Prefer polyline failure signal when available; the most common missing-door case
+                # is a polyline arc that exists but fails circle-fit.
+                top_any_fail = top_poly_fail or top_arc_fail or "unknown"
+                primary = f"no_arc_passed_thresholds:{top_any_fail}"
+                if top_any_fail == "rmse":
+                    hint = (
+                        "Arcs were found but circle-fit RMSE failed (often for polyline arcs). "
+                        "Consider loosening swing.arc.max_circle_fit_rmse or enabling a relative RMSE tolerance "
+                        "(e.g. swing.arc.max_circle_fit_rmse_ratio) / improving polyline arc extraction."
+                    )
+                elif top_any_fail == "radius":
+                    hint = "Arcs were found but radius bounds failed; consider loosening swing.arc.{min_radius_px,max_radius_px}."
+                elif top_any_fail == "angle":
+                    hint = "Arcs were found but angle span failed; consider loosening swing.arc.{min_angle_deg,max_angle_deg}."
+        else:
+            if pool_pass <= 0:
+                primary = "leaf_pairing_failed_for_all_arcs"
+                hint = "Swing arcs exist near ROI, but no nearby line qualified as a leaf even under pool rules; door leaf may be merged into wall geometry or missing as a primitive."
+            elif strict_pass <= 0:
+                primary = "only_pool_pairs_passed"
+                hint = "Loose (pool) arc+leaf pairs exist, but strict leaf rules rejected them. Candidate should exist, but final doors may be missing."
+            else:
+                primary = "arcs_and_leaf_pairs_exist"
+
+        report["summary"] = {
+            "primary_failure": primary,
+            "hint": hint,
+            "counts": {
+                "lines_near_roi": int(counts.get("lines_near_roi") or 0),
+                "beziers_near_roi": beziers_near,
+                "non_dashed_non_axis_lines_near_roi": int(non_dashed_non_axis),
+                "polyline_arc_candidates_near": int(len(poly_arcs)),
+                "polyline_arc_pass_near": int(poly_pass),
+                "polyline_arc_fail_near": int(poly_fail),
+                "leaf_only_candidates_near": int(len(leaf_only_near)),
+                "arc_pass_near_count": int(arc_pass_near),
+                "leaf_pool_pass": int(pool_pass),
+                "leaf_strict_pass": int(strict_pass),
+            },
+            "top_leaf_pool_fail": None,
+            "top_leaf_strict_fail": None,
+            "top_arc_fail": top_arc_fail or None,
+            "top_polyline_arc_fail": top_poly_fail or None,
+        }
+        try:
+            # Expose the most common strict/pool leaf exclusion in summary-only mode.
+            pool_fc = leaf_stats.get("pool_fail_counts") if isinstance(leaf_stats, dict) else None
+            strict_fc = leaf_stats.get("strict_fail_counts") if isinstance(leaf_stats, dict) else None
+
+            def _top_fail(fc: Any) -> Optional[str]:
+                if not isinstance(fc, dict) or not fc:
+                    return None
+                best_k = None
+                best_v = 0
+                for k, v in fc.items():
+                    try:
+                        iv = int(v or 0)
+                    except Exception:
+                        iv = 0
+                    if iv > best_v:
+                        best_v = iv
+                        best_k = str(k)
+                return best_k if best_k and best_v > 0 else None
+
+            report["summary"]["top_leaf_pool_fail"] = _top_fail(pool_fc)
+            report["summary"]["top_leaf_strict_fail"] = _top_fail(strict_fc)
+        except Exception:
+            pass
+    except Exception:
+        pass
     return report
 

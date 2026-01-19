@@ -38,9 +38,19 @@ from door_detector.ui.sidebar import sidebar_library
 from door_detector.ui.viewer import _normalize_bbox_xyxy, main_viewer_canvas
 from door_detector.doors.detect import debug_explain_unmatched_box
 from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids
+from door_detector.perf import enabled as perf_enabled, span as perf_span, log as perf_log
 
 
 logger = logging.getLogger("door_detector.review_app")
+
+def _ui_log(event: str, payload: Dict[str, Any]) -> None:
+    """Structured UI debug logs (server-side)."""
+    try:
+        # Streamlit's default log level often hides INFO; use WARNING so these are visible
+        # during debugging sessions.
+        logger.warning("[door_detector][ui] %s %s", str(event), json.dumps(payload, sort_keys=True, default=str))
+    except Exception:
+        return
 
 
 def _default_config_path_str() -> str:
@@ -106,6 +116,114 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
         }
 
 
+def _remap_fstate_ids_using_legacy_ids(*, fstate: Dict[str, Any], doors_data: Dict[str, Any]) -> None:
+    """Remap in-memory ids (fstate) using `doors.json` candidate `legacy_ids`.
+
+    Why:
+    - `labels.json` is remapped on load via `legacy_ids`, but `fstate` persists across reruns.
+    - After reanalysis (or after Step 1 changes) candidate ids can change; without remapping,
+      the UI can show confirmations that no longer match any current overlay ids (no green).
+    """
+    try:
+        candidates = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
+    except Exception:
+        candidates = []
+
+    legacy_to_current: Dict[str, str] = {}
+    try:
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("id")
+            if cid is None:
+                continue
+            cid_s = str(cid)
+            if not cid_s:
+                continue
+            legacy_to_current[cid_s] = cid_s
+            for lid in list(c.get("legacy_ids") or []):
+                if lid is None:
+                    continue
+                s = str(lid)
+                if s:
+                    legacy_to_current[s] = cid_s
+    except Exception:
+        legacy_to_current = {}
+
+    if not legacy_to_current:
+        return
+
+    def _map_id(x: Any) -> Any:
+        if x is None:
+            return x
+        s = str(x)
+        if not s:
+            return x
+        return legacy_to_current.get(s, s)
+
+    def _remap_state_dict(state: Dict[str, Any]) -> None:
+        # Confirmed/rejected/deleted sets
+        try:
+            cbt = coerce_confirmed_by_type(state.get("confirmed_by_type", {}))
+            state["confirmed_by_type"] = {t: {str(_map_id(i)) for i in ids} for t, ids in cbt.items()}
+        except Exception:
+            pass
+        try:
+            rbt = coerce_rejected_by_type(state.get("rejected_by_type", {}))
+            state["rejected_by_type"] = {t: {str(_map_id(i)) for i in ids} for t, ids in rbt.items()}
+        except Exception:
+            pass
+        try:
+            dids = coerce_id_set(state.get("deleted_ids", set()))
+            state["deleted_ids"] = {str(_map_id(i)) for i in dids}
+        except Exception:
+            pass
+
+        # Manual additions (snapped ids)
+        try:
+            for rec in list(state.get("manual_additions", []) or []):
+                if not isinstance(rec, dict):
+                    continue
+                sid = rec.get("snapped_candidate_id")
+                if sid in (None, ""):
+                    continue
+                rec["snapped_candidate_id"] = str(_map_id(sid))
+        except Exception:
+            pass
+
+        # Selection + proposal/cycle ids (best-effort).
+        try:
+            sel = state.get("selected_door_id")
+            if sel not in (None, ""):
+                state["selected_door_id"] = str(_map_id(sel))
+        except Exception:
+            pass
+        try:
+            cycle = state.get("_cycle_candidate_id")
+            if cycle not in (None, ""):
+                state["_cycle_candidate_id"] = str(_map_id(cycle))
+        except Exception:
+            pass
+        try:
+            prop = state.get("_proposal")
+            if isinstance(prop, dict):
+                sid = prop.get("snapped_candidate_id")
+                if sid not in (None, ""):
+                    prop["snapped_candidate_id"] = str(_map_id(sid))
+        except Exception:
+            pass
+
+    # Remap the committed state and any active edit buffers so the viewer stays consistent.
+    _remap_state_dict(fstate)
+    try:
+        if isinstance(fstate.get("_edit_draft"), dict):
+            _remap_state_dict(fstate["_edit_draft"])
+        if isinstance(fstate.get("_edit_baseline"), dict):
+            _remap_state_dict(fstate["_edit_baseline"])
+    except Exception:
+        pass
+
+
 def _clamp_bbox_xyxy(bbox_xyxy: List[float], *, w: Optional[int], h: Optional[int]) -> List[float]:
     nb = _normalize_bbox_xyxy(bbox_xyxy)
     if nb is None:
@@ -162,8 +280,11 @@ def _snap_to_candidate(
     best_iou_inter = -1.0
     best_inter = -1.0
     best_by_inter: Optional[Dict[str, Any]] = None
+    best_inter_iou = -1.0
+    best_inter_coverage = -1.0
     best_coverage = -1.0
     best_by_coverage: Optional[Dict[str, Any]] = None
+    best_coverage_inter = -1.0
     any_overlap = False
 
     # Conservative anti-symbol heuristics (circles often appear near doors).
@@ -224,9 +345,12 @@ def _snap_to_candidate(
         if inter > best_inter:
             best_inter = inter
             best_by_inter = cand
+            best_inter_iou = iou
+            best_inter_coverage = coverage
         if coverage > best_coverage:
             best_coverage = coverage
             best_by_coverage = cand
+            best_coverage_inter = inter
 
     if not any_overlap:
         return None, 0.0
@@ -249,13 +373,30 @@ def _snap_to_candidate(
             and best_iou_inter > 0.0
             and best_iou_inter < (best_inter * MIN_IOU_INTER_FRAC_OF_MAX_INTER)
         ):
-            cb = _normalize_bbox_xyxy(best_by_inter.get("bbox_xyxy"))
-            if cb is not None:
-                return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
+            # Guardrail:
+            # Large false-positive candidates (especially long-span `bifold` tracks) can overlap
+            # the entire drawn ROI, giving huge intersection area, but tiny IoU/coverage. In
+            # those cases, overriding the IoU-best pick is counterproductive (it selects the
+            # wrong thing and then we fall back to a manual-box candidate).
+            #
+            # If the IoU-best pick is reasonably strong, only override when the max-intersection
+            # candidate is also plausible (non-tiny IoU OR meaningfully covered by the ROI).
+            if float(best_iou) >= 0.10 and (float(best_inter_iou) < 0.04 or float(best_inter_coverage) < 0.06):
+                # Keep the IoU-best pick.
+                pass
+            else:
+                cb = _normalize_bbox_xyxy(best_by_inter.get("bbox_xyxy"))
+                if cb is not None:
+                    return best_by_inter, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
         return best_by_iou, max(0.0, float(best_iou))
 
     # Fallback: candidate is mostly covered by the selection.
     if best_by_coverage is not None and best_coverage >= MIN_CAND_COVERAGE:
+        # Guardrail: avoid snapping to a tiny candidate that happens to be fully contained
+        # by a much larger drawn box (common false-positive near doors).
+        inter_frac = (float(best_coverage_inter) / float(drawn_area)) if drawn_area > 0.0 else 0.0
+        if inter_frac < MIN_INTER_FRAC_OF_DRAWN:
+            return None, 0.0
         cb = _normalize_bbox_xyxy(best_by_coverage.get("bbox_xyxy"))
         if cb is not None:
             return best_by_coverage, max(0.0, float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])))
@@ -277,11 +418,36 @@ def _debug_unmatched_region(
     drawn_bbox_full_xyxy: List[float],
     config_path: str,
     extra: Optional[Dict[str, Any]] = None,
+    verbose: bool = False,
 ) -> Optional[str]:
     """Debug aid for unmatched Shift+drag boxes.
 
     Returns a JSON string; the viewer prints it to the browser console.
     """
+
+    def _shrink_report_for_transport(rep: Any) -> Any:
+        """Reduce report size for normal (non-verbose) transport.
+
+        Streamlit component props are sent over a websocket; large debug blobs can
+        cause disconnects (and noisy Tornado WebSocketClosedError traces). The
+        server already prints a compact summary, so for the browser-side log we
+        keep only high-signal fields unless verbose mode is enabled.
+        """
+        if not isinstance(rep, dict):
+            return rep
+        return {
+            "kind": rep.get("kind"),
+            "verbose": bool(rep.get("verbose", False)),
+            "bbox_full_xyxy": rep.get("bbox_full_xyxy"),
+            "roi_full_xyxy": rep.get("roi_full_xyxy"),
+            "counts": rep.get("counts"),
+            "summary": rep.get("summary"),
+            "extra": rep.get("extra"),
+            "file_dir": rep.get("file_dir"),
+            "config_path": rep.get("config_path"),
+            "truncation": rep.get("truncation"),
+        }
+
     try:
         primitives_path = file_dir / "primitives.json"
         if not primitives_path.exists():
@@ -294,7 +460,19 @@ def _debug_unmatched_region(
                 },
                 separators=(",", ":"),
             )
-        primitives = json.loads(primitives_path.read_bytes())
+        prim_bytes = None
+        if perf_enabled():
+            try:
+                prim_bytes = int(primitives_path.stat().st_size)
+            except Exception:
+                prim_bytes = None
+        with perf_span(
+            "ui.unmatched_debug.load_primitives",
+            file_dir=str(file_dir),
+            bytes=prim_bytes,
+            verbose=bool(verbose),
+        ):
+            primitives = json.loads(primitives_path.read_bytes())
     except Exception as e:
         return json.dumps(
             {
@@ -308,17 +486,44 @@ def _debug_unmatched_region(
         )
 
     try:
-        cfg = json.loads(Path(config_path).read_bytes())
+        with perf_span("ui.unmatched_debug.load_config", config_path=str(config_path)):
+            cfg = json.loads(Path(config_path).read_bytes())
     except Exception as e:
         cfg = {"error": f"failed_to_load_config: {e}"}
 
     try:
-        rep = debug_explain_unmatched_box(primitives=primitives, bbox_full_xyxy=drawn_bbox_full_xyxy, config=cfg)
+        with perf_span(
+            "ui.unmatched_debug.explain",
+            verbose=bool(verbose),
+            drawn_bbox_xyxy=[float(v) for v in (drawn_bbox_full_xyxy or [])[:4]],
+        ):
+            rep = debug_explain_unmatched_box(
+                primitives=primitives, bbox_full_xyxy=drawn_bbox_full_xyxy, config=cfg, verbose=bool(verbose)
+            )
         rep["file_dir"] = str(file_dir)
         rep["config_path"] = str(config_path)
         if isinstance(extra, dict) and extra:
             rep["extra"] = extra
-        return json.dumps(rep, separators=(",", ":"))
+        if not bool(verbose):
+            rep = _shrink_report_for_transport(rep)
+        # Also emit a short server-side summary so we can debug without copying a huge JSON blob.
+        try:
+            summ = rep.get("summary") if isinstance(rep, dict) else None
+            if isinstance(summ, dict):
+                payload = {
+                    "file_dir": str(file_dir),
+                    "bbox_full_xyxy": [float(v) for v in drawn_bbox_full_xyxy],
+                    "extra": extra if isinstance(extra, dict) else None,
+                    "summary": summ,
+                }
+                print("[door_detector] unmatched_debug_summary", json.dumps(payload, separators=(",", ":")))
+        except Exception:
+            pass
+        with perf_span("ui.unmatched_debug.dumps", verbose=bool(verbose)):
+            out = json.dumps(rep, separators=(",", ":"))
+        if perf_enabled():
+            perf_log("ui.unmatched_debug.payload", bytes=len(out), verbose=bool(verbose))
+        return out
     except Exception as e:
         return json.dumps(
             {
@@ -346,10 +551,21 @@ def _process_draw_event_if_any(
     raw = st.session_state.get(draw_key) or ""
     if not raw:
         return
+    if perf_enabled():
+        perf_log("ui.draw_event.sink_nonempty", file_id=str(file_id), bytes=len(str(raw)))
+    # Always clear the sink, even if parsing or downstream processing fails.
+    # Otherwise the UI can get stuck showing a client-only temp overlay with no way to cancel it.
     try:
-        evt = json.loads(raw)
+        with perf_span("ui.draw_event.parse_json", file_id=str(file_id), bytes=len(str(raw))):
+            evt = json.loads(raw)
     except Exception:
-        return
+        evt = None
+    finally:
+        try:
+            st.session_state[draw_key] = ""
+        except Exception:
+            pass
+
     if not isinstance(evt, dict):
         return
     if evt.get("event") != "draw_rect":
@@ -362,6 +578,13 @@ def _process_draw_event_if_any(
     if str(event_id) == str(fstate.get("_last_draw_event_id")):
         return
     fstate["_last_draw_event_id"] = str(event_id)
+    if perf_enabled():
+        perf_log(
+            "ui.draw_event.accepted",
+            file_id=str(file_id),
+            event_id=str(event_id),
+            has_snapped=bool(snapped_candidate_id not in (None, "")),
+        )
     prev_selected = str(fstate.get("selected_door_id") or "")
     push_breadcrumb(
         fstate,
@@ -378,19 +601,20 @@ def _process_draw_event_if_any(
     if not (isinstance(bbox_pdf, list) and len(bbox_pdf) == 4):
         return
     try:
-        tpath = file_dir / "transform.json"
-        tob = json.loads(tpath.read_text()) if tpath.exists() else {}
-        m = tob.get("pdf_to_pix_affine") if isinstance(tob, dict) else None
-        cb = tob.get("cropbox") if isinstance(tob, dict) else None
-        if not (isinstance(m, list) and len(m) == 6 and isinstance(cb, dict)):
-            return
-        # `pdf_to_pix_affine` expects fitz coordinates (Y-down). The PDF.js viewer emits
-        # PDF-spec coords (Y-up). Use our shared conversion logic which also handles
-        # "centered" PDF page boxes (negative coords) correctly.
-        from door_detector.pdf.affine import pdfjs_bbox_to_fitz_bbox_xyxy
+        with perf_span("ui.draw_event.pdf_to_pix", file_id=str(file_id), event_id=str(event_id)):
+            tpath = file_dir / "transform.json"
+            tob = json.loads(tpath.read_text()) if tpath.exists() else {}
+            m = tob.get("pdf_to_pix_affine") if isinstance(tob, dict) else None
+            cb = tob.get("cropbox") if isinstance(tob, dict) else None
+            if not (isinstance(m, list) and len(m) == 6 and isinstance(cb, dict)):
+                return
+            # `pdf_to_pix_affine` expects fitz coordinates (Y-down). The PDF.js viewer emits
+            # PDF-spec coords (Y-up). Use our shared conversion logic which also handles
+            # "centered" PDF page boxes (negative coords) correctly.
+            from door_detector.pdf.affine import pdfjs_bbox_to_fitz_bbox_xyxy
 
-        bbox_fitz = pdfjs_bbox_to_fitz_bbox_xyxy([float(v) for v in bbox_pdf], cropbox=cb)
-        drawn_full = _apply_affine_bbox_xyxy(m, bbox_fitz)
+            bbox_fitz = pdfjs_bbox_to_fitz_bbox_xyxy([float(v) for v in bbox_pdf], cropbox=cb)
+            drawn_full = _apply_affine_bbox_xyxy(m, bbox_fitz)
     except Exception:
         return
 
@@ -404,108 +628,68 @@ def _process_draw_event_if_any(
         candidates.extend(list(fstate.get("manual_candidates", []) or []))
     except Exception:
         pass
+    if perf_enabled():
+        perf_log(
+            "ui.draw_event.candidate_pool",
+            file_id=str(file_id),
+            event_id=str(event_id),
+            candidates=int(len(candidates)),
+        )
 
     # --- Build a ranked suggestion list for cycling (UI) ---
     # Users often need to cycle through overlapping candidates (e.g. double vs two swings,
     # arc-only vs full swing). We compute a ranked list here so the right panel can
     # offer Prev/Next selection without rerunning geometry detection.
     try:
-        bx0, by0, bx1, by1 = _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
-        bcx = 0.5 * (bx0 + bx1)
-        bcy = 0.5 * (by0 + by1)
+        with perf_span(
+            "ui.draw_event.build_suggestions",
+            file_id=str(file_id),
+            event_id=str(event_id),
+            candidates=int(len(candidates)),
+        ):
+            bx0, by0, bx1, by1 = _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
+            bcx = 0.5 * (bx0 + bx1)
+            bcy = 0.5 * (by0 + by1)
 
-        scored: List[Tuple[Tuple[float, float, float], Dict[str, Any]]] = []
-        nearest: List[Tuple[Tuple[float, float], Dict[str, Any]]] = []
-        for cand in candidates:
-            cid = cand.get("id")
-            cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
-            if cid is None or cb is None:
-                continue
-            cx0, cy0, cx1, cy1 = cb
-            ix0 = max(bx0, cx0)
-            iy0 = max(by0, cy0)
-            ix1 = min(bx1, cx1)
-            iy1 = min(by1, cy1)
-            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
-            if inter <= 0.0:
-                # Track "nearby" candidates so the UI can still offer cycling when
-                # the selection box barely misses the right candidate bbox.
-                try:
-                    ccx = 0.5 * (cx0 + cx1)
-                    ccy = 0.5 * (cy0 + cy1)
-                    dist = float(math.hypot(ccx - bcx, ccy - bcy))
-                    nearest.append(((dist, float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)), cand))
-                except Exception:
-                    pass
-                continue
-            iou_c = float(compute_iou([bx0, by0, bx1, by1], [cx0, cy0, cx1, cy1]))
-            conf = float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)
-            scored.append(((iou_c, inter, conf), cand))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        nearest.sort(key=lambda x: x[0])
-
-        pool_map = {str(c.get("id")): c for c in candidates if c.get("id") is not None}
-
-        suggestions: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-
-        for (iou_c, inter, conf), cand in scored[:40]:
-            cid = str(cand.get("id") or "")
-            if not cid or cid in seen:
-                continue
-            seen.add(cid)
-            suggestions.append(
-                {
-                    "id": cid,
-                    "type": str(cand.get("type") or ""),
-                    "iou": float(iou_c),
-                    "inter": float(inter),
-                    "confidence": float(conf),
-                    "source": "overlap",
-                }
-            )
-
-            # Expand doubles into component swings so the reviewer can cycle to them.
-            if str(cand.get("type") or "") == "double":
-                try:
-                    comps = (cand.get("components") or {}) if isinstance(cand, dict) else {}
-                    swing_ids = comps.get("swing_ids") or []
-                    if isinstance(swing_ids, list):
-                        for sid in swing_ids:
-                            ssid = str(sid) if sid not in (None, "") else ""
-                            if not ssid or ssid in seen:
-                                continue
-                            sc = pool_map.get(ssid)
-                            if not sc:
-                                continue
-                            scb = _normalize_bbox_xyxy(sc.get("bbox_xyxy"))
-                            if scb is None:
-                                continue
-                            siou = float(compute_iou([bx0, by0, bx1, by1], [scb[0], scb[1], scb[2], scb[3]]))
-                            seen.add(ssid)
-                            suggestions.append(
-                                {
-                                    "id": ssid,
-                                    "type": str(sc.get("type") or "swing"),
-                                    "iou": float(siou),
-                                    "inter": 0.0,
-                                    "confidence": float(sc.get("confidence", sc.get("heuristic_confidence", 0.0)) or 0.0),
-                                    "source": "double_component",
-                                    "parent_double_id": cid,
-                                }
-                            )
-                except Exception:
-                    pass
-
-        # If nothing overlaps, include a few nearby candidates (best-effort) so the
-        # reviewer can still cycle when bboxes are slightly mislocalized.
-        if not suggestions and nearest:
-            MAX_NEARBY = 12
-            MAX_NEARBY_DIST_PX = 320.0
-            for (dist, conf), cand in nearest[:MAX_NEARBY]:
-                if float(dist) > MAX_NEARBY_DIST_PX:
+            scored: List[Tuple[Tuple[float, float, float], Dict[str, Any]]] = []
+            nearest: List[Tuple[Tuple[float, float], Dict[str, Any]]] = []
+            for cand in candidates:
+                cid = cand.get("id")
+                cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
+                if cid is None or cb is None:
                     continue
+                cx0, cy0, cx1, cy1 = cb
+                ix0 = max(bx0, cx0)
+                iy0 = max(by0, cy0)
+                ix1 = min(bx1, cx1)
+                iy1 = min(by1, cy1)
+                inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+                if inter <= 0.0:
+                    # Track "nearby" candidates so the UI can still offer cycling when
+                    # the selection box barely misses the right candidate bbox.
+                    try:
+                        ccx = 0.5 * (cx0 + cx1)
+                        ccy = 0.5 * (cy0 + cy1)
+                        dist = float(math.hypot(ccx - bcx, ccy - bcy))
+                        nearest.append(
+                            ((dist, float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)), cand)
+                        )
+                    except Exception:
+                        pass
+                    continue
+                iou_c = float(compute_iou([bx0, by0, bx1, by1], [cx0, cy0, cx1, cy1]))
+                conf = float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)
+                scored.append(((iou_c, inter, conf), cand))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            nearest.sort(key=lambda x: x[0])
+
+            pool_map = {str(c.get("id")): c for c in candidates if c.get("id") is not None}
+
+            suggestions: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+
+            for (iou_c, inter, conf), cand in scored[:40]:
                 cid = str(cand.get("id") or "")
                 if not cid or cid in seen:
                     continue
@@ -514,24 +698,80 @@ def _process_draw_event_if_any(
                     {
                         "id": cid,
                         "type": str(cand.get("type") or ""),
-                        "iou": 0.0,
-                        "inter": 0.0,
+                        "iou": float(iou_c),
+                        "inter": float(inter),
                         "confidence": float(conf),
-                        "source": "nearby",
-                        "dist_px": float(dist),
+                        "source": "overlap",
                     }
                 )
 
-        fstate["_last_draw_suggestions"] = {
-            "event_id": str(event_id),
-            "drawn_bbox_xyxy": [float(v) for v in drawn_full],
-            "suggestions": suggestions[:50],
-        }
+                # Expand doubles into component swings so the reviewer can cycle to them.
+                if str(cand.get("type") or "") == "double":
+                    try:
+                        comps = (cand.get("components") or {}) if isinstance(cand, dict) else {}
+                        swing_ids = comps.get("swing_ids") or []
+                        if isinstance(swing_ids, list):
+                            for sid in swing_ids:
+                                ssid = str(sid) if sid not in (None, "") else ""
+                                if not ssid or ssid in seen:
+                                    continue
+                                sc = pool_map.get(ssid)
+                                if not sc:
+                                    continue
+                                scb = _normalize_bbox_xyxy(sc.get("bbox_xyxy"))
+                                if scb is None:
+                                    continue
+                                siou = float(compute_iou([bx0, by0, bx1, by1], [scb[0], scb[1], scb[2], scb[3]]))
+                                seen.add(ssid)
+                                suggestions.append(
+                                    {
+                                        "id": ssid,
+                                        "type": str(sc.get("type") or "swing"),
+                                        "iou": float(siou),
+                                        "inter": 0.0,
+                                        "confidence": float(sc.get("confidence", sc.get("heuristic_confidence", 0.0)) or 0.0),
+                                        "source": "double_component",
+                                        "parent_double_id": cid,
+                                    }
+                                )
+                    except Exception:
+                        pass
+
+            # If nothing overlaps, include a few nearby candidates (best-effort) so the
+            # reviewer can still cycle when bboxes are slightly mislocalized.
+            if not suggestions and nearest:
+                MAX_NEARBY = 12
+                MAX_NEARBY_DIST_PX = 320.0
+                for (dist, conf), cand in nearest[:MAX_NEARBY]:
+                    if float(dist) > MAX_NEARBY_DIST_PX:
+                        continue
+                    cid = str(cand.get("id") or "")
+                    if not cid or cid in seen:
+                        continue
+                    seen.add(cid)
+                    suggestions.append(
+                        {
+                            "id": cid,
+                            "type": str(cand.get("type") or ""),
+                            "iou": 0.0,
+                            "inter": 0.0,
+                            "confidence": float(conf),
+                            "source": "nearby",
+                            "dist_px": float(dist),
+                        }
+                    )
+
+            fstate["_last_draw_suggestions"] = {
+                "event_id": str(event_id),
+                "drawn_bbox_xyxy": [float(v) for v in drawn_full],
+                "suggestions": suggestions[:50],
+            }
     except Exception:
         fstate["_last_draw_suggestions"] = {"event_id": str(event_id), "suggestions": []}
 
     # Server-side snap is the source of truth (uses full candidate list).
-    best_server, iou_server = _snap_to_candidate(drawn_full, candidates=candidates)
+    with perf_span("ui.draw_event.snap_server", file_id=str(file_id), event_id=str(event_id), candidates=int(len(candidates))):
+        best_server, iou_server = _snap_to_candidate(drawn_full, candidates=candidates)
 
     # Client-proposed snap (from the viewer's candidatePool) is only a hint.
     # The pool is intentionally downsampled for performance, so accepting it blindly
@@ -582,30 +822,66 @@ def _process_draw_event_if_any(
         if sid and server_id and client_id and server_id != client_id:
             debug_reason = "snap_mismatch"
 
+        # Track whether there were *any* overlapping candidates (even if snap thresholds reject them).
+        overlap_suggestions = 0
+        try:
+            srec = fstate.get("_last_draw_suggestions") or {}
+            sugg = list(srec.get("suggestions") or [])
+            overlap_suggestions = sum(1 for r in sugg if isinstance(r, dict) and str(r.get("source") or "") == "overlap")
+        except Exception:
+            overlap_suggestions = 0
+
         # "Weak snap" heuristic: if the best match barely overlaps the drawn region,
         # it is often not the user's intended door. Emit a detailed ROI report so we can
         # see whether the intended door's primitives fail arc/leaf criteria.
         WEAK_SNAP_IOU = 0.12
-        if not debug_reason and best is not None and float(iou or 0.0) < WEAK_SNAP_IOU:
+        if not debug_reason and (
+            (best is not None and float(iou or 0.0) < WEAK_SNAP_IOU)
+            or (best is None and overlap_suggestions > 0)
+        ):
             debug_reason = "weak_snap_low_iou"
 
+        # If nothing overlaps at all, we still want a geometry explanation.
+        # Otherwise we cannot answer: "was the intended door missing as a candidate because
+        # the arc/leaf primitives were missing, or because arc extraction/pairing failed?"
+        #
+        # This case is especially common on plans where swing arcs are rasterized or drawn
+        # as dashed polylines (and therefore can be missed by conservative arc extraction).
+        if not debug_reason and best is None and overlap_suggestions <= 0:
+            debug_reason = "no_overlap_candidates"
+
         if debug_reason:
-            fstate["_last_unmatched_debug"] = _debug_unmatched_region(
-                file_dir=file_dir,
-                drawn_bbox_full_xyxy=drawn_full,
-                config_path=str(config_path),
-                extra={
-                    "debug_reason": str(debug_reason),
-                    "event_id": str(event_id),
-                    "client_snapped_candidate_id": client_id,
-                    "client_iou": float(iou_client),
-                    "server_snapped_candidate_id": server_id,
-                    "server_iou": float(iou_server),
-                    "chosen_candidate_id": str(best.get("id") or "") if isinstance(best, dict) else "",
-                    "chosen_iou": float(iou or 0.0),
-                    "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf] if isinstance(bbox_pdf, list) and len(bbox_pdf) == 4 else [],
-                },
-            )
+            # Always emit a lightweight, copy-friendly ROI summary when the snap is likely wrong.
+            # Use `debug_draw_roi=true` (session state) only to switch to the full verbose report.
+            verbose_roi = bool(st.session_state.get("debug_draw_roi", False))
+            with perf_span(
+                "ui.draw_event.unmatched_debug",
+                file_id=str(file_id),
+                event_id=str(event_id),
+                reason=str(debug_reason),
+                verbose=bool(verbose_roi),
+            ):
+                fstate["_last_unmatched_debug"] = _debug_unmatched_region(
+                    file_dir=file_dir,
+                    drawn_bbox_full_xyxy=drawn_full,
+                    config_path=str(config_path),
+                    verbose=verbose_roi,
+                    extra={
+                        "debug_reason": str(debug_reason),
+                        "event_id": str(event_id),
+                        "overlap_suggestions": int(overlap_suggestions),
+                        "client_snapped_candidate_id": client_id,
+                        "client_iou": float(iou_client),
+                        "server_snapped_candidate_id": server_id,
+                        "server_iou": float(iou_server),
+                        "chosen_candidate_id": str(best.get("id") or "") if isinstance(best, dict) else "",
+                        "chosen_iou": float(iou or 0.0),
+                        "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf]
+                        if isinstance(bbox_pdf, list) and len(bbox_pdf) == 4
+                        else [],
+                        "verbose": bool(verbose_roi),
+                    },
+                )
         else:
             # Clear any prior mismatch/unmatched debug so future changes re-trigger logs.
             fstate["_last_unmatched_debug"] = None
@@ -614,7 +890,32 @@ def _process_draw_event_if_any(
 
     # If nothing overlaps, create a UI-only manual candidate from the drawn box so
     # the reviewer can still proceed (propose + confirm) even when detection missed.
+    #
+    # Also treat *extremely weak* snaps as effectively unmatched. In these cases the
+    # selection box usually only barely clips an unrelated nearby symbol/candidate,
+    # and the user’s intended door is absent from the candidate list.
     created_manual_candidate_id = ""
+    try:
+        if best is not None and isinstance(fstate.get("_last_unmatched_debug"), str):
+            # Keep this heuristic strict: only override when the snap is so weak that it
+            # would be more harmful than helpful as the default selection.
+            debug_reason = ""
+            try:
+                raw_dbg = str(fstate.get("_last_unmatched_debug") or "")
+                if raw_dbg:
+                    obj_dbg = json.loads(raw_dbg)
+                    extra_dbg = obj_dbg.get("extra") if isinstance(obj_dbg, dict) else None
+                    if isinstance(extra_dbg, dict):
+                        debug_reason = str(extra_dbg.get("debug_reason") or "")
+            except Exception:
+                debug_reason = ""
+            MIN_IOU_TREAT_AS_UNMATCHED = 0.04
+            if debug_reason == "weak_snap_low_iou" and float(iou or 0.0) < MIN_IOU_TREAT_AS_UNMATCHED:
+                best = None
+                iou = 0.0
+    except Exception:
+        pass
+
     if best is None:
         try:
             cid = _manual_candidate_id_from_bbox(file_id=str(file_id), bbox_xyxy=drawn_full, quant_step_px=1.0)
@@ -670,6 +971,35 @@ def _process_draw_event_if_any(
 
     if best is not None and best.get("id") is not None:
         cid = str(best["id"])
+        # Guarantee the proposal menu can render even if suggestion ranking failed earlier.
+        # (If suggestions are empty, the right panel previously hid proposal controls,
+        # leaving the user with a non-interactive green "snapped" overlay.)
+        try:
+            srec = fstate.get("_last_draw_suggestions") or {}
+            sugg = list(srec.get("suggestions") or [])
+        except Exception:
+            sugg = []
+        if not sugg:
+            try:
+                sugg_type = str(best.get("type") or "")
+            except Exception:
+                sugg_type = ""
+            fstate["_last_draw_suggestions"] = {
+                "event_id": str(event_id),
+                "drawn_bbox_xyxy": [float(v) for v in drawn_full],
+                "suggestions": [
+                    {
+                        "id": str(cid),
+                        "type": sugg_type,
+                        "iou": float(iou or 0.0),
+                        "inter": 0.0,
+                        "confidence": float(best.get("confidence", best.get("heuristic_confidence", 0.0)) or 0.0)
+                        if isinstance(best, dict)
+                        else 0.0,
+                        "source": "fallback_best",
+                    }
+                ],
+            }
         # Align the cycling index to the chosen id (best effort).
         try:
             srec = fstate.get("_last_draw_suggestions") or {}
@@ -759,12 +1089,6 @@ def _process_draw_event_if_any(
                 "prev_selected_door_id": prev_selected,
             },
         )
-
-    # Consume the sink value so it doesn't grow / re-trigger on reconnects.
-    try:
-        st.session_state[draw_key] = ""
-    except Exception:
-        pass
 
 
 def run_pipeline(file_id: str, file_dir: Path, config_path: str) -> None:
@@ -898,12 +1222,14 @@ def main() -> None:
                         pass
 
                 try:
-                    doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
+                    with perf_span("ui.load_file_artifacts", file_id=str(file_id)):
+                        doors_data, labels_data, meta_data = load_file_artifacts(str(file_dir))
                 except Exception as e:
                     st.error(str(e))
                     st.stop()
                 init_file_state(file_id, doors_data, labels_data)
                 fstate = st.session_state.files[file_id]
+                _remap_fstate_ids_using_legacy_ids(fstate=fstate, doors_data=doors_data)
 
                 full_dims = get_full_page_dims(meta_data)
 
@@ -918,6 +1244,13 @@ def main() -> None:
                         if evt_id and evt_id != str(fstate.get("_last_viewer_event_id") or ""):
                             fstate["_last_viewer_event_id"] = evt_id
                             et = str(evt.get("type") or "")
+                            if perf_enabled():
+                                perf_log(
+                                    "ui.viewer_event",
+                                    file_id=str(file_id),
+                                    type=str(et),
+                                    event_id=str(evt_id),
+                                )
                             click_sink_label = f"door_click_sink_{file_id}"
                             if et == "door_click":
                                 did = evt.get("door_id")
@@ -995,6 +1328,38 @@ def main() -> None:
                     full_dims=full_dims,
                     config_path=str(doors_data.get("config_path") or _default_config_path_str()),
                 )
+
+                # If a prior run stored an unmatched debug blob (from a Shift+drag),
+                # emit a compact summary to the server console once per event.
+                try:
+                    raw_dbg = fstate.get("_last_unmatched_debug")
+                    if isinstance(raw_dbg, str) and raw_dbg:
+                        obj_dbg = json.loads(raw_dbg)
+                        extra_dbg = obj_dbg.get("extra") if isinstance(obj_dbg, dict) else None
+                        summ_dbg = obj_dbg.get("summary") if isinstance(obj_dbg, dict) else None
+                        ev_dbg = ""
+                        if isinstance(extra_dbg, dict):
+                            ev_dbg = str(extra_dbg.get("event_id") or "")
+                        if not ev_dbg:
+                            ev_dbg = str(fstate.get("_last_draw_event_id") or "")
+                        if ev_dbg and str(fstate.get("_last_unmatched_debug_printed_event_id") or "") != ev_dbg:
+                            fstate["_last_unmatched_debug_printed_event_id"] = ev_dbg
+                            if isinstance(summ_dbg, dict):
+                                print(
+                                    "[door_detector] unmatched_debug_summary",
+                                    json.dumps(
+                                        {
+                                            "file_id": str(file_id),
+                                            "file_dir": str(file_dir),
+                                            "event_id": ev_dbg,
+                                            "extra": extra_dbg if isinstance(extra_dbg, dict) else None,
+                                            "summary": summ_dbg,
+                                        },
+                                        separators=(",", ":"),
+                                    ),
+                                )
+                except Exception:
+                    pass
 
                 # Compute active doors once so the main viewer + right panel stay in perfect sync.
                 detections = doors_data.get("doors", [])
@@ -1087,10 +1452,25 @@ def main() -> None:
                     confirmed_ids = set(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
                 except Exception:
                     confirmed_ids = set()
-                door_filter_key = f"door_filter_{file_id}"
+                # Unified single-stage filter: choose exactly one of {All, Confirmed, Unconfirmed, <type>}.
+                #
+                # IMPORTANT: keep the canonical filter state separate from the widget key.
+                # The radio widget uses `door_filter_widget_{file_id}`; our app state uses
+                # `door_filter_{file_id}` which is stable across action-triggered reruns.
+                # Canonical filter state (NOT a widget key). Use a distinct prefix so Streamlit
+                # never confuses it with historical widget keys (prevents odd resets).
+                door_filter_key = f"_door_detector_door_filter_state_{file_id}"
+                door_filter_widget_key = f"door_filter_widget_{file_id}"
                 if door_filter_key not in st.session_state:
-                    st.session_state[door_filter_key] = "All"
+                    try:
+                        st.session_state[door_filter_key] = str(fstate.get("_door_filter") or "All")
+                    except Exception:
+                        st.session_state[door_filter_key] = "All"
                 selected_filter = str(st.session_state.get(door_filter_key) or "All")
+                try:
+                    fstate["_door_filter"] = str(selected_filter)
+                except Exception:
+                    pass
 
                 # Map id -> type from the full (hidden-filtered) list for click-driven filter switching.
                 id_to_type = {
@@ -1107,7 +1487,21 @@ def main() -> None:
                     clicked_type = id_to_type.get(str(clicked_id))
                     if clicked_type and clicked_type != selected_filter:
                         st.session_state[door_filter_key] = clicked_type
+                        try:
+                            st.session_state[door_filter_widget_key] = clicked_type
+                        except Exception:
+                            pass
                         selected_filter = clicked_type
+                        _ui_log(
+                            "door_filter_auto_switch_on_click",
+                            {
+                                "file_id": str(file_id),
+                                "clicked_id": str(clicked_id),
+                                "clicked_type": str(clicked_type),
+                                "prev_filter": str(fstate.get("_door_filter") or ""),
+                                "new_filter": str(selected_filter),
+                            },
+                        )
                         push_breadcrumb(
                             fstate,
                             {

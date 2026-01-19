@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import json
 import shutil
@@ -21,6 +22,22 @@ from door_detector.ui.labels import (
 
 
 logger = logging.getLogger("door_detector.review_app")
+
+
+def _mtime_ns(p: Path) -> int:
+    try:
+        return int(p.stat().st_mtime_ns)
+    except Exception:
+        return 0
+
+
+@st.cache_data(show_spinner=False)
+def _load_json_cached(path: str, *, mtime_ns: int) -> Dict[str, Any]:
+    """Load JSON from disk, cached by mtime.
+
+    IMPORTANT: Callers must treat returned objects as read-only and copy before mutating.
+    """
+    return json.loads(Path(path).read_bytes())
 
 
 def _coerce_str_list(v: Any) -> list[str]:
@@ -112,13 +129,18 @@ def load_file_artifacts(file_dir_str: str) -> tuple[Dict[str, Any], Dict[str, An
 
     doors_data: Dict[str, Any] = {}
     if doors_path.exists():
-        with open(doors_path) as f:
-            doors_data = json.load(f)
+        try:
+            doors_data = _load_json_cached(str(doors_path), mtime_ns=_mtime_ns(doors_path))
+        except Exception:
+            doors_data = {}
 
     labels_data: Dict[str, Any] = labels_v4_default()
     if labels_path.exists():
-        with open(labels_path) as f:
-            labels_data = json.load(f)
+        try:
+            # Copy defensively because we mutate (remap + migrations + validation).
+            labels_data = copy.deepcopy(_load_json_cached(str(labels_path), mtime_ns=_mtime_ns(labels_path)))
+        except Exception:
+            labels_data = labels_v4_default()
         # If `doors.json` uses a newer id scheme, remap old label ids to current
         # candidate ids (without changing the UX).
         _remap_labels_ids_in_place(labels_data, doors_data)
@@ -133,8 +155,10 @@ def load_file_artifacts(file_dir_str: str) -> tuple[Dict[str, Any], Dict[str, An
 
     meta_data: Dict[str, Any] = {}
     if meta_path.exists():
-        with open(meta_path) as f:
-            meta_data = json.load(f)
+        try:
+            meta_data = _load_json_cached(str(meta_path), mtime_ns=_mtime_ns(meta_path))
+        except Exception:
+            meta_data = {}
 
     return doors_data, labels_data, meta_data
 

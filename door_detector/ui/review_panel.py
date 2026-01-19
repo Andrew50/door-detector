@@ -27,6 +27,18 @@ from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_on
 
 logger = logging.getLogger("door_detector.review_app")
 
+def _ui_log(event: str, payload: Dict[str, Any]) -> None:
+    """Structured UI debug logs (server-side).
+
+    Keep this cheap + robust: logs are intended for diagnosing state resets across reruns.
+    """
+    try:
+        # Streamlit's default log level often hides INFO; use WARNING so these are visible
+        # during debugging sessions.
+        logger.warning("[door_detector][ui] %s %s", str(event), json.dumps(payload, sort_keys=True, default=str))
+    except Exception:
+        return
+
 
 def _default_config_path_str() -> str:
     """Best-effort default config path that works when launched outside repo root."""
@@ -312,27 +324,99 @@ def main_viewer_controls(
             continue
         counts[t] = counts.get(t, 0) + 1
     type_values = sorted(counts.keys())
-    door_filter_key = f"door_filter_{file_id}"
+    # IMPORTANT: keep filter state separate from the widget key.
+    #
+    # Using the same key for both the Streamlit widget and our application state caused
+    # intermittent resets on action-triggered reruns (e.g. Confirm), which could briefly
+    # render the UI as "All" before restoring.
+    #
+    # - `door_filter_state_key` is the canonical app state used by app.py to filter overlays.
+    # - `door_filter_widget_key` is the radio widget state.
+    # Use a distinct prefix so Streamlit never confuses it with historical widget keys.
+    door_filter_state_key = f"_door_detector_door_filter_state_{file_id}"
+    door_filter_widget_key = f"door_filter_widget_{file_id}"  # radio widget key
     filter_options = ["All", "Confirmed", "Unconfirmed"] + type_values
-    if door_filter_key not in st.session_state:
-        st.session_state[door_filter_key] = "All"
+    if door_filter_state_key not in st.session_state:
+        try:
+            prev = str(fstate.get("_door_filter") or "")
+        except Exception:
+            prev = ""
+        st.session_state[door_filter_state_key] = prev if prev else "All"
+    # Sync widget value to canonical state only when needed.
+    #
+    # Do NOT unconditionally overwrite the widget key; that can clobber user changes and
+    # can also make the filter feel "stuck". Instead, we:
+    # - initialize the widget from canonical state when missing
+    # - correct obvious "reset to All" cases when the user did not explicitly change it
+    canonical_filter = str(st.session_state.get(door_filter_state_key) or "All")
+    user_changed_key = f"_door_filter_user_changed_{file_id}"
+    user_changed = bool(st.session_state.get(user_changed_key, False))
+    if door_filter_widget_key not in st.session_state:
+        st.session_state[door_filter_widget_key] = canonical_filter
+    else:
+        widget_val = str(st.session_state.get(door_filter_widget_key) or "")
+        if (not user_changed) and widget_val == "All" and canonical_filter not in ("", "All"):
+            st.session_state[door_filter_widget_key] = canonical_filter
     # Preserve the user's filter choice even if its current count becomes 0.
     #
     # Streamlit radios require the current value be present in `options`; previously we
     # "fixed" missing values by resetting to "All", which felt like the UI was randomly
     # losing the filter after actions like confirm/reject/delete (those can remove the
     # last remaining door of a type, temporarily making that type absent from `type_values`).
-    cur_filter = str(st.session_state.get(door_filter_key) or "All")
+    cur_filter = canonical_filter
     if cur_filter not in filter_options:
         # Keep the filter visible (it will show "(0)" via format_func).
         filter_options.append(cur_filter)
+    # Mirror into per-file state so actions that trigger reruns (confirm/reject/delete)
+    # don't accidentally fall back to "All" if Streamlit drops the widget key.
+    try:
+        fstate["_door_filter"] = str(cur_filter)
+    except Exception:
+        pass
+
+    # Debug: detect unexpected filter resets/missing values.
+    try:
+        last_logged = str(fstate.get("_door_filter_last_logged") or "")
+    except Exception:
+        last_logged = ""
+    if cur_filter != last_logged:
+        _ui_log(
+            "door_filter_effective",
+            {
+                "file_id": str(file_id),
+                "cur_filter": str(cur_filter),
+                "prev_filter": last_logged,
+                "options": list(filter_options),
+                "base_total": int(base_total),
+                "base_confirmed": int(base_confirmed),
+                "base_unconfirmed": int(base_unconfirmed),
+            },
+        )
+        try:
+            fstate["_door_filter_last_logged"] = str(cur_filter)
+        except Exception:
+            pass
+
+    # Record explicit user interaction with the filter widget so app.py can distinguish
+    # a real user change ("I clicked All") from unexpected resets ("it flipped to All").
+    def _mark_door_filter_touched() -> None:
+        try:
+            st.session_state[user_changed_key] = True
+            v = str(st.session_state.get(door_filter_widget_key) or "All")
+            st.session_state[f"_door_filter_user_value_{file_id}"] = v
+            # Canonicalize into the app-state key for immediate use at rerun start.
+            st.session_state[door_filter_state_key] = v
+            fstate["_door_filter"] = v
+        except Exception:
+            return
 
     st.radio(
         "Filter doors",
         filter_options,
-        key=door_filter_key,
+        key=door_filter_widget_key,
         horizontal=True,
         label_visibility="collapsed",
+        on_change=_mark_door_filter_touched,
         format_func=lambda v: (
             f"All ({base_total})"
             if str(v) == "All"
@@ -343,6 +427,20 @@ def main_viewer_controls(
             else f"{str(v).capitalize()} ({int(counts.get(str(v), 0))})"
         ),
     )
+
+    # Defensive: after the widget renders, keep canonical state in sync with the widget value.
+    # This preserves immediate updates on reruns (app.py reads the canonical key).
+    try:
+        v = str(st.session_state.get(door_filter_widget_key) or "All")
+        st.session_state[door_filter_state_key] = v
+        fstate["_door_filter"] = v
+    except Exception:
+        pass
+    # Clear one-shot marker so later reruns can detect spurious resets.
+    try:
+        st.session_state[user_changed_key] = False
+    except Exception:
+        pass
 
 def _sync_selected_door_for_run(
     *,
@@ -573,7 +671,8 @@ def right_panel_review(
     all_visible = active_doors.copy()
     all_visible.sort(key=lambda x: x["confidence"], reverse=True)
 
-    door_filter_key = f"door_filter_{file_id}"
+    door_filter_state_key = f"_door_detector_door_filter_state_{file_id}"
+    door_filter_widget_key = f"door_filter_widget_{file_id}"
     # Doors header removed (redundant; selection section below is explicit).
 
     if not all_visible:
@@ -588,8 +687,52 @@ def right_panel_review(
     except Exception:
         sugg_all = []
     prop = fstate.get("_proposal")
-    if isinstance(prop, dict) and sugg_all:
+    if isinstance(prop, dict):
         st.divider()
+
+        # If suggestion computation failed (or was interrupted), still render a minimal
+        # proposal UI so the user can cancel and clear any proposal overlay.
+        if not sugg_all:
+            c1, c2 = st.columns(2)
+            if c1.button("Cancel proposal", use_container_width=True, type="secondary", key=f"proposal_cancel_min_{key_suffix}"):
+                try:
+                    created_id = str(prop.get("created_manual_candidate_id") or "")
+                except Exception:
+                    created_id = ""
+                if created_id:
+                    try:
+                        mc = list(fstate.get("manual_candidates", []) or [])
+                        fstate["manual_candidates"] = [
+                            c for c in mc if not (isinstance(c, dict) and str(c.get("id") or "") == created_id)
+                        ]
+                    except Exception:
+                        pass
+                # Restore previous selection (best effort).
+                try:
+                    prev_id = str(prop.get("prev_selected_door_id") or "")
+                except Exception:
+                    prev_id = ""
+                if prev_id:
+                    fstate["selected_door_id"] = prev_id
+                    try:
+                        st.session_state[f"jump_{file_id}"] = prev_id
+                    except Exception:
+                        pass
+                fstate["_proposal"] = None
+                fstate["_last_draw_suggestions"] = None
+                try:
+                    st.session_state[f"_draw_suggest_idx_{file_id}"] = 0
+                except Exception:
+                    pass
+                st.rerun()
+            if c2.button("Keep (no suggestions)", use_container_width=True, type="primary", key=f"proposal_keep_min_{key_suffix}"):
+                st.rerun()
+
+            st.caption("Proposal is active, but no snap list was computed. Cancel to remove the overlay and try Shift+drag again.")
+            st.divider()
+            st.markdown("**Tips**")
+            st.caption("Shift+drag to propose selection · Drag to pan · Scroll to zoom")
+            return
 
         # Reuse the same cycling keys so the viewer can highlight `cycle_candidate_id`
         # during the same rerun (app.py computes it from session_state).
@@ -918,6 +1061,25 @@ def right_panel_review(
     reject_label = f"Not a {str(detected_type).capitalize()} door"
 
     if c1.button(confirm_label, use_container_width=True, type="primary", key=f"confirm_btn_{key_suffix}"):
+        # Record expected filter across this rerun (debug). If the filter resets to All,
+        # app.py will log an expected-mismatch on the next run.
+        try:
+            st.session_state[f"_door_filter_expected_{file_id}"] = str(st.session_state.get(door_filter_state_key) or "")
+        except Exception:
+            pass
+        _ui_log(
+            "action_confirm_clicked",
+            {
+                "file_id": str(file_id),
+                "door_id": str(did),
+                "ui_label_type": str(ui_label_type),
+                "detected_type": str(detected_type),
+                "door_filter": str(st.session_state.get(door_filter_state_key) or ""),
+                "is_editing": bool(is_editing),
+                "selected_idx": int(selected_idx),
+                "visible_len": int(len(door_ids)),
+            },
+        )
         # Ensure confirmed_by_type exists.
         try:
             cbt = working.get("confirmed_by_type")
@@ -977,6 +1139,15 @@ def right_panel_review(
             st.session_state[f"door_click_sink_{file_id}"] = str(next_id)
         except Exception:
             pass
+        _ui_log(
+            "action_confirm_rerun",
+            {
+                "file_id": str(file_id),
+                "door_id": str(did),
+                "next_id": str(st.session_state.get(f"door_click_sink_{file_id}") or ""),
+                "door_filter": str(st.session_state.get(door_filter_state_key) or ""),
+            },
+        )
         _mark_nav_intent(str(file_id))
         st.rerun()
     if c2.button(
@@ -985,6 +1156,22 @@ def right_panel_review(
         key=f"reject_btn_{key_suffix}",
         help="Typed negative: mark this candidate as NOT its detected door type (e.g. 'not a double').",
     ):
+        try:
+            st.session_state[f"_door_filter_expected_{file_id}"] = str(st.session_state.get(door_filter_state_key) or "")
+        except Exception:
+            pass
+        _ui_log(
+            "action_reject_clicked",
+            {
+                "file_id": str(file_id),
+                "door_id": str(did),
+                "detected_type": str(detected_type),
+                "door_filter": str(st.session_state.get(door_filter_state_key) or ""),
+                "is_editing": bool(is_editing),
+                "selected_idx": int(selected_idx),
+                "visible_len": int(len(door_ids)),
+            },
+        )
         # Ensure rejected_by_type exists.
         try:
             rbt = working.get("rejected_by_type")
@@ -1002,7 +1189,12 @@ def right_panel_review(
         # Auto-switch the filter so the revealed swing candidates are immediately visible.
         if detected_type == "double":
             try:
-                st.session_state[door_filter_key] = "swing"
+                st.session_state[door_filter_state_key] = "swing"
+                st.session_state[door_filter_widget_key] = "swing"
+                try:
+                    fstate["_door_filter"] = "swing"
+                except Exception:
+                    pass
             except Exception:
                 pass
         try:
@@ -1040,7 +1232,25 @@ def right_panel_review(
         # UX: selection will advance automatically. Treat this as explicit navigation so
         # auto-focus (if enabled) will focus the next selected door.
         _mark_nav_intent(str(file_id))
-        fstate["selected_door_id"] = None  # Move to next
+        # Advance selection using the same click-sink mechanism as Confirm. Setting
+        # selected_door_id=None is not enough to express "next" (sync falls back to first).
+        try:
+            if len(door_ids) > 1:
+                next_id = door_ids[(int(selected_idx) + 1) % max(1, len(door_ids))]
+                if str(next_id) and str(next_id) != str(did):
+                    st.session_state[f"door_click_sink_{file_id}"] = str(next_id)
+        except Exception:
+            pass
+        fstate["selected_door_id"] = None  # Allow sync to pick click-sink (or first).
+        _ui_log(
+            "action_reject_rerun",
+            {
+                "file_id": str(file_id),
+                "door_id": str(did),
+                "next_id": str(st.session_state.get(f"door_click_sink_{file_id}") or ""),
+                "door_filter": str(st.session_state.get(door_filter_state_key) or ""),
+            },
+        )
         st.rerun()
 
     # Optional global negative (rare): truly "not a door at all".
@@ -1051,6 +1261,21 @@ def right_panel_review(
         key=f"not_door_btn_{key_suffix}",
         help="Global negative: use only when the highlighted item is truly not any door type (hide it).",
     ):
+        try:
+            st.session_state[f"_door_filter_expected_{file_id}"] = str(st.session_state.get(door_filter_state_key) or "")
+        except Exception:
+            pass
+        _ui_log(
+            "action_not_a_door_at_all_clicked",
+            {
+                "file_id": str(file_id),
+                "door_id": str(did),
+                "door_filter": str(st.session_state.get(door_filter_state_key) or ""),
+                "is_editing": bool(is_editing),
+                "selected_idx": int(selected_idx),
+                "visible_len": int(len(door_ids)),
+            },
+        )
         working["deleted_ids"].add(did)
         try:
             cbt = working.get("confirmed_by_type")
@@ -1094,7 +1319,25 @@ def right_panel_review(
         # UX: selection will advance automatically. Treat this as explicit navigation so
         # auto-focus (if enabled) will focus the next selected door.
         _mark_nav_intent(str(file_id))
+        # Advance selection using click-sink. (selected_door_id=None alone falls back to first.)
+        try:
+            if len(door_ids) > 1:
+                next_id = door_ids[(int(selected_idx) + 1) % max(1, len(door_ids))]
+                if str(next_id) and str(next_id) != str(did):
+                    st.session_state[f"door_click_sink_{file_id}"] = str(next_id)
+        except Exception:
+            pass
         fstate["selected_door_id"] = None
+        _ui_log(
+            "action_not_a_door_at_all_rerun",
+            {
+                "file_id": str(file_id),
+                "door_id": str(did),
+                "next_id": str(st.session_state.get(f"door_click_sink_{file_id}") or ""),
+                "door_filter": str(st.session_state.get(door_filter_state_key) or ""),
+                "deleted_len": int(len(list(working.get("deleted_ids", set()) or []))),
+            },
+        )
         st.rerun()
 
     # Tips (below the action buttons).

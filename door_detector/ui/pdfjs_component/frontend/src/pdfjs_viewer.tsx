@@ -21,6 +21,29 @@ function dbg(label: string, payload?: any) {
   }
 }
 
+function perf(label: string, payload?: any) {
+  try {
+    // Enable either via console:
+    // - `window.__door_detectorPdfjsPerf = true`
+    // or via storage:
+    // - `localStorage.setItem("door_detector_profile","1")` (or sessionStorage)
+    const enabledFlag = (window as any).__door_detectorPdfjsPerf === true;
+    let enabledStorage = false;
+    try {
+      enabledStorage =
+        window.localStorage?.getItem("door_detector_profile") === "1" ||
+        window.sessionStorage?.getItem("door_detector_profile") === "1";
+    } catch {
+      enabledStorage = false;
+    }
+    if (!enabledFlag && !enabledStorage) return;
+    // eslint-disable-next-line no-console
+    console.log(label, payload ?? {});
+  } catch {
+    // ignore
+  }
+}
+
 // This runs only when the iframe JS bundle loads (useful to detect full remount/reload).
 try {
   const boot = ((window as any).__door_detectorPdfjsBoot ??= {
@@ -272,29 +295,44 @@ export function PdfJsViewer(props: ComponentProps) {
   // "Received component message for unregistered ComponentInstance".
   //
   // Make events robust by:
-  // - persisting the last emitted event (sessionStorage)
-  // - resending it until Python acks receipt via `lastAckEventId`
+  // - persisting an in-flight event + small queue (sessionStorage)
+  // - resending the in-flight event until Python acks receipt via `lastAckEventId`
+  //
+  // IMPORTANT:
+  // Streamlit custom components do not provide a built-in event queue. If we only store a
+  // single "pending event", a later event (e.g. a click/focus_state) can overwrite a
+  // draw event before it is acked, which makes draw/proposal interactions appear to
+  // "do nothing" (the UI reruns but proposal state never updates, leaving temp overlays).
   const mountedRef = useRef(true);
   const lastAckRef = useRef<string>("");
-  const pendingEventRef = useRef<ViewerEvent | null>(null);
+  const inFlightEventRef = useRef<ViewerEvent | null>(null);
+  const queuedEventsRef = useRef<ViewerEvent[]>([]);
   const resendTimerRef = useRef<number | null>(null);
   const resendAttemptsRef = useRef<number>(0);
+  const resendForEventIdRef = useRef<string>("");
   const recentEmittedEventsRef = useRef<ViewerEvent[]>([]);
 
   const pendingKey = useMemo(() => `door_detector_pdfjs_pending_evt_${fileId || "unknown"}`, [fileId]);
+
+  type PendingStore = {
+    inFlight: ViewerEvent | null;
+    queue: ViewerEvent[];
+  };
 
   const clearResendTimer = useCallback(() => {
     if (resendTimerRef.current) {
       window.clearTimeout(resendTimerRef.current);
       resendTimerRef.current = null;
     }
+    resendForEventIdRef.current = "";
   }, []);
 
-  const persistPendingEvent = useCallback(
-    (evt: ViewerEvent) => {
-      pendingEventRef.current = evt;
+  const persistPendingStore = useCallback(
+    (store: PendingStore) => {
+      inFlightEventRef.current = store.inFlight;
+      queuedEventsRef.current = store.queue;
       try {
-        sessionStorage.setItem(pendingKey, JSON.stringify(evt));
+        sessionStorage.setItem(pendingKey, JSON.stringify(store));
       } catch {
         // ignore
       }
@@ -302,34 +340,42 @@ export function PdfJsViewer(props: ComponentProps) {
     [pendingKey]
   );
 
-  const tryLoadPendingEvent = useCallback(() => {
+  const tryLoadPendingStore = useCallback((): PendingStore | null => {
     try {
       const raw = sessionStorage.getItem(pendingKey);
       if (!raw) return null;
       const obj = JSON.parse(raw);
       if (!obj || typeof obj !== "object") return null;
-      if (typeof obj.event_id !== "string" || !obj.event_id) return null;
-      return obj as ViewerEvent;
+
+      // Backwards compatibility: older builds stored a single ViewerEvent here.
+      if (typeof (obj as any).event_id === "string" && (obj as any).event_id) {
+        return { inFlight: obj as ViewerEvent, queue: [] };
+      }
+
+      const inFlight = (obj as any).inFlight ?? null;
+      const queue = (obj as any).queue ?? [];
+      const okInFlight = inFlight && typeof inFlight === "object" && typeof (inFlight as any).event_id === "string";
+      const okQueue = Array.isArray(queue);
+      return {
+        inFlight: okInFlight ? (inFlight as ViewerEvent) : null,
+        queue: okQueue ? (queue as ViewerEvent[]) : [],
+      };
     } catch {
       return null;
     }
   }, [pendingKey]);
 
-  const clearPendingEvent = useCallback(() => {
-    pendingEventRef.current = null;
-    resendAttemptsRef.current = 0;
-    clearResendTimer();
-    try {
-      sessionStorage.removeItem(pendingKey);
-    } catch {
-      // ignore
-    }
-  }, [clearResendTimer, pendingKey]);
-
   const sendEventOnce = useCallback((evt: ViewerEvent) => {
     if (!mountedRef.current) return;
     try {
       Streamlit.setComponentValue(evt);
+      try {
+        const eid = (evt as any)?.event_id ? String((evt as any).event_id) : "";
+        const et = String((evt as any)?.type ?? "");
+        perf("[door_detector][perf] emit", { type: et, event_id: eid, ts: Date.now() });
+      } catch {
+        // ignore
+      }
     } catch {
       // ignore
     }
@@ -339,6 +385,10 @@ export function PdfJsViewer(props: ComponentProps) {
     (evt: ViewerEvent) => {
       clearResendTimer();
       resendAttemptsRef.current = 0;
+      const eid0 = (evt as any)?.event_id ? String((evt as any).event_id) : "";
+      resendForEventIdRef.current = eid0;
+      const evtType = String((evt as any)?.type ?? "");
+      perf("[door_detector][perf] resend_schedule", { type: evtType, event_id: eid0, ts: Date.now() });
 
       const step = () => {
         if (!mountedRef.current) return;
@@ -346,37 +396,88 @@ export function PdfJsViewer(props: ComponentProps) {
         const eid = (evt as any)?.event_id ? String((evt as any).event_id) : "";
         if (!eid) return;
         if (curAck && curAck === eid) {
-          clearPendingEvent();
+          // Acked: stop resending. Queue advancement happens in the ack effect
+          // when `lastAckEventId` changes, so we don’t risk double-sending.
+          resendAttemptsRef.current = 0;
+          clearResendTimer();
           return;
         }
         // Retry a few times. The server dedupes by event_id, so resends are safe, but
         // *each resend can still trigger a Streamlit rerun*. If the server is doing
         // heavier work on a draw event (e.g. generating an ROI debug report), a too-fast
         // resend loop can cause multiple reruns and collapse UI state (e.g. proposal menu).
-        if (resendAttemptsRef.current >= 6) return;
+        // For draw events, be much more conservative: an early resend can interrupt
+        // the rerun that is supposed to create proposal state, leaving behind a
+        // client-only temp overlay (a "ghost" green box).
+        const maxAttempts = evtType === "draw_rect" ? 2 : 6;
+        if (resendAttemptsRef.current >= maxAttempts) return;
         resendAttemptsRef.current += 1;
+        perf("[door_detector][perf] resend_attempt", {
+          type: evtType,
+          event_id: eid,
+          attempt: resendAttemptsRef.current,
+          max: maxAttempts,
+          ts: Date.now(),
+        });
         sendEventOnce(evt);
-        // Exponential-ish backoff. Draw events can be heavier server-side, so start slower.
-        const base =
-          String((evt as any)?.type ?? "") === "draw_rect"
-            ? 950
-            : 520;
-        const delay = Math.min(2600, Math.round(base * Math.pow(1.65, resendAttemptsRef.current - 1)));
+        // Exponential-ish backoff. Draw events can be heavier server-side, so start *much*
+        // slower to avoid interrupting the in-flight rerun.
+        const base = evtType === "draw_rect" ? 2500 : 520;
+        const cap = evtType === "draw_rect" ? 12000 : 2600;
+        const delay = Math.min(cap, Math.round(base * Math.pow(1.75, resendAttemptsRef.current - 1)));
+        perf("[door_detector][perf] resend_delay", { type: evtType, event_id: eid, delay_ms: delay, ts: Date.now() });
         resendTimerRef.current = window.setTimeout(step, delay);
       };
 
       // First retry is delayed so we don't immediately spam in the common case.
       // (Especially important for draw events which can legitimately take longer.)
-      const firstDelay = String((evt as any)?.type ?? "") === "draw_rect" ? 950 : 520;
+      const firstDelay = evtType === "draw_rect" ? 2500 : 520;
+      perf("[door_detector][perf] resend_first_delay", { type: evtType, event_id: eid0, delay_ms: firstDelay, ts: Date.now() });
       resendTimerRef.current = window.setTimeout(step, firstDelay);
     },
-    [clearPendingEvent, clearResendTimer, sendEventOnce]
+    [clearResendTimer, sendEventOnce]
   );
 
   const emitEvent = useCallback(
     (evt: ViewerEvent) => {
       // Persist before sending so we can recover from an iframe swap.
-      persistPendingEvent(evt);
+      //
+      // If there is an unacked in-flight event, enqueue this one instead of
+      // overwriting the in-flight event (which would drop it).
+      const curAck = lastAckRef.current || "";
+      const inFlight = inFlightEventRef.current;
+      const inFlightId = inFlight && (inFlight as any)?.event_id ? String((inFlight as any).event_id) : "";
+      const isInFlightAcked = !!(inFlightId && curAck && curAck === inFlightId);
+
+      if (inFlight && inFlightId && !isInFlightAcked) {
+        const q = queuedEventsRef.current.slice();
+        q.push(evt);
+        persistPendingStore({ inFlight, queue: q });
+        perf("[door_detector][perf] enqueue", {
+          in_flight_event_id: inFlightId,
+          queued_len: q.length,
+          type: String((evt as any)?.type ?? ""),
+          event_id: String((evt as any)?.event_id ?? ""),
+          ts: Date.now(),
+        });
+        try {
+          const arr = recentEmittedEventsRef.current;
+          arr.push(evt);
+          if (arr.length > 25) arr.splice(0, arr.length - 25);
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      // No in-flight event (or it was already acked): send immediately.
+      persistPendingStore({ inFlight: evt, queue: queuedEventsRef.current.slice() });
+      perf("[door_detector][perf] send_immediate", {
+        type: String((evt as any)?.type ?? ""),
+        event_id: String((evt as any)?.event_id ?? ""),
+        queued_len: queuedEventsRef.current.length,
+        ts: Date.now(),
+      });
       try {
         const arr = recentEmittedEventsRef.current;
         arr.push(evt);
@@ -387,7 +488,7 @@ export function PdfJsViewer(props: ComponentProps) {
       sendEventOnce(evt);
       scheduleResendLoop(evt);
     },
-    [persistPendingEvent, scheduleResendLoop, sendEventOnce]
+    [persistPendingStore, scheduleResendLoop, sendEventOnce]
   );
 
   // High-signal lifecycle + prop-change logs (helps distinguish remount vs rerender).
@@ -420,22 +521,85 @@ export function PdfJsViewer(props: ComponentProps) {
     };
   }, [clearResendTimer]);
 
+  // Load any persisted pending events when file changes (or on first mount).
+  useEffect(() => {
+    const store0 = tryLoadPendingStore();
+    if (store0) persistPendingStore(store0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fileId]);
+
   // Track the latest server-side ack id so resends can stop ASAP after a rerun.
   useEffect(() => {
     lastAckRef.current = String(lastAckEventId || "");
-    const pending = pendingEventRef.current ?? tryLoadPendingEvent();
-    if (!pending) return;
-    const eid = String((pending as any)?.event_id || "");
-    if (!eid) return;
-    if (lastAckRef.current && lastAckRef.current === eid) {
-      clearPendingEvent();
+    const ack = lastAckRef.current || "";
+
+    const inFlight = inFlightEventRef.current;
+    const inFlightId = inFlight && (inFlight as any)?.event_id ? String((inFlight as any).event_id) : "";
+
+    // If the in-flight event is acked, clear it and advance the queue.
+    if (inFlightId && ack && ack === inFlightId) {
+      perf("[door_detector][perf] ack", { ack, in_flight_event_id: inFlightId, queued_len: queuedEventsRef.current.length, ts: Date.now() });
+      inFlightEventRef.current = null;
+      resendAttemptsRef.current = 0;
+      clearResendTimer();
+
+      const q = queuedEventsRef.current.slice();
+      const next = q.shift() ?? null;
+      if (next) {
+        persistPendingStore({ inFlight: next, queue: q });
+        perf("[door_detector][perf] dequeue_send_next", {
+          next_event_id: String((next as any)?.event_id ?? ""),
+          next_type: String((next as any)?.type ?? ""),
+          remaining: q.length,
+          ts: Date.now(),
+        });
+        sendEventOnce(next);
+        scheduleResendLoop(next);
+        return;
+      }
+
+      // No queued items left: clear persisted store.
+      persistPendingStore({ inFlight: null, queue: [] });
+      try {
+        sessionStorage.removeItem(pendingKey);
+      } catch {
+        // ignore
+      }
       return;
     }
-    // If we have a pending event and it hasn't been acked, attempt a resend loop.
-    // This recovers from cases where Streamlit dropped the original message during rerun.
-    pendingEventRef.current = pending;
-    scheduleResendLoop(pending);
-  }, [clearPendingEvent, lastAckEventId, scheduleResendLoop, tryLoadPendingEvent]);
+
+    // If there is no in-flight event (e.g. we loaded a queue from storage), promote next.
+    if (!inFlightEventRef.current) {
+      const q = queuedEventsRef.current.slice();
+      const next = q.shift() ?? null;
+      if (next) {
+        persistPendingStore({ inFlight: next, queue: q });
+        perf("[door_detector][perf] promote_send", {
+          next_event_id: String((next as any)?.event_id ?? ""),
+          next_type: String((next as any)?.type ?? ""),
+          remaining: q.length,
+          ts: Date.now(),
+        });
+        sendEventOnce(next);
+        scheduleResendLoop(next);
+      } else {
+        // Ensure storage doesn't retain stale state.
+        try {
+          sessionStorage.removeItem(pendingKey);
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    // There is an in-flight event that is not acked: ensure resend loop is running,
+    // but don't reset attempts if we're already resending this same event.
+    if (inFlightId && resendForEventIdRef.current !== inFlightId) {
+      perf("[door_detector][perf] resume_resend_loop", { in_flight_event_id: inFlightId, ts: Date.now() });
+      scheduleResendLoop(inFlightEventRef.current);
+    }
+  }, [clearResendTimer, lastAckEventId, pendingKey, persistPendingStore, scheduleResendLoop, sendEventOnce]);
 
   const lastPropsRef = useRef<any>(null);
   useEffect(() => {
@@ -519,6 +683,18 @@ export function PdfJsViewer(props: ComponentProps) {
       if (obj) {
         // eslint-disable-next-line no-console
         console.log("[door_detector] unmatched_debug_report parsed", obj);
+        try {
+          if ((obj as any)?.summary) {
+            // eslint-disable-next-line no-console
+            console.log("[door_detector] unmatched_debug_report summary", (obj as any).summary);
+          }
+          if ((obj as any)?.extra) {
+            // eslint-disable-next-line no-console
+            console.log("[door_detector] unmatched_debug_report extra", (obj as any).extra);
+          }
+        } catch {
+          // ignore
+        }
       } else {
         // eslint-disable-next-line no-console
         console.warn("[door_detector] unmatched_debug_report parse_failed");
@@ -1337,6 +1513,19 @@ export function PdfJsViewer(props: ComponentProps) {
         return bestByIou;
       }
       if (bestByCoverage && bestByCoverage.coverage >= MIN_CAND_COVERAGE) {
+        const interFrac = drawnArea > 0 ? bestByCoverage.inter / drawnArea : 0;
+        // Guardrail: avoid snapping to a tiny candidate that happens to be fully contained
+        // by a much larger drawn box (common false-positive near doors).
+        if (interFrac < MIN_INTER_FRAC_OF_DRAWN) {
+          // eslint-disable-next-line no-console
+          console.log("[door_detector] snapCandidateForDrawPdf no match (coverage candidate too small)", {
+            id: bestByCoverage.id,
+            coverage: bestByCoverage.coverage,
+            interFracOfDrawn: interFrac,
+            iou: bestByCoverage.iou,
+          });
+          return null;
+        }
         // eslint-disable-next-line no-console
         console.log("[door_detector] snapCandidateForDrawPdf chosen", {
           reason: "coverage",
@@ -1709,6 +1898,28 @@ export function PdfJsViewer(props: ComponentProps) {
                 : null,
               ts: Date.now(),
             });
+            // Copy-friendly line (avoids "Array(4)" collapsing in console output).
+            // eslint-disable-next-line no-console
+            console.log(
+              "[door_detector] draw_rect endDrag (pdfjs) json",
+              JSON.stringify(
+                {
+                  drawn_pdf_xyxy: drawn,
+                  candidates: candidatePool.length,
+                  snap: snap
+                    ? {
+                        id: (snap as any).id,
+                        type: snapType,
+                        iou: (snap as any).iou ?? computeIoU(drawn, (snap as any).bbox),
+                        bbox: (snap as any).bbox,
+                      }
+                    : null,
+                  ts: Date.now(),
+                },
+                null,
+                0
+              )
+            );
           } catch {
             // ignore
           }

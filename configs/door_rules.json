@@ -23,8 +23,20 @@
   "swing": {
     "enabled": true,
     "bezier_sampling_points": 17,
+    "leaf_only": {
+      "enabled": true,
+      "min_leaf_length_px": 40.0,
+      "max_leaf_length_px": 420.0,
+      "corner_probe_px": 8.0,
+      "corner_endpoint_snap_px": 6.0,
+      "min_axis_support_length_px": 40.0,
+      "axis_alignment_ratio": 0.2,
+      "pad_frac_of_length": 0.22,
+      "max_candidates": 250
+    },
     "polyline_arc": {
       "endpoint_snap_px": 4.0,
+      "allow_dashed": true,
       "min_segments": 3,
       "max_segments": 60,
       "max_segment_length_px": 180.0,
@@ -35,6 +47,7 @@
       "min_angle_deg": 20,
       "max_angle_deg": 125,
       "max_circle_fit_rmse": 2.5,
+      "max_circle_fit_rmse_ratio": 0.04,
       "min_radius_px": 8,
       "max_radius_px": 900,
       "suppress_circle_clusters": true,

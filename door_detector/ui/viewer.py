@@ -21,6 +21,7 @@ from door_detector.ui.labels import flatten_confirmed_ids, flatten_rejected_ids,
 from door_detector.ui.pdfjs_component import pdfjs_viewer
 from door_detector.pdf.affine import apply_affine_bbox_xyxy, fitz_bbox_to_pdfjs_bbox_xyxy, normalize_bbox_xyxy
 from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids
+from door_detector.perf import enabled as perf_enabled, span as perf_span, log as perf_log
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -1948,7 +1949,33 @@ def main_viewer_canvas(
         pdf_mtime = int(pdf_path.stat().st_mtime_ns)
     except Exception:
         pdf_mtime = 0
-    pdf_hash, pdf_b64 = _load_pdf_b64_and_hash(str(pdf_path), mtime_ns=pdf_mtime)
+    with perf_span("viewer.load_pdf_b64", file_id=str(file_id), mtime_ns=int(pdf_mtime)):
+        pdf_hash, pdf_b64 = _load_pdf_b64_and_hash(str(pdf_path), mtime_ns=pdf_mtime)
+
+    # IMPORTANT (perf):
+    # Sending multi-MB `pdfDataB64` on every rerun is a major source of UI lag.
+    # The PDF.js component caches PDF bytes in browser storage keyed by `pdfHash`,
+    # so we only need to send the base64 once per (file_id, pdf_hash) per Streamlit session.
+    send_pdf_b64 = True
+    try:
+        last_sent = str(fstate.get("_pdf_b64_sent_hash") or "")
+        if last_sent and last_sent == str(pdf_hash):
+            send_pdf_b64 = False
+        else:
+            fstate["_pdf_b64_sent_hash"] = str(pdf_hash)
+            send_pdf_b64 = True
+    except Exception:
+        send_pdf_b64 = True
+
+    pdf_b64_to_send = str(pdf_b64) if send_pdf_b64 else None
+    if perf_enabled():
+        perf_log(
+            "viewer.pdf_payload",
+            file_id=str(file_id),
+            pdf_hash=str(pdf_hash),
+            send_pdf_b64=bool(send_pdf_b64),
+            pdf_b64_bytes=int(len(pdf_b64_to_send or "")),
+        )
 
     # Load Step1 transform so we can compute bbox_pdf_xyxy for any legacy data.
     pix_to_pdf_affine: Optional[List[float]] = None
@@ -1964,7 +1991,8 @@ def main_viewer_canvas(
     try:
         tpath = file_dir / "transform.json"
         if tpath.exists():
-            obj = json.loads(tpath.read_text())
+            with perf_span("viewer.load_transform_json", file_id=str(file_id)):
+                obj = json.loads(tpath.read_text())
             m = obj.get("pix_to_pdf_affine") if isinstance(obj, dict) else None
             if isinstance(m, list) and len(m) == 6:
                 pix_to_pdf_affine = [float(v) for v in m]
@@ -2322,7 +2350,35 @@ def main_viewer_canvas(
         except Exception:
             full_w, full_h = None, None
 
-    picked = _sample_pool_for_viewer(pool, full_w=full_w, full_h=full_h, max_out=1200, grid=8)
+    # Performance note:
+    # The candidate pool is shipped to the browser on *every* rerun. Keeping it large
+    # makes the UI feel laggy due to websocket serialization/transfer and client-side
+    # prop processing.
+    #
+    # The server is the source of truth for snapping; the client pool is only a hint.
+    # So we keep the default pool modest, and allow a larger pool in edit/proposal modes.
+    try:
+        edit_mode = bool(fstate.get("edit_mode"))
+    except Exception:
+        edit_mode = False
+    try:
+        has_proposal = isinstance(fstate.get("_proposal"), dict) and bool(fstate.get("_proposal"))
+    except Exception:
+        has_proposal = False
+
+    max_pool_out = 500
+    if edit_mode or has_proposal:
+        max_pool_out = 900
+
+    with perf_span(
+        "viewer.sample_candidate_pool",
+        file_id=str(file_id),
+        pool_in=int(len(pool)),
+        max_out=int(max_pool_out),
+        edit_mode=bool(edit_mode),
+        has_proposal=bool(has_proposal),
+    ):
+        picked = _sample_pool_for_viewer(pool, full_w=full_w, full_h=full_h, max_out=int(max_pool_out), grid=8)
     # Ensure the currently-cycled candidate (from the right panel Prev/Next) is
     # present in the frontend pool so the viewer can draw its highlight bbox.
     try:
@@ -2339,32 +2395,46 @@ def main_viewer_canvas(
         except Exception:
             pass
     out_pool: List[Dict[str, Any]] = []
-    for cand in picked:
-        cid = cand.get("id")
-        if cid is None:
-            continue
-        bb_pdf = _bbox_pdf_for_any(cand.get("bbox_xyxy"), cand.get("bbox_pdf_xyxy"))
-        if not bb_pdf:
-            continue
-        # Include minimal metadata to allow the frontend to apply conservative
-        # snap filters (e.g. distinguish swing arcs vs generic near-square symbols).
-        feats = cand.get("features") if isinstance(cand, dict) else None
-        slim_feats: Dict[str, Any] = {}
-        if isinstance(feats, dict):
-            for k in ("arc_only", "angle_span", "radius", "rmse"):
-                if k in feats:
-                    try:
-                        slim_feats[k] = float(feats.get(k))
-                    except Exception:
-                        continue
-        out_pool.append(
-            {
-                "id": str(cid),
-                "type": str(cand.get("type") or ""),
-                "bbox_pdf_xyxy": bb_pdf,
-                "features": slim_feats,
-            }
-        )
+    with perf_span("viewer.build_candidate_pool_props", file_id=str(file_id), picked=int(len(picked))):
+        for cand in picked:
+            cid = cand.get("id")
+            if cid is None:
+                continue
+            bb_pdf = _bbox_pdf_for_any(cand.get("bbox_xyxy"), cand.get("bbox_pdf_xyxy"))
+            if not bb_pdf:
+                continue
+            # Include minimal metadata to allow the frontend to apply conservative
+            # snap filters (e.g. distinguish swing arcs vs generic near-square symbols).
+            feats = cand.get("features") if isinstance(cand, dict) else None
+            slim_feats: Dict[str, Any] = {}
+            if isinstance(feats, dict):
+                for k in ("arc_only", "angle_span", "radius", "rmse"):
+                    if k in feats:
+                        try:
+                            slim_feats[k] = float(feats.get(k))
+                        except Exception:
+                            continue
+            out_pool.append(
+                {
+                    "id": str(cid),
+                    "type": str(cand.get("type") or ""),
+                    "bbox_pdf_xyxy": bb_pdf,
+                    "features": slim_feats,
+                }
+            )
+
+    # Optional payload sizing (helps identify websocket bottlenecks).
+    out_pool_bytes = None
+    overlay_bytes = None
+    if perf_enabled():
+        try:
+            out_pool_bytes = int(len(json.dumps(out_pool, separators=(",", ":"))))
+        except Exception:
+            out_pool_bytes = None
+        try:
+            overlay_bytes = int(len(json.dumps(overlay_doors_pdf, separators=(",", ":"))))
+        except Exception:
+            overlay_bytes = None
 
     # Door state for styling.
     working = _get_working_label_state(fstate)
@@ -2414,28 +2484,46 @@ def main_viewer_canvas(
     )
 
     # NOTE: component value is stored in session_state under this key.
-    pdfjs_viewer(
+    if perf_enabled():
+        perf_log(
+            "viewer.props",
+            file_id=str(file_id),
+            viewer_key=str(viewer_key),
+            pdf_b64_bytes=int(len(pdf_b64_to_send or "")),
+            overlay_doors=int(len(overlay_doors_pdf or [])),
+            candidate_pool=int(len(out_pool or [])),
+            overlay_bytes=int(overlay_bytes) if overlay_bytes is not None else None,
+            candidate_pool_bytes=int(out_pool_bytes) if out_pool_bytes is not None else None,
+            unmatched_debug_bytes=int(len(unmatched_debug_raw or "")),
+        )
+    with perf_span(
+        "viewer.render_pdfjs_component",
         file_id=str(file_id),
-        height=int(viewer_height),
-        pdf_hash=str(pdf_hash),
-        pdf_data_b64=str(pdf_b64),
-        page_number=1,
-        overlay_doors=overlay_doors_pdf,
-        candidate_pool=out_pool,
-        selected_door_id=str(fstate.get("selected_door_id") or ""),
-        focus_seq=int(fstate.get("_focus_seq") or 0),
-        focus_request_seq=int(fstate.get("_focus_request_seq") or 0),
-        proposal_focus_seq=int(fstate.get("_proposal_focus_seq") or 0),
-        auto_focus=bool(fstate.get("auto_focus", True)),
-        cycle_candidate_id=str(fstate.get("_cycle_candidate_id") or ""),
-        edit_mode=bool(fstate.get("edit_mode")),
-        viewer_display_mode=str(viewer_display),
-        door_state=door_state,
-        manual_overlays=manual_payload,
-        proposal_overlays=proposal_payload,
-        unmatched_debug_raw=unmatched_debug_raw,
-        last_ack_event_id=last_ack,
-        key=viewer_key,
-    )
+        overlay_doors=int(len(overlay_doors_pdf or [])),
+        candidate_pool=int(len(out_pool or [])),
+    ):
+        pdfjs_viewer(
+            file_id=str(file_id),
+            height=int(viewer_height),
+            pdf_hash=str(pdf_hash),
+            pdf_data_b64=pdf_b64_to_send,
+            page_number=1,
+            overlay_doors=overlay_doors_pdf,
+            candidate_pool=out_pool,
+            selected_door_id=str(fstate.get("selected_door_id") or ""),
+            focus_seq=int(fstate.get("_focus_seq") or 0),
+            focus_request_seq=int(fstate.get("_focus_request_seq") or 0),
+            proposal_focus_seq=int(fstate.get("_proposal_focus_seq") or 0),
+            auto_focus=bool(fstate.get("auto_focus", True)),
+            cycle_candidate_id=str(fstate.get("_cycle_candidate_id") or ""),
+            edit_mode=bool(fstate.get("edit_mode")),
+            viewer_display_mode=str(viewer_display),
+            door_state=door_state,
+            manual_overlays=manual_payload,
+            proposal_overlays=proposal_payload,
+            unmatched_debug_raw=unmatched_debug_raw,
+            last_ack_event_id=last_ack,
+            key=viewer_key,
+        )
     return None, active_doors
 

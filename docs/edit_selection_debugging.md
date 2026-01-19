@@ -65,6 +65,28 @@ Look for `extra.debug_reason` in the parsed object:
 - `weak_snap_low_iou`: a candidate overlapped, but overlap was weak; common “intended door wasn’t a candidate”.
 - `snap_mismatch`: the client and server picked different candidates.
 
+### Prefer the summary logs (copy-friendly)
+Newer builds include a compact summary so you don’t have to copy a massive verbose JSON blob:
+
+- Browser console:
+  - `[door_detector] unmatched_debug_report summary …`
+  - `[door_detector] unmatched_debug_report extra …`
+- Server console (Streamlit terminal):
+  - `[door_detector] unmatched_debug_summary {…}`
+
+High-signal fields:
+- `summary.primary_failure`
+- `summary.counts.beziers_near_roi`
+- `summary.counts.non_dashed_non_axis_lines_near_roi`
+
+If you see:
+- `summary.primary_failure == "no_vector_arc_or_leaf_near_roi"` **and** both counts above are `0`,
+  that means the door’s arc/leaf are likely **rasterized (or otherwise absent from vector primitives)**. In that case,
+  arc/leaf-based swing detection cannot generate a `swing` candidate; you must use the manual-box fallback or a future raster detector.
+- `summary.primary_failure == "no_arc_primitives_near_roi"` with `beziers_near_roi == 0` but `non_dashed_non_axis_lines_near_roi > 0`,
+  that usually means the **leaf line is vector** but the **arc is missing/rasterized**. In that case, enable (or tune)
+  `swing.leaf_only` candidates so the door becomes snap-selectable.
+
 ### Optional (enable only when needed)
 To enable PDF.js component lifecycle logs:
 
@@ -91,7 +113,7 @@ instance (often during a rerun).
 This means: **none of the candidates the viewer knows about overlap the drawn box**.
 
 Common causes:
-- You drew a box that misses the candidate bbox (padding can surprise you).
+- You drew a box that misses the candidate bbox (padding can surprise you), but for given sitaution this isnt likely as the tester took care to draw accurate box.
 - The relevant candidate exists on the server but wasn’t included in the **downsampled** frontend pool.
 - There truly is no candidate for that door.
 
