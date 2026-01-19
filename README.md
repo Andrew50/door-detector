@@ -22,7 +22,7 @@ In the UI:
 - Review detections (confirm / reject / delete) and add missed doors (**Edit Doors → Shift+drag**)
 - Labels are saved to `artifacts/library/<file_id>/labels.json` (schema v4)
 
-## Architecture diagram (good for Loom)
+## Architecture diagram
 
 See `docs/ARCHITECTURE_DIAGRAM.md` for a one-screen diagram of the pipeline and the review → retrain loop.
 
