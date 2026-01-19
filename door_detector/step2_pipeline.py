@@ -24,7 +24,15 @@ def run_step2(
         output_dir = artifacts_dir
 
     # 1. Load config and compute signature
+    config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_bytes())
+    # Best-effort base dir for resolving `models/...` references when the process
+    # is launched from a different working directory than the repo root.
+    try:
+        base_dir = config_path.parent.parent if config_path.parent.name == "configs" else config_path.parent
+        config["_door_detector_base_dir"] = str(base_dir)
+    except Exception:
+        pass
     analysis_signature = compute_analysis_signature(config_path)
 
     # 2. Load artifacts

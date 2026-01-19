@@ -28,6 +28,19 @@ from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_on
 logger = logging.getLogger("door_detector.review_app")
 
 
+def _default_config_path_str() -> str:
+    """Best-effort default config path that works when launched outside repo root."""
+    p = Path("configs/door_rules.json")
+    if p.exists():
+        return str(p)
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        p2 = repo_root / "configs" / "door_rules.json"
+        return str(p2)
+    except Exception:
+        return str(p)
+
+
 def _nav_intent_key(file_id: str) -> str:
     # Flag set in session_state to indicate the user explicitly navigated to a new door
     # (e.g. by typing an index). Used to control autofocus behavior.
@@ -158,7 +171,7 @@ def main_viewer_controls(
             st.cache_data.clear()
             st.rerun()
 
-        config_path = "configs/door_rules.json"
+        config_path = _default_config_path_str()
         current_sig = get_current_signature(config_path)
         stored_sig = doors_data.get("analysis_signature")
         is_out_of_date = stored_sig and current_sig and stored_sig != current_sig

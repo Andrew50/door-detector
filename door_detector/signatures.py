@@ -25,6 +25,65 @@ def compute_analysis_signature(config_path: Path) -> str:
 
     sig_content = bytearray(config_bytes)
 
+    def _base_dirs() -> list[Path]:
+        out: list[Path] = []
+        # Heuristic: configs typically live at `<repo>/configs/*.json` in this repo.
+        try:
+            if config_path.parent.name == "configs":
+                out.append(config_path.parent.parent)
+            else:
+                out.append(config_path.parent)
+        except Exception:
+            pass
+        # Fallback: infer repo root from package location (`door_detector/signatures.py` -> parents[1]).
+        try:
+            out.append(Path(__file__).resolve().parents[1])
+        except Exception:
+            pass
+        # Deduplicate.
+        seen: set[str] = set()
+        uniq: list[Path] = []
+        for p in out:
+            sp = str(p)
+            if sp in seen:
+                continue
+            seen.add(sp)
+            uniq.append(p)
+        return uniq
+
+    def _resolve_existing(path_str: str) -> Path | None:
+        if not isinstance(path_str, str) or not path_str:
+            return None
+        raw = path_str.strip()
+        if not raw:
+            return None
+        try:
+            p = Path(raw)
+        except Exception:
+            return None
+        try:
+            if p.is_absolute():
+                return p if p.exists() else None
+        except Exception:
+            return None
+        # 1) As-is (relative to CWD).
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            pass
+        # 2) Relative to inferred base dirs.
+        for bd in _base_dirs():
+            try:
+                cand = bd / p
+                if cand.exists():
+                    return cand
+            except Exception:
+                continue
+        return None
+
+    added_any_reweighter = False
+
     # Preferred: per-type reweighters.
     reweighters = config.get("reweighters")
     if isinstance(reweighters, dict):
@@ -32,20 +91,39 @@ def compute_analysis_signature(config_path: Path) -> str:
             v = reweighters.get(k)
             if not isinstance(v, str) or not v:
                 continue
-            re_path = Path(v)
-            if re_path.exists():
+            re_path = _resolve_existing(v)
+            if re_path is not None:
                 sig_content.extend(b"|reweighter:")
                 sig_content.extend(str(k).encode("utf-8"))
                 sig_content.extend(b"|")
                 sig_content.extend(re_path.read_bytes())
+                added_any_reweighter = True
 
     # Backward compatibility: single reweighter path.
     legacy_path = config.get("reweighter_path")
     if isinstance(legacy_path, str) and legacy_path:
-        re_path = Path(legacy_path)
-        if re_path.exists():
+        re_path = _resolve_existing(legacy_path)
+        if re_path is not None:
             sig_content.extend(b"|reweighter:legacy|")
             sig_content.extend(re_path.read_bytes())
+            added_any_reweighter = True
+
+    # If config doesn't reference any models, include default files (matches runtime auto-discovery).
+    if not added_any_reweighter:
+        for t in ("swing", "double", "pocket", "bifold"):
+            re_path = _resolve_existing(f"models/reweighter_{t}_v1.json")
+            if re_path is None:
+                continue
+            sig_content.extend(b"|reweighter:auto|")
+            sig_content.extend(str(t).encode("utf-8"))
+            sig_content.extend(b"|")
+            sig_content.extend(re_path.read_bytes())
+            added_any_reweighter = True
+        legacy_auto = _resolve_existing("models/reweighter_v1.json")
+        if legacy_auto is not None:
+            sig_content.extend(b"|reweighter:auto|legacy|")
+            sig_content.extend(legacy_auto.read_bytes())
+            added_any_reweighter = True
 
     return hashlib.sha256(bytes(sig_content)).hexdigest()
 

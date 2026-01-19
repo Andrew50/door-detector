@@ -1216,7 +1216,7 @@ export function PdfJsViewer(props: ComponentProps) {
       const MIN_SNAP_IOU_FOR_SQUARE = 0.10;
 
       const norm = normalizeBBox(drawnPdf);
-      const overlap: Array<{ id: string; bbox: BBox; iou: number; inter: number; coverage: number }> = [];
+      const overlap: Array<{ id: string; type: string; bbox: BBox; iou: number; inter: number; coverage: number }> = [];
 
       let bestIou = -1;
       let bestByIou: { id: string; bbox: BBox; iou: number; inter: number } | null = null;
@@ -1250,7 +1250,7 @@ export function PdfJsViewer(props: ComponentProps) {
             skippedSquareWeak += 1;
             continue;
           }
-          overlap.push({ id: did, bbox: cand, iou, inter, coverage });
+          overlap.push({ id: did, type: rType, bbox: cand, iou, inter, coverage });
           if (iou > bestIou) {
             bestIou = iou;
             bestByIou = { id: did, bbox: cand, iou, inter };
@@ -1285,7 +1285,7 @@ export function PdfJsViewer(props: ComponentProps) {
         bestByCoverage: bestByCoverage
           ? { id: bestByCoverage.id, coverage: bestByCoverage.coverage, inter: bestByCoverage.inter, iou: bestByCoverage.iou }
           : null,
-        overlapSample: overlap.slice(0, 3),
+        overlapSample: overlap.slice(0, 3).map((o) => ({ id: o.id, type: o.type, iou: o.iou, inter: o.inter, coverage: o.coverage, bbox: o.bbox })),
       });
 
       if (!overlap.length) {
@@ -1644,13 +1644,24 @@ export function PdfJsViewer(props: ComponentProps) {
           const p1 = vp.convertToPdfPoint(x1, y1);
           const drawn: BBox = normalizeBBox([p0[0], p0[1], p1[0], p1[1]]);
           const snap = snapCandidateForDrawPdf(drawn);
+          const snapType =
+            snap && (snap as any).id
+              ? String(((candidatePool as any[]).find((c) => String(c?.id ?? "") === String((snap as any).id)) as any)?.type ?? "")
+              : "";
 
           try {
             // eslint-disable-next-line no-console
             console.log("[door_detector] draw_rect endDrag (pdfjs)", {
               drawn_pdf_xyxy: drawn,
               candidates: candidatePool.length,
-              snap: snap ? { id: (snap as any).id, iou: (snap as any).iou ?? computeIoU(drawn, (snap as any).bbox), bbox: (snap as any).bbox } : null,
+              snap: snap
+                ? {
+                    id: (snap as any).id,
+                    type: snapType,
+                    iou: (snap as any).iou ?? computeIoU(drawn, (snap as any).bbox),
+                    bbox: (snap as any).bbox,
+                  }
+                : null,
               ts: Date.now(),
             });
           } catch {

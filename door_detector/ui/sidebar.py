@@ -21,6 +21,20 @@ from door_detector.ui.labels import (
 )
 
 
+def _default_models_dir() -> Path:
+    """Best-effort models dir aligned with repo-root `configs/door_rules.json`."""
+    cwd_models = Path("models")
+    # Prefer repo root if it looks like we're in a repo checkout.
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        cfg = repo_root / "configs" / "door_rules.json"
+        if cfg.exists():
+            return repo_root / "models"
+    except Exception:
+        pass
+    return cwd_models
+
+
 def _retrain_state_path(models_dir: Path) -> Path:
     return models_dir / "retrain_state_v1.json"
 
@@ -207,7 +221,7 @@ def sidebar_library(lib: Library) -> None:
     total_samples = int(counts.get("total_samples") or 0)
     num_label_files = int(counts.get("num_label_files") or 0)
 
-    models_dir = Path("models")
+    models_dir = _default_models_dir()
     last_trained_total = _load_last_trained_total_samples(models_dir=models_dir)
     untrained = max(0, int(total_samples) - int(last_trained_total))
 

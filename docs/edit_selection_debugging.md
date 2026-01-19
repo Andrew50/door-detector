@@ -1,3 +1,13 @@
+## your task:
+
+for the proposed selection (only valid snap/canddiate in green, user seelction box in blue) the door that was attempted to be proposed was not a candidate. this is an issue with how candidates are generated. what caused the door to not be a candidate (what specific critera was missed for the doors gemotry that led to it not being a canddidate)? I have attached the logs, if they do not provide enough information then they need to be augmented. if you are going to modify the candidate criteria first read candidate failure logs.md, and then do it in a way that doesnt invalidate previously undedected candidadate. append the reason for the door not being in the candidate list to the candidate filaure log with a concise dscripton of the door geometry, why it failed to be a candidate, and how you changed the detection
+
+
+
+## context that might help:
+
+
+
 # Debugging Edit Doors selection/snapping issues
 
 This doc explains how to debug cases where **Edit Doors → Shift+drag** does **not** surface the door you intended in the **Selection matches** suggestions (or snaps to the wrong thing).
@@ -29,7 +39,7 @@ Implemented in `door_detector/ui/app.py` (`_process_draw_event_if_any`).
 
 - Uses **full** candidate list from `doors.json["candidates"]` (fallback to `doors.json["doors"]`).
 - Produces a ranked `fstate["_last_draw_suggestions"]` which powers the right-panel **Selection matches** UI.
-- Emits `unmatched_debug_report` (printed by the viewer) when it cannot match to a candidate.
+- Emits `unmatched_debug_report` (printed by the viewer) when it cannot match to a candidate (and, in newer builds, also when the snap is likely wrong / very weak).
 
 ---
 
@@ -42,7 +52,17 @@ Implemented in `door_detector/ui/app.py` (`_process_draw_event_if_any`).
   - `[door_detector] draw_rect endDrag (pdfjs) …` (include `drawn_pdf_xyxy`)
 - If printed, the full:
   - `[door_detector] unmatched_debug_report raw {…}`
+- If present, also copy:
+  - `[door_detector] unmatched_debug_report parsed {…}`
 - The **file id** (e.g. `f_1768774913300`) and whether you just **Re-analyzed**.
+
+### Important: you can get `unmatched_debug_report` even when it *did* snap
+Recent builds emit the unmatched debug report not only when *no* candidate overlaps,
+but also when the snap is likely wrong (e.g. a **low IoU** snap to some nearby symbol).
+
+Look for `extra.debug_reason` in the parsed object:
+- `weak_snap_low_iou`: a candidate overlapped, but overlap was weak; common “intended door wasn’t a candidate”.
+- `snap_mismatch`: the client and server picked different candidates.
 
 ### Optional (enable only when needed)
 To enable PDF.js component lifecycle logs:
@@ -81,8 +101,10 @@ This means: the intended door was either:
 - not in the overlap set, or
 - in the overlap set but ranked lower than a false-positive symbol.
 
-Next step: use **Selection matches** + type filter to cycle.
-If the intended door is not in suggestions, it likely does not exist as a candidate (or doesn’t overlap).
+Next step:
+- Use **Selection matches** + type filter to cycle.
+- If the intended door is not in suggestions, it likely does not exist as a candidate (or doesn’t overlap).
+- If `unmatched_debug_report` is present with `extra.debug_reason: "weak_snap_low_iou"`, use that report to identify the specific missing geometry criterion (arc extraction, leaf pairing, dashed track, etc).
 
 ---
 

@@ -207,6 +207,75 @@ def apply_reweighters_by_type(
     return candidates
 
 
+def _door_detector_base_dirs_from_config(config: Dict[str, Any]) -> List[Path]:
+    """Return candidate base dirs for resolving relative model paths (best-effort).
+
+    This is intentionally permissive: the UI/CLI may run from a different CWD than
+    the repo root, while configs often reference `models/...` relative to the repo.
+    """
+    out: List[Path] = []
+
+    base = config.get("_door_detector_base_dir")
+    if isinstance(base, str) and base.strip():
+        try:
+            out.append(Path(base.strip()))
+        except Exception:
+            pass
+
+    # Fallback: infer repo root from package location (works in this repo checkout).
+    # `.../door_detector/doors/detect.py` -> parents[2] == repo root.
+    try:
+        out.append(Path(__file__).resolve().parents[2])
+    except Exception:
+        pass
+
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    uniq: List[Path] = []
+    for p in out:
+        sp = str(p)
+        if sp in seen:
+            continue
+        seen.add(sp)
+        uniq.append(p)
+    return uniq
+
+
+def _resolve_existing_path(path_str: str, *, base_dirs: List[Path]) -> Optional[str]:
+    """Resolve a model path string to an existing filesystem path if possible."""
+    if not isinstance(path_str, str) or not path_str.strip():
+        return None
+    raw = path_str.strip()
+
+    try:
+        p = Path(raw)
+    except Exception:
+        return None
+
+    try:
+        if p.is_absolute():
+            return str(p) if p.exists() else None
+    except Exception:
+        return None
+
+    # 1) As-is (relative to CWD).
+    try:
+        if p.exists():
+            return str(p)
+    except Exception:
+        pass
+
+    # 2) Relative to known base dirs (repo root, UI-provided base, etc).
+    for bd in base_dirs:
+        try:
+            cand = bd / p
+            if cand.exists():
+                return str(cand)
+        except Exception:
+            continue
+
+    return None
+
 def _normalize_bbox_xyxy(bbox: Any) -> Optional[List[float]]:
     try:
         x0, y0, x1, y1 = [float(v) for v in bbox]
@@ -1651,24 +1720,38 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     max_doors = int(out_conf.get("max_doors", 500) or 500)
 
     # Per-type reweighters (preferred) + backward compatibility with single `reweighter_path`.
+    base_dirs = _door_detector_base_dirs_from_config(config)
+
     model_paths_by_type: Dict[str, str] = {}
     cfg_reweighters = config.get("reweighters")
     if isinstance(cfg_reweighters, dict):
         for k, v in cfg_reweighters.items():
-            if isinstance(v, str) and v.strip():
-                model_paths_by_type[str(k).strip().lower()] = v.strip()
+            if not (isinstance(v, str) and v.strip()):
+                continue
+            t = str(k).strip().lower()
+            resolved = _resolve_existing_path(v, base_dirs=base_dirs)
+            if resolved:
+                model_paths_by_type[t] = resolved
+
+    # Backward compatibility: single model path is treated as swing reweighter.
     legacy_model_path = config.get("reweighter_path")
     if isinstance(legacy_model_path, str) and legacy_model_path.strip():
-        model_paths_by_type.setdefault("swing", legacy_model_path.strip())
+        resolved = _resolve_existing_path(legacy_model_path, base_dirs=base_dirs)
+        if resolved:
+            model_paths_by_type.setdefault("swing", resolved)
 
-    has_any_model = False
-    for p in list(model_paths_by_type.values()):
-        try:
-            if p and Path(p).exists():
-                has_any_model = True
-                break
-        except Exception:
-            continue
+    # If config didn't specify any usable models, auto-discover default per-type files.
+    if not model_paths_by_type:
+        for t in ("swing", "double", "pocket", "bifold"):
+            resolved = _resolve_existing_path(f"models/reweighter_{t}_v1.json", base_dirs=base_dirs)
+            if resolved:
+                model_paths_by_type[t] = resolved
+        # Legacy single-file convention.
+        legacy = _resolve_existing_path("models/reweighter_v1.json", base_dirs=base_dirs)
+        if legacy:
+            model_paths_by_type.setdefault("swing", legacy)
+
+    has_any_model = bool(model_paths_by_type)
 
     if has_any_model:
         strict_candidates_all = apply_reweighters_by_type(strict_candidates_all, model_paths_by_type=model_paths_by_type)

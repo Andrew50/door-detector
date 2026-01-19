@@ -43,6 +43,19 @@ from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_on
 logger = logging.getLogger("door_detector.review_app")
 
 
+def _default_config_path_str() -> str:
+    """Best-effort default config path that works when launched outside repo root."""
+    p = Path("configs/door_rules.json")
+    if p.exists():
+        return str(p)
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        p2 = repo_root / "configs" / "door_rules.json"
+        return str(p2)
+    except Exception:
+        return str(p)
+
+
 def _debug_log(msg: str, *args: Any) -> None:
     """Optional debug logging to the server console (disabled in the UI)."""
     try:
@@ -237,7 +250,13 @@ def _snap_to_candidate(
     return None, 0.0
 
 
-def _debug_unmatched_region(*, file_dir: Path, drawn_bbox_full_xyxy: List[float], config_path: str) -> Optional[str]:
+def _debug_unmatched_region(
+    *,
+    file_dir: Path,
+    drawn_bbox_full_xyxy: List[float],
+    config_path: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Debug aid for unmatched Shift+drag boxes.
 
     Returns a JSON string; the viewer prints it to the browser console.
@@ -276,6 +295,8 @@ def _debug_unmatched_region(*, file_dir: Path, drawn_bbox_full_xyxy: List[float]
         rep = debug_explain_unmatched_box(primitives=primitives, bbox_full_xyxy=drawn_bbox_full_xyxy, config=cfg)
         rep["file_dir"] = str(file_dir)
         rep["config_path"] = str(config_path)
+        if isinstance(extra, dict) and extra:
+            rep["extra"] = extra
         return json.dumps(rep, separators=(",", ":"))
     except Exception as e:
         return json.dumps(
@@ -521,23 +542,48 @@ def _process_draw_event_if_any(
             best = best_client
             iou = float(iou_client)
 
-    # Emit a lightweight debug message to the browser console when the client and
-    # server disagree (useful while debugging snap behavior).
+    # Diagnostics: mismatch + "weak snap" debugging.
+    #
+    # The core issue in many Edit Doors failures is *candidate existence*, not snap logic:
+    # the user draws around a door symbol that never became a candidate, so the snap
+    # falls back to some other nearby overlapping symbol (often with very low IoU).
+    #
+    # Historically we only emitted `unmatched_debug_report` when *no* candidate overlapped.
+    # That misses the important case "overlapCandidates > 0 but the intended door is absent".
+    #
+    # So we also emit a bounded ROI explanation when the chosen snap is suspiciously weak.
     try:
         sid = str(snapped_candidate_id) if snapped_candidate_id not in (None, "") else ""
         server_id = str(best_server.get("id")) if isinstance(best_server, dict) and best_server.get("id") is not None else ""
         client_id = str(best_client.get("id")) if isinstance(best_client, dict) and best_client.get("id") is not None else ""
+
+        debug_reason = ""
         if sid and server_id and client_id and server_id != client_id:
-            fstate["_last_unmatched_debug"] = json.dumps(
-                {
-                    "kind": "snap_mismatch_debug_v1",
+            debug_reason = "snap_mismatch"
+
+        # "Weak snap" heuristic: if the best match barely overlaps the drawn region,
+        # it is often not the user's intended door. Emit a detailed ROI report so we can
+        # see whether the intended door's primitives fail arc/leaf criteria.
+        WEAK_SNAP_IOU = 0.12
+        if not debug_reason and best is not None and float(iou or 0.0) < WEAK_SNAP_IOU:
+            debug_reason = "weak_snap_low_iou"
+
+        if debug_reason:
+            fstate["_last_unmatched_debug"] = _debug_unmatched_region(
+                file_dir=file_dir,
+                drawn_bbox_full_xyxy=drawn_full,
+                config_path=str(config_path),
+                extra={
+                    "debug_reason": str(debug_reason),
                     "event_id": str(event_id),
                     "client_snapped_candidate_id": client_id,
                     "client_iou": float(iou_client),
                     "server_snapped_candidate_id": server_id,
                     "server_iou": float(iou_server),
+                    "chosen_candidate_id": str(best.get("id") or "") if isinstance(best, dict) else "",
+                    "chosen_iou": float(iou or 0.0),
+                    "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf] if isinstance(bbox_pdf, list) and len(bbox_pdf) == 4 else [],
                 },
-                separators=(",", ":"),
             )
         else:
             # Clear any prior mismatch/unmatched debug so future changes re-trigger logs.
@@ -677,6 +723,11 @@ def _process_draw_event_if_any(
             file_dir=file_dir,
             drawn_bbox_full_xyxy=drawn_full,
             config_path=str(config_path),
+            extra={
+                "debug_reason": "no_match_after_manual_candidate_fallback_failed",
+                "event_id": str(event_id),
+                "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf] if isinstance(bbox_pdf, list) and len(bbox_pdf) == 4 else [],
+            },
         )
         push_breadcrumb(
             fstate,
@@ -921,7 +972,7 @@ def main() -> None:
                     fstate=fstate,
                     doors_data=doors_data,
                     full_dims=full_dims,
-                    config_path=str(doors_data.get("config_path") or "configs/door_rules.json"),
+                    config_path=str(doors_data.get("config_path") or _default_config_path_str()),
                 )
 
                 # Compute active doors once so the main viewer + right panel stay in perfect sync.
@@ -1188,7 +1239,7 @@ def main() -> None:
                         run_pipeline(
                             str(file_id),
                             Path(str(task.get("file_dir") or str(file_dir))),
-                            str(task.get("config_path") or "configs/door_rules.json"),
+                            str(task.get("config_path") or _default_config_path_str()),
                         )
                     finally:
                         st.session_state.door_detector_pipeline_task = None
