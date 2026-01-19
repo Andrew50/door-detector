@@ -176,18 +176,27 @@ def sidebar_library(lib: Library) -> None:
         if not items:
             st.info("No files in library.")
         else:
+            def _select_file(file_id: str) -> None:
+                # IMPORTANT: Use an on_click callback so selection updates *before*
+                # this script renders widgets on the click-triggered rerun. If we
+                # instead mutate session_state inside `if st.button(...):`, the
+                # sidebar list will render using the *previous* selection and only
+                # show the "selected" styling after a second click.
+                st.session_state.selected_file_id = str(file_id)
+
             for item in items:
                 is_selected = st.session_state.get("selected_file_id") == item["id"]
                 label = item["original_name"]
 
-                if st.button(
+                st.button(
                     label,
                     key=f"sel_{item['id']}",
                     help=item["original_name"],
                     type="primary" if is_selected else "secondary",
                     use_container_width=True,
-                ):
-                    st.session_state.selected_file_id = item["id"]
+                    on_click=_select_file,
+                    args=(str(item["id"]),),
+                )
 
     # --- Training section (global across the whole library) ---
     st.sidebar.divider()

@@ -20,6 +20,7 @@ from door_detector.ui.assets import sidebar_autopen_component_html
 from door_detector.ui.labels import flatten_confirmed_ids, flatten_rejected_ids, get_working_label_state as _get_working_label_state
 from door_detector.ui.pdfjs_component import pdfjs_viewer
 from door_detector.pdf.affine import apply_affine_bbox_xyxy, fitz_bbox_to_pdfjs_bbox_xyxy, normalize_bbox_xyxy
+from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -2085,6 +2086,70 @@ def main_viewer_canvas(
             continue
         overlay_doors_pdf.append({"id": str(did), "bbox_pdf_xyxy": bb_pdf})
 
+    # --- Desync diagnostics: selected door missing from rendered overlays ---
+    try:
+        selected_id = str(fstate.get("selected_door_id") or "")
+    except Exception:
+        selected_id = ""
+    try:
+        active_ids = [str(d.get("id")) for d in (active_doors or []) if isinstance(d, dict) and d.get("id") is not None]
+    except Exception:
+        active_ids = []
+    try:
+        overlay_ids = [str(d.get("id")) for d in overlay_doors_pdf if isinstance(d, dict) and d.get("id") is not None]
+    except Exception:
+        overlay_ids = []
+
+    # If the right panel is selecting an id that the viewer can't draw, users will perceive
+    # a sidebar/highlight mismatch. Most often this happens when bbox conversion fails.
+    if selected_id and selected_id in set(active_ids) and selected_id not in set(overlay_ids):
+        viewer_display_tmp = _viewer_display_mode_to_sink_value(str(fstate.get("viewer_display_mode") or "Highlight All"))
+        if str(viewer_display_tmp) != "off":
+            warn_key = f"selected_missing_from_overlay_pdf::{file_id}::{selected_id}::{doors_schema_version}"
+            if warn_once(fstate, warn_key):
+                try:
+                    selected_obj = next(
+                        (d for d in (active_doors or []) if isinstance(d, dict) and str(d.get("id") or "") == selected_id),
+                        None,
+                    )
+                except Exception:
+                    selected_obj = None
+                missing = sorted(list(set(active_ids) - set(overlay_ids)))
+                logger.warning(
+                    "[door_detector] possible viewer/sidebar desync: selected door not present in PDF overlay list (cannot highlight)",
+                    extra={
+                        "file_id": str(file_id),
+                        "selected_door_id": selected_id,
+                        "viewer_display_mode": str(viewer_display_tmp),
+                        "active_doors_len": int(len(active_ids)),
+                        "overlay_doors_pdf_len": int(len(overlay_ids)),
+                        "missing_overlay_ids_sample": sample_ids(missing, limit=16),
+                        "selected_obj": (
+                            {
+                                "id": str(selected_obj.get("id") or ""),
+                                "type": str(selected_obj.get("type") or ""),
+                                "bbox_xyxy": selected_obj.get("bbox_xyxy"),
+                                "bbox_pdf_xyxy": selected_obj.get("bbox_pdf_xyxy"),
+                            }
+                            if isinstance(selected_obj, dict)
+                            else None
+                        ),
+                        "overlay_debug_meta": overlay_debug_meta,
+                        "breadcrumbs_tail": tail_breadcrumbs(fstate, n=12),
+                        "hint": "If selected id is in the right panel but not drawn, suspect bbox_pdf conversion (schema_version/transform/cropbox/rotation) or missing bbox data for that candidate.",
+                    },
+                )
+                push_breadcrumb(
+                    fstate,
+                    {
+                        "kind": "warn_selected_missing_overlay_pdf",
+                        "file_id": str(file_id),
+                        "selected_door_id": selected_id,
+                        "active_doors_len": int(len(active_ids)),
+                        "overlay_doors_pdf_len": int(len(overlay_ids)),
+                    },
+                )
+
     # --- Diagnostics: are overlays landing off-page? ---
     try:
         # Prefer full_dims (actual page.png size). Fall back to transform.json.
@@ -2335,6 +2400,19 @@ def main_viewer_canvas(
     viewer_key = f"pdfjs_viewer_{file_id}"
     last_ack = str(fstate.get("_last_viewer_event_id") or "")
 
+    push_breadcrumb(
+        fstate,
+        {
+            "kind": "render_viewer_props",
+            "file_id": str(file_id),
+            "selected_door_id": str(fstate.get("selected_door_id") or ""),
+            "viewer_display": str(viewer_display),
+            "overlay_doors_pdf_len": int(len(overlay_doors_pdf)),
+            "candidate_pool_len": int(len(out_pool)),
+            "edit_mode": bool(fstate.get("edit_mode")),
+        },
+    )
+
     # NOTE: component value is stored in session_state under this key.
     pdfjs_viewer(
         file_id=str(file_id),
@@ -2347,6 +2425,7 @@ def main_viewer_canvas(
         selected_door_id=str(fstate.get("selected_door_id") or ""),
         focus_seq=int(fstate.get("_focus_seq") or 0),
         focus_request_seq=int(fstate.get("_focus_request_seq") or 0),
+        proposal_focus_seq=int(fstate.get("_proposal_focus_seq") or 0),
         auto_focus=bool(fstate.get("auto_focus", True)),
         cycle_candidate_id=str(fstate.get("_cycle_candidate_id") or ""),
         edit_mode=bool(fstate.get("edit_mode")),

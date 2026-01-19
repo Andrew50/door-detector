@@ -517,6 +517,45 @@ GLOBAL_STYLE_HTML = r"""
         height: 38px !important;
         padding: 0px 10px !important;
     }
+    /* Hide the built-in +/- steppers for this number input so only our explicit
+       navigation buttons (- / +) are shown. */
+    div[data-testid="stNumberInput"]:has(input[aria-label^="door_jump_idx_"]) button {
+        display: none !important;
+    }
+
+    /* Door navigation header (Prev | Door X/Y | Next) */
+    .door_detector-door-nav-center {
+        text-align: center;
+        font-size: 20px;
+        font-weight: 850;
+        letter-spacing: 0.2px;
+        line-height: 38px;
+        opacity: 0.92;
+    }
+    /* Make the Door X/Y center "button" look like text (but clickable). */
+    button[id^="door_focus_btn_"] {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        height: 38px !important;
+    }
+    button[id^="door_focus_btn_"]:hover {
+        background: rgba(255, 255, 255, 0.06) !important;
+        border-radius: 10px !important;
+    }
+    button[id^="door_focus_btn_"] div[data-testid="stMarkdownContainer"] p {
+        margin: 0 !important;
+        padding: 0 !important;
+        text-align: center !important;
+        font-size: 20px !important;
+        font-weight: 850 !important;
+        letter-spacing: 0.2px !important;
+        line-height: 38px !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+    }
 
     /* Prevent Delete/Confirm/Cancel labels from wrapping (even in narrow columns)
        NOTE: keys must be valid HTML ids; we generate safe hashed keys. */
@@ -528,15 +567,24 @@ GLOBAL_STYLE_HTML = r"""
         text-overflow: ellipsis !important;
     }
 
-    /* Review panel action buttons (typed confirm/reject) */
-    button[id^="confirm_btn_"] {
-        background: rgba(0, 200, 83, 0.14) !important;
-        border: 1px solid rgba(0, 200, 83, 0.30) !important;
+    /* Make the per-file Delete action visually "danger" (red). */
+    button[id^="delete_btn_"],
+    button[id^="delete_confirm_btn_"] {
+        background: rgba(255, 75, 75, 0.18) !important;
+        border: 1px solid rgba(255, 75, 75, 0.45) !important;
     }
-    button[id^="confirm_btn_"]:hover {
-        background: rgba(0, 200, 83, 0.20) !important;
-        border-color: rgba(0, 200, 83, 0.45) !important;
+    button[id^="delete_btn_"]:hover,
+    button[id^="delete_confirm_btn_"]:hover {
+        background: rgba(255, 75, 75, 0.26) !important;
+        border-color: rgba(255, 75, 75, 0.62) !important;
     }
+
+    /* Small spacer above the right panel controls. */
+    .door_detector-review-panel-top-pad {
+        height: 14px;
+    }
+
+    /* Review panel action buttons (typed reject) */
     button[id^="reject_btn_"] {
         background: rgba(255, 75, 75, 0.12) !important;
         border: 1px solid rgba(255, 75, 75, 0.28) !important;
@@ -552,6 +600,25 @@ GLOBAL_STYLE_HTML = r"""
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
+    }
+
+    /* Filter type "bubble" pills (radio buttons). */
+    div[data-testid="stRadio"] div[role="radiogroup"] {
+        gap: 0.4rem !important;
+    }
+    div[data-testid="stRadio"] label {
+        border: 1px solid rgba(255, 255, 255, 0.18) !important;
+        border-radius: 999px !important;
+        padding: 6px 10px !important;
+        background: rgba(17, 25, 40, 0.35) !important;
+    }
+    div[data-testid="stRadio"] label:hover {
+        border-color: rgba(255, 255, 255, 0.30) !important;
+        background: rgba(17, 25, 40, 0.55) !important;
+    }
+    div[data-testid="stRadio"] label:has(input:checked) {
+        border-color: rgba(255, 75, 75, 0.55) !important;
+        background: rgba(255, 75, 75, 0.14) !important;
     }
 
     /* Selected door details */

@@ -193,6 +193,7 @@ export function PdfJsViewer(props: ComponentProps) {
   const selectedDoorId = String(args.selectedDoorId ?? "");
   const focusSeq = Number(args.focusSeq ?? 0);
   const focusRequestSeq = Number(args.focusRequestSeq ?? 0);
+  const proposalFocusSeq = Number(args.proposalFocusSeq ?? 0);
   const autoFocus = Boolean(args.autoFocus ?? true);
   const cycleCandidateId = String(args.cycleCandidateId ?? "");
   const editMode = Boolean(args.editMode ?? false);
@@ -242,6 +243,7 @@ export function PdfJsViewer(props: ComponentProps) {
   const baseTyRef = useRef(0);
   const focusSeqRef = useRef(0);
   const focusRequestSeqRef = useRef(0);
+  const proposalFocusSeqRef = useRef(0);
   const resetBtnRef = useRef<HTMLButtonElement | null>(null);
   const [resetVisible, setResetVisible] = useState(false);
   const resetVisibleRef = useRef(false);
@@ -277,6 +279,7 @@ export function PdfJsViewer(props: ComponentProps) {
   const pendingEventRef = useRef<ViewerEvent | null>(null);
   const resendTimerRef = useRef<number | null>(null);
   const resendAttemptsRef = useRef<number>(0);
+  const recentEmittedEventsRef = useRef<ViewerEvent[]>([]);
 
   const pendingKey = useMemo(() => `door_detector_pdfjs_pending_evt_${fileId || "unknown"}`, [fileId]);
 
@@ -363,6 +366,13 @@ export function PdfJsViewer(props: ComponentProps) {
     (evt: ViewerEvent) => {
       // Persist before sending so we can recover from an iframe swap.
       persistPendingEvent(evt);
+      try {
+        const arr = recentEmittedEventsRef.current;
+        arr.push(evt);
+        if (arr.length > 25) arr.splice(0, arr.length - 25);
+      } catch {
+        // ignore
+      }
       sendEventOnce(evt);
       scheduleResendLoop(evt);
     },
@@ -946,8 +956,13 @@ export function PdfJsViewer(props: ComponentProps) {
       if (isSelected) {
         r.setAttribute("stroke", "#ff4b4b");
         r.setAttribute("stroke-width", "3");
+        // Keep the selected door above other doors WITHOUT moving it out of `#pz_doors`.
+        // (If we append to the SVG root, it won't be cleared when overlays rerender,
+        // which can leave "ghost" boxes after filtering changes.)
         try {
-          svg.appendChild(r);
+          const doorsLayer = svg.querySelector<SVGGElement>("#pz_doors");
+          if (doorsLayer && r.parentNode !== doorsLayer) doorsLayer.appendChild(r);
+          else r.parentNode?.appendChild(r);
         } catch {
           // ignore
         }
@@ -972,6 +987,15 @@ export function PdfJsViewer(props: ComponentProps) {
     // If this becomes hot, we can diff by id.
     // Keep them in their own group so edit overlays can layer above.
     const doorsLayer = ensureLayer("pz_doors");
+    // Important: the selected door used to be temporarily moved out of `#pz_doors`
+    // for z-ordering. Ensure we never leave stale `rect[data-door-id]` nodes
+    // attached elsewhere in the SVG, or they will persist across filter changes.
+    try {
+      const stale = svg.querySelectorAll<SVGRectElement>("rect[data-door-id]");
+      for (const r of stale) r.remove();
+    } catch {
+      // ignore
+    }
     clearSvgLayer(doorsLayer);
 
     // Diagnostics: detect the "everything is off page" failure mode.
@@ -990,7 +1014,11 @@ export function PdfJsViewer(props: ComponentProps) {
         : null;
     const viewportBounds: BBox = [0, 0, Number(pageSize.w), Number(pageSize.h)];
 
+    const overlayIdsAll = new Set<string>();
+    const renderedIds = new Set<string>();
     for (const d of overlayDoors) {
+      const didStr = d && (d as any)?.id != null ? String((d as any).id) : "";
+      if (didStr) overlayIdsAll.add(didStr);
       if (!d || !d.id || !d.bbox_pdf_xyxy) continue;
       const bbPdf = normalizeBBox(d.bbox_pdf_xyxy);
       const [x0, y0, x1, y1] = pdfBBoxToViewportBBox(vp, bbPdf);
@@ -1030,6 +1058,46 @@ export function PdfJsViewer(props: ComponentProps) {
       r.setAttribute("data-h", h.toFixed(2));
       r.setAttribute("style", "pointer-events: all; cursor: pointer;");
       doorsLayer?.appendChild(r);
+      renderedIds.add(String(d.id));
+    }
+
+    // Desync diagnostics: if the server says a door is selected but we can't render its bbox,
+    // the right panel will refer to an id that is not highlighted in the viewer.
+    try {
+      const sid = selectedDoorId ? String(selectedDoorId) : "";
+      if (sid && viewerDisplayMode !== "off") {
+        const missingFromOverlay = !overlayIdsAll.has(sid);
+        const missingFromRendered = overlayIdsAll.has(sid) && !renderedIds.has(sid);
+        if (missingFromOverlay || missingFromRendered) {
+          const k = `__door_detectorSelectedOverlayMissing_${fileId}_${pdfHash}_${sid}_${viewerDisplayMode}_${missingFromOverlay ? "no_overlay" : "not_rendered"}`;
+          const already = (window as any)[k] === true;
+          if (!already) {
+            (window as any)[k] = true;
+            // eslint-disable-next-line no-console
+            console.warn("[door_detector] possible viewer/right-panel desync: selected door cannot be highlighted", {
+              fileId,
+              pdfHash,
+              pageNumber,
+              selectedDoorId: sid,
+              viewerDisplayMode,
+              overlayDoorsLen: overlayDoors.length,
+              overlayContainsSelected: overlayIdsAll.has(sid),
+              renderedContainsSelected: renderedIds.has(sid),
+              editMode,
+              confirmedLen: confirmedSet.size,
+              deletedLen: deletedSet.size,
+              lastAckEventId,
+              recentEmittedEvents: recentEmittedEventsRef.current.slice(-10),
+              hint: missingFromOverlay
+                ? "Python did not include the selected id in overlayDoors (likely bbox conversion/transform issue or filtering mismatch)."
+                : "Selected id was in overlayDoors but was not rendered (invalid/degenerate bbox after conversion).",
+              ts: Date.now(),
+            });
+          }
+        }
+      }
+    } catch {
+      // ignore
     }
 
     if (oobCount > 0) {
@@ -1407,6 +1475,28 @@ export function PdfJsViewer(props: ComponentProps) {
     pendingFocusDoorIdRef.current = selectedDoorId;
     focusToDoorId(selectedDoorId);
   }, [focusRequestSeq, focusToDoorId, loadState, selectedDoorId]);
+
+  // Proposal focus requests: focus to the proposal snapped/drawn bbox even when
+  // door overlays are filtered/hidden.
+  useEffect(() => {
+    proposalFocusSeqRef.current = proposalFocusSeq;
+    if (!(proposalFocusSeq > 0)) return;
+    const lastApplied = (proposalFocusSeqRef as any)._lastApplied ?? 0;
+    if (lastApplied === proposalFocusSeq) return;
+    (proposalFocusSeqRef as any)._lastApplied = proposalFocusSeq;
+
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const snapped = (proposalOverlays as any)?.snapped_bbox_pdf_xyxy;
+    const drawn = (proposalOverlays as any)?.drawn_bbox_pdf_xyxy;
+    const bb = snapped && Array.isArray(snapped) && snapped.length === 4 ? (snapped as BBox) : drawn && Array.isArray(drawn) && drawn.length === 4 ? (drawn as BBox) : null;
+    if (!bb) return;
+    try {
+      focusToBBox(pdfBBoxToViewportBBox(vp, bb));
+    } catch {
+      // ignore
+    }
+  }, [focusToBBox, proposalFocusSeq, proposalOverlays]);
 
   // Wheel zoom + drag pan + shift+drag drawing.
   useEffect(() => {

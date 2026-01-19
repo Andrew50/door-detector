@@ -22,6 +22,7 @@ from door_detector.ui.labels import (
     save_labels,
 )
 from door_detector.doors.types import DOOR_TYPES, normalize_door_type
+from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -138,9 +139,12 @@ def main_viewer_controls(
     if is_running_for_file:
         st.info(f"{analysis_label} (running)")
 
-    # Grid for main controls
-    c1, c2, c_del = st.columns([2, 2, 1])
-    with c1:
+    # Small top pad so the right panel aligns with the viewer window.
+    st.markdown('<div class="door_detector-review-panel-top-pad"></div>', unsafe_allow_html=True)
+
+    # Row 1: Analyze + Delete
+    c_an, c_del = st.columns([4, 1])
+    with c_an:
         status = item.get("status", "not_processed")
         if status == "processing":
             # Streamlit runs the pipeline synchronously; the UI won't render mid-run.
@@ -171,20 +175,6 @@ def main_viewer_controls(
             disabled=is_running_for_file,
             on_click=_queue_pipeline_run,
             args=(str(file_id), str(file_dir), str(config_path), analysis_label),
-        )
-    with c2:
-        modes = ["Highlight All", "Highlight Selected", "Off"]
-        viewer_display_key = f"viewer_display_mode_{file_id}"
-        if viewer_display_key not in st.session_state:
-            st.session_state[viewer_display_key] = str(fstate.get("viewer_display_mode") or "Highlight All")
-        fstate["viewer_display_mode"] = st.selectbox(
-            "Mode",
-            modes,
-            index=modes.index(fstate.get("viewer_display_mode"))
-            if fstate.get("viewer_display_mode") in modes
-            else 0,
-            label_visibility="collapsed",
-            key=viewer_display_key,
         )
     with c_del:
         confirm_key = f"confirm_delete_{file_id}"
@@ -220,148 +210,119 @@ def main_viewer_controls(
                 st.session_state[confirm_key] = False
                 st.rerun()
 
-    c3, c4 = st.columns(2)
-    with c3:
-        st.caption("Shift+drag to propose a selection (snap-to-candidate).")
-    with c4:
+    # Row 2: Highlight doors toggle + Auto-focus (left-justified, side-by-side)
+    c_hl, c_auto, _spacer = st.columns([1, 1, 3])
+    with c_hl:
+        highlight_key = f"highlight_doors_{file_id}"
+        if highlight_key not in st.session_state:
+            st.session_state[highlight_key] = True
+        fstate["highlight_doors"] = st.checkbox("Highlight doors", key=highlight_key)
+    with c_auto:
         auto_focus_key = f"auto_focus_{file_id}"
         # Keep widget state and per-file fstate in sync.
         if auto_focus_key not in st.session_state:
             st.session_state[auto_focus_key] = bool(fstate.get("auto_focus", True))
         fstate["auto_focus"] = st.checkbox("Auto-focus", key=auto_focus_key)
 
-    # After a Shift+drag, allow cycling through candidate matches under that selection.
-    # This addresses the core UX issue: snapping can only pick *one* candidate, but the
-    # correct label may be a different overlapping candidate (or a component of a double).
+    # Type filter bubbles live with the top controls.
+    # Compute counts based on the visible candidate set (excluding deleted/rejected),
+    # and include any manual candidates / confirmed extras so "All (N)" matches the UI list.
+    working = _get_working_label_state(fstate)
     try:
-        srec = fstate.get("_last_draw_suggestions") or {}
-        suggestions = list(srec.get("suggestions") or [])
+        hidden_ids = set(working.get("deleted_ids", set())) | set(flatten_rejected_ids(working.get("rejected_by_type", {})))
     except Exception:
-        suggestions = []
-    if suggestions:
-        st.divider()
-        st.subheader("Proposal / Matches")
+        hidden_ids = set()
 
-        idx_key = f"_draw_suggest_idx_{file_id}"
-        # Type filter dropdown (starts as "All types"; filtering only activates after user changes it).
-        type_key = f"_draw_suggest_type_{file_id}"
-        type_prev_key = f"_draw_suggest_type_prev_{file_id}"
-        type_touched_key = f"_draw_suggest_type_touched_{file_id}"
+    doors = list(doors_data.get("doors", []) or [])
+    candidates = list(doors_data.get("candidates", []) or [])
+    try:
+        candidates.extend(list(working.get("manual_candidates", []) or []))
+    except Exception:
+        pass
 
-        types = sorted({str(s.get("type") or "").strip() for s in suggestions if str(s.get("type") or "").strip()})
-        type_options = ["All types"] + types
-        if type_key not in st.session_state:
-            st.session_state[type_key] = "All types"
-        if str(st.session_state.get(type_key) or "All types") not in type_options:
-            st.session_state[type_key] = "All types"
+    by_id = {str(c.get("id")): c for c in candidates if isinstance(c, dict) and c.get("id") is not None}
+    door_ids = {str(d.get("id")) for d in doors if isinstance(d, dict) and d.get("id") is not None}
 
-        chosen_type = st.selectbox("Type filter", type_options, key=type_key, label_visibility="collapsed")
-        prev_type = st.session_state.get(type_prev_key)
-        if prev_type is None:
-            st.session_state[type_prev_key] = chosen_type
-        elif chosen_type != prev_type:
-            st.session_state[type_prev_key] = chosen_type
-            st.session_state[type_touched_key] = True
+    try:
+        extra_ids = set(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
+    except Exception:
+        extra_ids = set()
+    try:
+        for mc in list(working.get("manual_candidates", []) or []):
+            if isinstance(mc, dict) and mc.get("id") not in (None, ""):
+                extra_ids.add(str(mc.get("id")))
+    except Exception:
+        pass
+    try:
+        prop = fstate.get("_proposal") or {}
+        if isinstance(prop, dict) and prop.get("snapped_candidate_id") not in (None, ""):
+            extra_ids.add(str(prop.get("snapped_candidate_id")))
+    except Exception:
+        pass
 
-        # Apply filter only after user has touched the dropdown.
-        use_filter = bool(st.session_state.get(type_touched_key, False)) and (chosen_type != "All types")
-        filtered = [s for s in suggestions if (not use_filter) or (str(s.get("type") or "") == chosen_type)]
-        if not filtered:
-            filtered = suggestions
-            use_filter = False
+    visible_items: list[dict[str, Any]] = []
+    for d in doors:
+        if not isinstance(d, dict) or d.get("id") is None:
+            continue
+        sid = str(d.get("id"))
+        if sid in hidden_ids:
+            continue
+        visible_items.append(d)
+    for sid in sorted(extra_ids - door_ids):
+        if not sid or sid in hidden_ids:
+            continue
+        c = by_id.get(str(sid))
+        if isinstance(c, dict):
+            visible_items.append(c)
 
-        if idx_key not in st.session_state:
-            st.session_state[idx_key] = 0
-        try:
-            idx = int(st.session_state.get(idx_key) or 0)
-        except Exception:
-            idx = 0
-        if idx < 0:
-            idx = 0
-        if filtered and idx >= len(filtered):
-            idx = 0
-        st.session_state[idx_key] = idx
+    # Unified single-stage filter pills:
+    # - One "All" option only
+    # - Other options are either {Confirmed, Unconfirmed} OR a door type
+    # - User chooses exactly one slice (no combining type+confirmed filters)
+    try:
+        confirmed_ids = set(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
+    except Exception:
+        confirmed_ids = set()
 
-        cur = filtered[idx] if filtered else suggestions[0]
-        cur_id = str(cur.get("id") or "")
-        cur_type = str(cur.get("type") or "")
-        cur_src = str(cur.get("source") or "")
-        cur_iou = cur.get("iou")
-        cur_conf = cur.get("confidence")
-        bits = []
-        if cur_id:
-            bits.append(f"id={cur_id}")
-        if cur_type:
-            bits.append(f"type={cur_type}")
-        if isinstance(cur_iou, (int, float)):
-            bits.append(f"iou={float(cur_iou):.3f}")
-        if isinstance(cur_conf, (int, float)):
-            bits.append(f"conf={float(cur_conf):.2f}")
-        if cur_src:
-            bits.append(str(cur_src))
-        st.caption(f"Showing **{idx+1} / {len(filtered)}**" + (" (filtered)" if use_filter else ""))
-        st.write(" / ".join(bits) if bits else "Match")
+    base_total = len(visible_items)
+    try:
+        base_confirmed = sum(
+            1 for d in visible_items if isinstance(d, dict) and str(d.get("id") or "") in confirmed_ids
+        )
+    except Exception:
+        base_confirmed = 0
+    base_unconfirmed = max(0, base_total - base_confirmed)
 
-        c_prev, c_next = st.columns(2)
-        if c_prev.button("Prev", use_container_width=True, key=f"prev_draw_suggest_{file_id}"):
-            st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) - 1) % len(filtered)
-            st.rerun()
-        if c_next.button("Next", use_container_width=True, key=f"next_draw_suggest_{file_id}"):
-            st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) + 1) % len(filtered)
-            st.rerun()
+    counts: dict[str, int] = {}
+    for d in visible_items:
+        t = str(d.get("type") or "").strip()
+        if not t:
+            continue
+        counts[t] = counts.get(t, 0) + 1
+    type_values = sorted(counts.keys())
+    door_filter_key = f"door_filter_{file_id}"
+    filter_options = ["All", "Confirmed", "Unconfirmed"] + type_values
+    if door_filter_key not in st.session_state:
+        st.session_state[door_filter_key] = "All"
+    if str(st.session_state.get(door_filter_key) or "All") not in filter_options:
+        st.session_state[door_filter_key] = "All"
 
-        c_use, c_discard = st.columns(2)
-        if c_use.button(
-            "Use highlighted match",
-            use_container_width=True,
-            type="primary",
-            key=f"use_draw_suggest_{file_id}",
-            disabled=not bool(cur_id),
-        ):
-            try:
-                st.session_state[f"door_click_sink_{file_id}"] = str(cur_id)
-            except Exception:
-                pass
-            _mark_nav_intent(str(file_id))
-            st.rerun()
-
-        if c_discard.button(
-            "Discard proposal",
-            use_container_width=True,
-            type="secondary",
-            key=f"discard_draw_suggest_{file_id}",
-        ):
-            # Clear proposal state. If the proposal created a manual candidate id, drop it.
-            try:
-                prop = fstate.get("_proposal") or {}
-            except Exception:
-                prop = {}
-            try:
-                created_id = str(prop.get("created_manual_candidate_id") or "")
-            except Exception:
-                created_id = ""
-            if created_id:
-                try:
-                    mc = list(fstate.get("manual_candidates", []) or [])
-                    fstate["manual_candidates"] = [
-                        c for c in mc if not (isinstance(c, dict) and str(c.get("id") or "") == created_id)
-                    ]
-                except Exception:
-                    pass
-            try:
-                fstate["_proposal"] = None
-            except Exception:
-                pass
-            try:
-                fstate["_last_draw_suggestions"] = None
-            except Exception:
-                pass
-            try:
-                st.session_state[idx_key] = 0
-            except Exception:
-                pass
-            st.rerun()
-
+    st.radio(
+        "Filter doors",
+        filter_options,
+        key=door_filter_key,
+        horizontal=True,
+        label_visibility="collapsed",
+        format_func=lambda v: (
+            f"All ({base_total})"
+            if str(v) == "All"
+            else f"Confirmed ({base_confirmed})"
+            if str(v) == "Confirmed"
+            else f"Unconfirmed ({base_unconfirmed})"
+            if str(v) == "Unconfirmed"
+            else f"{str(v).capitalize()} ({int(counts.get(str(v), 0))})"
+        ),
+    )
 
 def _sync_selected_door_for_run(
     *,
@@ -427,11 +388,40 @@ def _sync_selected_door_for_run(
         fstate["_last_clicked_door_id"] = clicked_id
         current_id = clicked_id
         allow_autofocus = True
+        push_breadcrumb(
+            fstate,
+            {
+                "kind": "selection_intent",
+                "source": "viewer_click",
+                "file_id": str(file_id),
+                "clicked_id": str(clicked_id),
+                "visible_count": int(len(door_ids)),
+            },
+        )
         try:
             st.session_state[click_sink_key] = ""
         except Exception:
             pass
     else:
+        # If the viewer emitted an id that isn't in the current visible list, that suggests
+        # stale client state or a filter/overlay mismatch.
+        if clicked_id not in (None, ""):
+            bad = str(clicked_id)
+            k = f"viewer_click_id_not_visible::{file_id}::{bad}"
+            if warn_once(fstate, k):
+                logger.warning(
+                    "[door_detector] possible viewer/sidebar desync: viewer click id not in current visible list",
+                    extra={
+                        "file_id": str(file_id),
+                        "clicked_id": bad,
+                        "visible_count": int(len(door_ids)),
+                        "visible_id_sample": sample_ids(door_ids, limit=16),
+                        "selected_door_id_before": str(fstate.get("selected_door_id") or ""),
+                        "last_clicked_door_id": str(fstate.get("_last_clicked_door_id") or ""),
+                        "breadcrumbs_tail": tail_breadcrumbs(fstate, n=12),
+                    },
+                )
+
         # If the user typed an index, treat it as the requested selection.
         idx_req = _coerce_idx(st.session_state.get(idx_key))
         if isinstance(idx_req, int):
@@ -442,11 +432,30 @@ def _sync_selected_door_for_run(
                 current_id = door_ids[0]
             else:
                 current_id = door_ids[idx_req - 1]
+            push_breadcrumb(
+                fstate,
+                {
+                    "kind": "selection_intent",
+                    "source": "index",
+                    "file_id": str(file_id),
+                    "idx_req": int(idx_req),
+                    "visible_count": int(len(door_ids)),
+                },
+            )
         else:
             jump_raw = st.session_state.get(jump_key)
             jump_id = str(jump_raw) if jump_raw not in (None, "") else None
             if jump_id in door_ids:
                 current_id = jump_id
+                push_breadcrumb(
+                    fstate,
+                    {
+                        "kind": "selection_intent",
+                        "source": "jump",
+                        "file_id": str(file_id),
+                        "jump_id": str(jump_id),
+                    },
+                )
             else:
                 sel_raw = fstate.get("selected_door_id")
                 sel_id = str(sel_raw) if sel_raw not in (None, "") else None
@@ -454,6 +463,21 @@ def _sync_selected_door_for_run(
                     current_id = sel_id
                 else:
                     current_id = door_ids[0]
+                    prev = str(sel_id or "")
+                    k = f"selection_coerced_to_first::{file_id}::{prev}::{str(current_id)}"
+                    if warn_once(fstate, k):
+                        logger.warning(
+                            "[door_detector] selection coerced: previous selected id not in visible list; falling back to first",
+                            extra={
+                                "file_id": str(file_id),
+                                "prev_selected_door_id": prev,
+                                "new_selected_door_id": str(current_id),
+                                "visible_count": int(len(door_ids)),
+                                "visible_id_sample": sample_ids(door_ids, limit=16),
+                                "breadcrumbs_tail": tail_breadcrumbs(fstate, n=12),
+                                "hint": "Common causes: filter changed, door deleted/rejected, confirm-filter changed, or selection pointed at an id not present in overlays.",
+                            },
+                        )
 
     # Make selection canonical for the rest of this run.
     if st.session_state.get(jump_key) != current_id:
@@ -463,6 +487,15 @@ def _sync_selected_door_for_run(
     except Exception:
         st.session_state[idx_key] = 1
     fstate["selected_door_id"] = str(current_id) if current_id not in (None, "") else None
+    push_breadcrumb(
+        fstate,
+        {
+            "kind": "selection_canonicalized",
+            "file_id": str(file_id),
+            "selected_door_id": str(fstate.get("selected_door_id") or ""),
+            "visible_count": int(len(door_ids)),
+        },
+    )
 
     # Bump focus sequence when selection changes (so the viewer auto-focuses only on changes).
     if current_id != fstate.get("_focus_last_id"):
@@ -517,70 +550,225 @@ def right_panel_review(
     all_visible = active_doors.copy()
     all_visible.sort(key=lambda x: x["confidence"], reverse=True)
 
-    total_doors = len(all_active_doors) if isinstance(all_active_doors, list) else len(all_visible)
-    door_type_filter_key = f"door_type_filter_{file_id}"
-    current_filter = str(st.session_state.get(door_type_filter_key) or "All")
-    if current_filter and current_filter != "All":
-        st.subheader(f"Doors ({len(all_visible)} of {total_doors})")
-    else:
-        st.subheader(f"Doors ({len(all_visible)})")
+    door_filter_key = f"door_filter_{file_id}"
+    # Doors header removed (redundant; selection section below is explicit).
 
     if not all_visible:
         return
 
-    # Filter panel (stored in session_state; applied before rendering the viewer).
-    all_for_filter = (all_active_doors if isinstance(all_active_doors, list) else active_doors) or []
-    type_values = sorted(
-        {
-            str(d.get("type")).strip()
-            for d in all_for_filter
-            if d.get("type") is not None and str(d.get("type")).strip()
-        }
-    )
-    type_options = ["All"] + type_values
-    if door_type_filter_key not in st.session_state:
-        st.session_state[door_type_filter_key] = "All"
-    if str(st.session_state.get(door_type_filter_key) or "All") not in type_options:
-        st.session_state[door_type_filter_key] = "All"
+    # If there is an active selection/proposal, show the selection menu *instead of*
+    # the normal "selected door" details. After confirm/deny, the proposal is cleared
+    # and this function will render the selected door details again.
+    try:
+        srec = fstate.get("_last_draw_suggestions") or {}
+        sugg_all = list(srec.get("suggestions") or [])
+    except Exception:
+        sugg_all = []
+    prop = fstate.get("_proposal")
+    if isinstance(prop, dict) and sugg_all:
+        st.divider()
 
-    f_lbl, f_sel = st.columns([1, 3])
-    f_lbl.markdown("<div style='line-height: 38px; opacity: 0.85;'>Type</div>", unsafe_allow_html=True)
-    f_sel.selectbox("Door type", type_options, key=door_type_filter_key, label_visibility="collapsed")
+        # Reuse the same cycling keys so the viewer can highlight `cycle_candidate_id`
+        # during the same rerun (app.py computes it from session_state).
+        idx_key = f"_draw_suggest_idx_{file_id}"
+        type_key = f"_draw_suggest_type_{file_id}"
+        type_touched_key = f"_draw_suggest_type_touched_{file_id}"
 
-    # Door navigation (index input + Prev/Next).
+        # Reset per-selection UI state when the selection event changes.
+        try:
+            ev_id = str(srec.get("event_id") or "")
+        except Exception:
+            ev_id = ""
+        ev_key = f"_draw_suggest_event_id_{file_id}"
+        if st.session_state.get(ev_key) != ev_id:
+            st.session_state[ev_key] = ev_id
+            st.session_state[type_touched_key] = False
+            st.session_state[idx_key] = 0
+
+        # Type dropdown behavior:
+        # - Never show "All types"
+        # - If the user has never interacted with it, DO NOT filter cycling; instead,
+        #   auto-set the dropdown value to match the currently highlighted suggestion's type.
+        # - Once the user selects a type, filter cycling to that type only.
+        types = sorted({str(s.get("type") or "").strip() for s in sugg_all if str(s.get("type") or "").strip()})
+        if not types:
+            types = ["swing"]
+
+        def _mark_type_touched() -> None:
+            try:
+                st.session_state[type_touched_key] = True
+            except Exception:
+                return
+
+        touched = bool(st.session_state.get(type_touched_key, False))
+
+        if idx_key not in st.session_state:
+            st.session_state[idx_key] = 0
+        try:
+            idx = int(st.session_state.get(idx_key) or 0)
+        except Exception:
+            idx = 0
+        if idx < 0:
+            idx = 0
+        if idx >= len(sugg_all):
+            idx = 0
+        st.session_state[idx_key] = idx
+
+        if not touched:
+            cur_unfiltered = sugg_all[idx] if sugg_all else {}
+            cur_unfiltered_type = str(cur_unfiltered.get("type") or "").strip()
+            if cur_unfiltered_type in types:
+                st.session_state[type_key] = cur_unfiltered_type
+            elif str(st.session_state.get(type_key) or "") not in types:
+                st.session_state[type_key] = types[0]
+        else:
+            if str(st.session_state.get(type_key) or "") not in types:
+                st.session_state[type_key] = types[0]
+
+        chosen_type = str(st.session_state.get(type_key) or types[0])
+
+        use_filter = bool(st.session_state.get(type_touched_key, False))
+        if use_filter:
+            filtered = [s for s in sugg_all if str(s.get("type") or "").strip() == str(chosen_type)]
+        else:
+            filtered = sugg_all
+        if not filtered:
+            filtered = sugg_all
+            use_filter = False
+
+        if idx_key not in st.session_state:
+            st.session_state[idx_key] = 0
+        try:
+            idx = int(st.session_state.get(idx_key) or 0)
+        except Exception:
+            idx = 0
+        if idx < 0:
+            idx = 0
+        if filtered and idx >= len(filtered):
+            idx = 0
+        st.session_state[idx_key] = idx
+
+        # Header row aligned with non-proposal mode: Prev | Selection | Next
+        c_prev, c_mid, c_next = st.columns([1, 2, 1])
+        if c_prev.button("Prev", use_container_width=True, key=f"prev_draw_suggest_{file_id}"):
+            st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) - 1) % max(1, len(filtered))
+            st.rerun()
+        if c_mid.button(
+            f"Selection Snap {idx+1} / {len(filtered)}",
+            use_container_width=True,
+            type="secondary",
+            key=f"door_focus_btn_{key_suffix}",
+        ):
+            try:
+                fstate["_proposal_focus_seq"] = int(fstate.get("_proposal_focus_seq") or 0) + 1
+            except Exception:
+                fstate["_proposal_focus_seq"] = 1
+            st.rerun()
+        if c_next.button("Next", use_container_width=True, key=f"next_draw_suggest_{file_id}"):
+            st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) + 1) % max(1, len(filtered))
+            st.rerun()
+
+        # Single type dropdown (controls filtering AND confirm type).
+        chosen_type = st.selectbox(
+            "Type",
+            types,
+            key=type_key,
+            format_func=lambda t: str(t).capitalize(),
+            label_visibility="collapsed",
+            on_change=_mark_type_touched,
+        )
+
+        cur = filtered[idx] if filtered else sugg_all[0]
+        cur_id = str(cur.get("id") or "")
+        cur_type_raw = str(cur.get("type") or "")
+        cur_iou = cur.get("iou")
+        cur_conf = cur.get("confidence")
+
+        # Selection actions apply to the currently-highlighted match.
+        working = _get_working_label_state(fstate)
+        label_type = normalize_door_type(str(chosen_type), default="swing")
+
+        # Confirm / Cancel only (no typed reject / not-a-door-at-all here).
+        c1, c2 = st.columns(2)
+        if c1.button("Confirm", use_container_width=True, type="primary", key=f"proposal_confirm_{key_suffix}"):
+            cbt = working.get("confirmed_by_type")
+            if not isinstance(cbt, dict):
+                cbt = {t: set() for t in DOOR_TYPES}
+                working["confirmed_by_type"] = cbt
+            for t in DOOR_TYPES:
+                ids = cbt.get(t)
+                if isinstance(ids, set):
+                    ids.discard(cur_id)
+            cbt.setdefault(label_type, set()).add(cur_id)
+            working["deleted_ids"].discard(cur_id)
+            rbt = working.get("rejected_by_type")
+            if isinstance(rbt, dict):
+                for t in DOOR_TYPES:
+                    ids = rbt.get(t)
+                    if isinstance(ids, set):
+                        ids.discard(cur_id)
+
+            # Persist immediately and clear proposal.
+            save_current_labels(str(file_id), file_dir)
+            fstate["_proposal"] = None
+            fstate["_last_draw_suggestions"] = None
+            try:
+                st.session_state[idx_key] = 0
+            except Exception:
+                pass
+
+            # Ensure the confirmed selection remains the selected door.
+            fstate["selected_door_id"] = str(cur_id)
+            try:
+                st.session_state[f"jump_{file_id}"] = str(cur_id)
+            except Exception:
+                pass
+            st.rerun()
+        if c2.button("Cancel", use_container_width=True, type="secondary", key=f"proposal_deny_{key_suffix}"):
+            # If the proposal created a manual candidate, drop it on deny.
+            try:
+                created_id = str(prop.get("created_manual_candidate_id") or "")
+            except Exception:
+                created_id = ""
+            if created_id:
+                try:
+                    mc = list(fstate.get("manual_candidates", []) or [])
+                    fstate["manual_candidates"] = [
+                        c for c in mc if not (isinstance(c, dict) and str(c.get("id") or "") == created_id)
+                    ]
+                except Exception:
+                    pass
+
+            # Restore previous selection (best effort).
+            try:
+                prev_id = str(prop.get("prev_selected_door_id") or "")
+            except Exception:
+                prev_id = ""
+            if prev_id:
+                fstate["selected_door_id"] = prev_id
+                try:
+                    st.session_state[f"jump_{file_id}"] = prev_id
+                except Exception:
+                    pass
+
+            fstate["_proposal"] = None
+            fstate["_last_draw_suggestions"] = None
+            try:
+                st.session_state[idx_key] = 0
+            except Exception:
+                pass
+            st.rerun()
+
+        # Tips directly under selection actions.
+        st.divider()
+        st.markdown("**Tips**")
+        st.caption("Shift+drag to propose selection · Drag to pan · Scroll to zoom")
+        return
+
+    # Door navigation.
     door_ids = [str(d["id"]) for d in all_visible if d.get("id") is not None]
     if not door_ids:
         return
-
-    jump_key = f"jump_{file_id}"
-    idx_key = f"{jump_key}__idx"
-    idx_label = f"door_jump_idx_{file_id}"
-
-    jump_raw = st.session_state.get(jump_key)
-    jump_id = str(jump_raw) if jump_raw not in (None, "") else None
-    current_id = jump_id if (jump_id in door_ids) else door_ids[0]
-    selected_idx = door_ids.index(current_id) if current_id in door_ids else 0
-    # Keep the editable index input in sync with selection (must happen before widget instantiation).
-    if st.session_state.get(idx_key) != (selected_idx + 1):
-        st.session_state[idx_key] = selected_idx + 1
-
-    col_idx = st.container()
-    with col_idx:
-        c_in, c_total = st.columns([1, 1])
-        c_in.number_input(
-            idx_label,
-            min_value=0,
-            max_value=len(door_ids) + 1,
-            step=1,
-            key=idx_key,
-            on_change=_mark_nav_intent,
-            args=(str(file_id),),
-            label_visibility="collapsed",
-        )
-        c_total.markdown(
-            f"<div style='text-align: left; line-height: 38px; padding-left: 6px;'>/ {len(all_visible)}</div>",
-            unsafe_allow_html=True,
-        )
 
     st.divider()
 
@@ -599,10 +787,43 @@ def right_panel_review(
     conf = max(0.0, min(1.0, conf))
     conf_pct = int(round(conf * 100))
 
-    # Make it explicit that the panel below refers to the currently selected door.
-    st.markdown(f"**Door {int(selected_idx) + 1} / {len(all_visible)}**")
-    if did:
-        st.caption(f"ID: `{did}`")
+    # Door navigation: Prev / Door X/Y / Next in one line.
+    c_prev, c_mid, c_next = st.columns([1, 2, 1])
+    if c_prev.button("Prev", use_container_width=True, key=f"door_prev_btn_{key_suffix}"):
+        try:
+            prev_id = door_ids[(int(selected_idx) - 1) % max(1, len(door_ids))]
+            st.session_state[f"door_click_sink_{file_id}"] = str(prev_id)
+        except Exception:
+            pass
+        _mark_nav_intent(str(file_id))
+        st.rerun()
+
+    if c_mid.button(
+        f"Door {int(selected_idx) + 1} / {len(all_visible)}",
+        use_container_width=True,
+        type="secondary",
+        key=f"door_focus_btn_{key_suffix}",
+    ):
+        try:
+            fstate["_focus_request_seq"] = int(fstate.get("_focus_request_seq") or 0) + 1
+        except Exception:
+            fstate["_focus_request_seq"] = 1
+        try:
+            fstate["_focused_door_id"] = str(did)
+        except Exception:
+            pass
+        st.rerun()
+
+    if c_next.button("Next", use_container_width=True, key=f"door_next_btn_{key_suffix}"):
+        try:
+            next_id = door_ids[(int(selected_idx) + 1) % max(1, len(door_ids))]
+            st.session_state[f"door_click_sink_{file_id}"] = str(next_id)
+        except Exception:
+            pass
+        _mark_nav_intent(str(file_id))
+        st.rerun()
+
+    # (Door id display removed; it adds clutter.)
 
     # Use the *current working* label state so this reflects draft changes in edit mode.
     working = _get_working_label_state(fstate)
@@ -628,20 +849,6 @@ def right_panel_review(
 """,
         unsafe_allow_html=True,
     )
-
-    # Manual focus: shown only when this door wasn't focused via an explicit focus action.
-    is_focused = str(fstate.get("_focused_door_id") or "") == str(did)
-    if not is_focused:
-        if st.button("Focus", use_container_width=True, type="secondary"):
-            try:
-                fstate["_focus_request_seq"] = int(fstate.get("_focus_request_seq") or 0) + 1
-            except Exception:
-                fstate["_focus_request_seq"] = 1
-            try:
-                fstate["_focused_door_id"] = str(did)
-            except Exception:
-                pass
-            st.rerun()
 
     # Typed label control (what the reviewer says this door *is*).
     # This is separate from the model-predicted door type (displayed above).
@@ -680,14 +887,14 @@ def right_panel_review(
 
     # Actions
     is_editing = bool(fstate.get("edit_mode"))
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     # Button labels include door type to make the feedback intent unambiguous.
     ui_label_type = normalize_door_type(st.session_state.get(label_type_key), default=default_label_type)
     detected_type = normalize_door_type(selected_door.get("type"), default="swing")
     confirm_label = f"Confirm {str(ui_label_type).capitalize()} door"
     reject_label = f"Not a {str(detected_type).capitalize()} door"
 
-    if c1.button(confirm_label, use_container_width=True, key=f"confirm_btn_{key_suffix}"):
+    if c1.button(confirm_label, use_container_width=True, type="primary", key=f"confirm_btn_{key_suffix}"):
         # Ensure confirmed_by_type exists.
         try:
             cbt = working.get("confirmed_by_type")
@@ -772,7 +979,7 @@ def right_panel_review(
         # Auto-switch the filter so the revealed swing candidates are immediately visible.
         if detected_type == "double":
             try:
-                st.session_state[door_type_filter_key] = "swing"
+                st.session_state[door_filter_key] = "swing"
             except Exception:
                 pass
         try:
@@ -814,7 +1021,7 @@ def right_panel_review(
         st.rerun()
 
     # Optional global negative (rare): truly "not a door at all".
-    if st.button(
+    if c3.button(
         "Not a door at all",
         use_container_width=True,
         type="secondary",
@@ -867,15 +1074,9 @@ def right_panel_review(
         fstate["selected_door_id"] = None
         st.rerun()
 
+    # Tips (below the action buttons).
     st.divider()
-    # Show stats for the currently active label state (draft while editing).
-    st.write(
-        f"**Stats:** "
-        f"{len(flatten_confirmed_ids(working.get('confirmed_by_type', {})))} confirmed, "
-        f"{len(flatten_rejected_ids(working.get('rejected_by_type', {})))} rejected-type, "
-        f"{len(working.get('deleted_ids', set()))} not-a-door, "
-        f"{len(working.get('manual_additions', []))} manual-added, "
-        f"{len(working.get('unmatched_manual_boxes', []))} unmatched"
-    )
+    st.markdown("**Tips**")
+    st.caption("Shift+drag to propose selection · Drag to pan · Scroll to zoom")
 
-    # Edit-mode controls were removed; all actions apply immediately.
+    # Stats display removed (too noisy); all actions apply immediately.

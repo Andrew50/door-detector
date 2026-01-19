@@ -37,6 +37,7 @@ from door_detector.ui.review_panel import main_viewer_controls, right_panel_revi
 from door_detector.ui.sidebar import sidebar_library
 from door_detector.ui.viewer import _normalize_bbox_xyxy, main_viewer_canvas
 from door_detector.doors.detect import debug_explain_unmatched_box
+from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids
 
 
 logger = logging.getLogger("door_detector.review_app")
@@ -80,10 +81,15 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
             # Manual focus requests (via a button in the right panel). This should
             # trigger a one-shot focus in the viewer regardless of auto-focus toggle.
             "_focus_request_seq": 0,
+            # One-shot focus requests for proposal overlays (Shift+drag cyan/green boxes).
+            "_proposal_focus_seq": 0,
             # Best-effort record of which door we've most recently focused. This is
             # UI-only (used to decide whether to show the Focus button).
             "_focused_door_id": None,
             "_last_clicked_door_id": None,
+            # Debug: rolling breadcrumb trail of UI actions affecting selection/highlight.
+            "_ui_breadcrumbs": [],
+            "_ui_warned_keys": set(),
         }
 
 
@@ -314,6 +320,17 @@ def _process_draw_event_if_any(
     if str(event_id) == str(fstate.get("_last_draw_event_id")):
         return
     fstate["_last_draw_event_id"] = str(event_id)
+    prev_selected = str(fstate.get("selected_door_id") or "")
+    push_breadcrumb(
+        fstate,
+        {
+            "kind": "draw_event_received",
+            "file_id": str(file_id),
+            "event_id": str(event_id),
+            "prev_selected_door_id": prev_selected,
+            "snapped_candidate_id": str(snapped_candidate_id) if snapped_candidate_id not in (None, "") else "",
+        },
+    )
 
     # PDF.js emits bbox_pdf_xyxy in PDF coords; convert PDF → pixel using Step1 transform.
     if not (isinstance(bbox_pdf, list) and len(bbox_pdf) == 4):
@@ -607,6 +624,7 @@ def _process_draw_event_if_any(
                 "drawn_bbox_xyxy": [float(v) for v in drawn_full],
                 "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf],
                 "snapped_candidate_id": str(cid),
+                "prev_selected_door_id": str(prev_selected),
                 "snapped_bbox_xyxy": [
                     float(snapped_full[0]),
                     float(snapped_full[1]),
@@ -627,6 +645,19 @@ def _process_draw_event_if_any(
             fstate["_focus_last_id"] = cid
         except Exception:
             pass
+        push_breadcrumb(
+            fstate,
+            {
+                "kind": "draw_event_proposed_selection",
+                "file_id": str(file_id),
+                "event_id": str(event_id),
+                "prev_selected_door_id": prev_selected,
+                "selected_door_id": str(fstate.get("selected_door_id") or ""),
+                "proposal_snapped_candidate_id": cid,
+                "iou": float(iou or 0.0),
+                "created_manual_candidate_id": str(created_manual_candidate_id or ""),
+            },
+        )
     else:
         # No match (unexpected). Record a proposal so the UI can show the drawn region.
         try:
@@ -635,6 +666,7 @@ def _process_draw_event_if_any(
                 "drawn_bbox_xyxy": [float(v) for v in drawn_full],
                 "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf],
                 "snapped_candidate_id": "",
+                "prev_selected_door_id": str(prev_selected),
                 "snapped_bbox_xyxy": [],
                 "iou": 0.0,
                 "created_manual_candidate_id": "",
@@ -645,6 +677,15 @@ def _process_draw_event_if_any(
             file_dir=file_dir,
             drawn_bbox_full_xyxy=drawn_full,
             config_path=str(config_path),
+        )
+        push_breadcrumb(
+            fstate,
+            {
+                "kind": "draw_event_unmatched",
+                "file_id": str(file_id),
+                "event_id": str(event_id),
+                "prev_selected_door_id": prev_selected,
+            },
         )
 
     # Consume the sink value so it doesn't grow / re-trigger on reconnects.
@@ -810,6 +851,17 @@ def main() -> None:
                                 did = evt.get("door_id")
                                 if did not in (None, ""):
                                     st.session_state[click_sink_label] = str(did)
+                                push_breadcrumb(
+                                    fstate,
+                                    {
+                                        "kind": "viewer_event",
+                                        "file_id": str(file_id),
+                                        "type": "door_click",
+                                        "event_id": evt_id,
+                                        "door_id": str(did) if did not in (None, "") else "",
+                                        "selected_door_id_before": str(fstate.get("selected_door_id") or ""),
+                                    },
+                                )
                             elif et == "draw_rect":
                                 st.session_state[f"draw_event_sink_{file_id}"] = json.dumps(
                                     {
@@ -823,6 +875,18 @@ def main() -> None:
                                     },
                                     separators=(",", ":"),
                                 )
+                                push_breadcrumb(
+                                    fstate,
+                                    {
+                                        "kind": "viewer_event",
+                                        "file_id": str(file_id),
+                                        "type": "draw_rect",
+                                        "event_id": evt_id,
+                                        "snapped_candidate_id": str(evt.get("snapped_candidate_id") or ""),
+                                        "ts_client": evt.get("ts"),
+                                        "selected_door_id_before": str(fstate.get("selected_door_id") or ""),
+                                    },
+                                )
                             elif et == "focus_state":
                                 did = evt.get("door_id")
                                 in_focus = bool(evt.get("in_focus"))
@@ -834,6 +898,19 @@ def main() -> None:
                                     else:
                                         if str(fstate.get("_focused_door_id") or "") == did_s:
                                             fstate["_focused_door_id"] = None
+                                push_breadcrumb(
+                                    fstate,
+                                    {
+                                        "kind": "viewer_event",
+                                        "file_id": str(file_id),
+                                        "type": "focus_state",
+                                        "event_id": evt_id,
+                                        "door_id": did_s,
+                                        "in_focus": bool(in_focus),
+                                        "selected_door_id_before": cur_s,
+                                        "focused_door_id_before": str(fstate.get("_focused_door_id") or ""),
+                                    },
+                                )
                 except Exception:
                     pass
 
@@ -933,29 +1010,50 @@ def main() -> None:
 
                 active_doors_all: List[Dict[str, Any]] = [d for d in overlay_doors if str(d.get("id")) not in hidden_ids]
 
-                # Door type filter (affects navigation list + right panel; overlay still includes all).
-                door_type_filter_key = f"door_type_filter_{file_id}"
-                if door_type_filter_key not in st.session_state:
-                    st.session_state[door_type_filter_key] = "All"
-                selected_type = str(st.session_state.get(door_type_filter_key) or "All")
+                # Unified single-stage filter: choose exactly one of {All, Confirmed, Unconfirmed, <type>}.
+                try:
+                    confirmed_ids = set(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
+                except Exception:
+                    confirmed_ids = set()
+                door_filter_key = f"door_filter_{file_id}"
+                if door_filter_key not in st.session_state:
+                    st.session_state[door_filter_key] = "All"
+                selected_filter = str(st.session_state.get(door_filter_key) or "All")
+
+                # Map id -> type from the full (hidden-filtered) list for click-driven filter switching.
                 id_to_type = {
                     str(d.get("id")): str(d.get("type") or "").strip()
                     for d in active_doors_all
                     if d.get("id") is not None
                 }
 
-                # If the user clicked a door of a different type, switch filter to that type.
+                # If the user clicked a door of a different type while already type-filtered,
+                # switch the filter to that type (but do not override Confirmed/Unconfirmed modes).
                 click_sink_label = f"door_click_sink_{file_id}"
                 clicked_id = st.session_state.get(click_sink_label)
-                if clicked_id is not None:
+                if clicked_id is not None and selected_filter not in ("All", "Confirmed", "Unconfirmed"):
                     clicked_type = id_to_type.get(str(clicked_id))
-                    if clicked_type and selected_type != "All" and clicked_type != selected_type:
-                        st.session_state[door_type_filter_key] = clicked_type
-                        selected_type = clicked_type
+                    if clicked_type and clicked_type != selected_filter:
+                        st.session_state[door_filter_key] = clicked_type
+                        selected_filter = clicked_type
+                        push_breadcrumb(
+                            fstate,
+                            {
+                                "kind": "auto_filter_switch_on_click",
+                                "file_id": str(file_id),
+                                "clicked_id": str(clicked_id),
+                                "clicked_type": str(clicked_type),
+                                "new_filter": str(selected_filter),
+                            },
+                        )
 
-                if selected_type and selected_type != "All":
-                    active_doors: List[Dict[str, Any]] = [
-                        d for d in active_doors_all if str(d.get("type") or "").strip() == selected_type
+                if selected_filter == "Confirmed":
+                    active_doors = [d for d in active_doors_all if str(d.get("id") or "") in confirmed_ids]
+                elif selected_filter == "Unconfirmed":
+                    active_doors = [d for d in active_doors_all if str(d.get("id") or "") not in confirmed_ids]
+                elif selected_filter and selected_filter != "All":
+                    active_doors = [
+                        d for d in active_doors_all if str(d.get("type") or "").strip() == selected_filter
                     ]
                 else:
                     active_doors = active_doors_all
@@ -963,7 +1061,40 @@ def main() -> None:
                 # Sync selection state before rendering the viewer.
                 all_visible = active_doors.copy()
                 all_visible.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+                prev_sel_before_sync = str(fstate.get("selected_door_id") or "")
                 _sync_selected_door_for_run(file_id=str(file_id), fstate=fstate, all_visible=all_visible)
+                sel_after_sync = str(fstate.get("selected_door_id") or "")
+                if sel_after_sync != prev_sel_before_sync:
+                    push_breadcrumb(
+                        fstate,
+                        {
+                            "kind": "selection_changed_by_sync",
+                            "file_id": str(file_id),
+                            "from": prev_sel_before_sync,
+                            "to": sel_after_sync,
+                            "visible_count": int(len(all_visible)),
+                            "door_filter": str(selected_filter),
+                        },
+                    )
+
+                # Warn if selection appears to fall out of the visible list (can happen
+                # transiently with filter changes or stale ids).
+                if sel_after_sync and sel_after_sync not in {str(d.get("id")) for d in all_visible if isinstance(d, dict)}:
+                    k = f"desync_selected_not_in_visible::{file_id}::{sel_after_sync}::{selected_filter}"
+                    if warn_once(fstate, k):
+                        logger.warning(
+                            "[door_detector] possible selection/sidebar desync: selected id not in visible list (post-sync)",
+                            extra={
+                                "file_id": str(file_id),
+                                "selected_door_id": sel_after_sync,
+                                "prev_selected_door_id": prev_sel_before_sync,
+                                "visible_count": int(len(all_visible)),
+                                "visible_id_sample": sample_ids([d.get("id") for d in all_visible if isinstance(d, dict)], limit=12),
+                                "door_filter": str(selected_filter),
+                                "proposal_active": bool(fstate.get("_proposal")),
+                                "breadcrumbs_tail": tail_breadcrumbs(fstate, n=12),
+                            },
+                        )
 
                 # --- Sync viewer-affecting widget state BEFORE rendering the viewer ---
                 # Widgets live in the right panel, but their state is available at the start
@@ -974,9 +1105,12 @@ def main() -> None:
                     st.session_state[auto_focus_key] = bool(fstate.get("auto_focus", True))
                 fstate["auto_focus"] = bool(st.session_state.get(auto_focus_key))
 
-                viewer_display_key = f"viewer_display_mode_{file_id}"
-                if viewer_display_key in st.session_state:
-                    fstate["viewer_display_mode"] = str(st.session_state.get(viewer_display_key) or "Highlight All")
+                # Highlight toggle (UI): when disabled, viewer should show no door overlays.
+                highlight_key = f"highlight_doors_{file_id}"
+                if highlight_key not in st.session_state:
+                    st.session_state[highlight_key] = True
+                fstate["highlight_doors"] = bool(st.session_state.get(highlight_key))
+                fstate["viewer_display_mode"] = "Highlight All" if fstate["highlight_doors"] else "Off"
 
                 # --- Sync draw-suggestion cycling state BEFORE rendering the viewer ---
                 # Right panel writes these widget states; we compute the currently-cycled
@@ -1027,7 +1161,8 @@ def main() -> None:
                         full_dims=full_dims,
                         doors_data=doors_data,
                         fstate=fstate,
-                        active_doors=overlay_doors,
+                        # Only show overlays for the filtered type when highlighting is enabled.
+                        active_doors=(active_doors if fstate.get("highlight_doors") else []),
                         click_sink_label=click_sink_label,
                     )
 
@@ -1038,7 +1173,6 @@ def main() -> None:
                         doors_data=doors_data,
                         fstate=fstate,
                     )
-                    st.divider()
                     right_panel_review(
                         selected_item,
                         doors_data=doors_data,
