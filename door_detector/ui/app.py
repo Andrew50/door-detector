@@ -8,6 +8,7 @@ import logging
 import math
 import time
 import hashlib
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,12 +58,30 @@ def _default_config_path_str() -> str:
         return str(p)
 
 
+def _normalize_door_filter_value(v: object) -> str:
+    """Coerce UI filter value to one of {All, Confirmed, Unconfirmed, <canonical door type>}."""
+    try:
+        s = str(v).strip()
+    except Exception:
+        return "All"
+    sl = s.lower()
+    if sl == "all":
+        return "All"
+    if sl == "confirmed":
+        return "Confirmed"
+    if sl == "unconfirmed":
+        return "Unconfirmed"
+    t = normalize_door_type(s, default="")
+    return t if t else "All"
+
+
 
 def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
     if "files" not in st.session_state:
         st.session_state.files = {}
 
     if file_id not in st.session_state.files:
+        fstate_instance = f"fs_{uuid.uuid4().hex[:10]}"
         st.session_state.files[file_id] = {
             "confirmed_by_type": coerce_confirmed_by_type(labels_data.get("confirmed_by_type", {})),
             "rejected_by_type": coerce_rejected_by_type(labels_data.get("rejected_by_type", {})),
@@ -74,6 +93,8 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
             "viewer_display_mode": "Highlight All",
             "auto_focus": True,
             "edit_mode": False,
+            # Debug: stable per-file state instance id to detect unexpected resets.
+            "_door_detector_fstate_instance": fstate_instance,
             "_edit_baseline": None,
             "_edit_draft": None,
             "_edit_manual_confirmed_ids": set(),
@@ -112,8 +133,32 @@ def _remap_fstate_ids_using_legacy_ids(*, fstate: Dict[str, Any], doors_data: Di
     except Exception:
         candidates = []
 
+    # IMPORTANT:
+    # Never remap an id that is already a current candidate id.
+    #
+    # Some `doors.json` files can contain legacy id collisions where:
+    # - candidate A has id "d_X"
+    # - candidate B has legacy_ids that include "d_X"
+    #
+    # If we blindly map legacy_ids after writing the identity mapping, we'd override
+    # "d_X" -> "d_Y" and effectively *erase* labels for the real "d_X" candidate.
     legacy_to_current: Dict[str, str] = {}
     try:
+        current_ids: set[str] = set()
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("id")
+            if cid is None:
+                continue
+            cid_s = str(cid)
+            if cid_s:
+                current_ids.add(cid_s)
+
+        # Identity mapping for all current ids.
+        legacy_to_current = {cid: cid for cid in current_ids}
+
+        # Add legacy mappings, but never override a current id key.
         for c in candidates:
             if not isinstance(c, dict):
                 continue
@@ -123,13 +168,19 @@ def _remap_fstate_ids_using_legacy_ids(*, fstate: Dict[str, Any], doors_data: Di
             cid_s = str(cid)
             if not cid_s:
                 continue
-            legacy_to_current[cid_s] = cid_s
             for lid in list(c.get("legacy_ids") or []):
                 if lid is None:
                     continue
                 s = str(lid)
-                if s:
-                    legacy_to_current[s] = cid_s
+                if not s:
+                    continue
+                # Do not treat a current id as a legacy id for another candidate.
+                if s in current_ids:
+                    continue
+                # Keep the first mapping if multiple candidates claim the same legacy id.
+                if s in legacy_to_current:
+                    continue
+                legacy_to_current[s] = cid_s
     except Exception:
         legacy_to_current = {}
 
@@ -677,6 +728,7 @@ def _process_draw_event_if_any(
 
             scored: List[Tuple[Tuple[float, float, float], Dict[str, Any]]] = []
             nearest: List[Tuple[Tuple[float, float], Dict[str, Any]]] = []
+            overlap_swing_ids: set[str] = set()
             for cand in candidates:
                 cid = cand.get("id")
                 cb = _normalize_bbox_xyxy(cand.get("bbox_xyxy"))
@@ -704,11 +756,40 @@ def _process_draw_event_if_any(
                 iou_c = float(compute_iou([bx0, by0, bx1, by1], [cx0, cy0, cx1, cy1]))
                 conf = float(cand.get("confidence", cand.get("heuristic_confidence", 0.0)) or 0.0)
                 scored.append(((iou_c, inter, conf), cand))
+                # Track overlapping swing candidates so we can surface "double" suggestions
+                # even when the double bbox IoU is weaker than its component swings.
+                try:
+                    if str(cand.get("type") or "") == "swing":
+                        overlap_swing_ids.add(str(cid))
+                except Exception:
+                    pass
 
             scored.sort(key=lambda x: x[0], reverse=True)
             nearest.sort(key=lambda x: x[0])
 
             pool_map = {str(c.get("id")): c for c in candidates if c.get("id") is not None}
+            # Map swing_id -> list of double candidates that reference it.
+            doubles_by_swing: Dict[str, List[str]] = {}
+            double_by_id: Dict[str, Dict[str, Any]] = {}
+            try:
+                for c in candidates:
+                    if not (isinstance(c, dict) and str(c.get("type") or "") == "double"):
+                        continue
+                    did = str(c.get("id") or "")
+                    if not did:
+                        continue
+                    double_by_id[did] = c
+                    comps = c.get("components") if isinstance(c.get("components"), dict) else {}
+                    swing_ids = comps.get("swing_ids") if isinstance(comps, dict) else None
+                    if not isinstance(swing_ids, list) or len(swing_ids) != 2:
+                        continue
+                    for sid in swing_ids:
+                        ssid = str(sid) if sid not in (None, "") else ""
+                        if ssid:
+                            doubles_by_swing.setdefault(ssid, []).append(did)
+            except Exception:
+                doubles_by_swing = {}
+                double_by_id = {}
 
             suggestions: List[Dict[str, Any]] = []
             seen: set[str] = set()
@@ -728,6 +809,59 @@ def _process_draw_event_if_any(
                         "source": "overlap",
                     }
                 )
+
+                # If a swing overlaps, and a high-confidence double references it AND the
+                # other component swing also overlaps, surface the double suggestion even
+                # when its bbox IoU would rank below the top-N overlap list.
+                try:
+                    if str(cand.get("type") or "") == "swing" and overlap_swing_ids:
+                        MIN_DOUBLE_SUGGEST_CONF = 0.55
+                        for did in doubles_by_swing.get(cid, [])[:8]:
+                            if did in seen:
+                                continue
+                            dobj = double_by_id.get(did)
+                            if not isinstance(dobj, dict):
+                                continue
+                            try:
+                                dconf = float(dobj.get("confidence", dobj.get("heuristic_confidence", 0.0)) or 0.0)
+                            except Exception:
+                                dconf = 0.0
+                            if dconf < MIN_DOUBLE_SUGGEST_CONF:
+                                continue
+                            comps = dobj.get("components") if isinstance(dobj.get("components"), dict) else {}
+                            sids = comps.get("swing_ids") if isinstance(comps, dict) else None
+                            if not (isinstance(sids, list) and len(sids) == 2):
+                                continue
+                            sids2 = [str(s) for s in sids if s not in (None, "")]
+                            if len(sids2) != 2:
+                                continue
+                            if not all(s in overlap_swing_ids for s in sids2):
+                                continue
+                            db = _normalize_bbox_xyxy(dobj.get("bbox_xyxy"))
+                            if db is None:
+                                continue
+                            dx0, dy0, dx1, dy1 = db
+                            dix0 = max(bx0, dx0)
+                            diy0 = max(by0, dy0)
+                            dix1 = min(bx1, dx1)
+                            diy1 = min(by1, dy1)
+                            dinter = max(0.0, dix1 - dix0) * max(0.0, diy1 - diy0)
+                            if dinter <= 0.0:
+                                continue
+                            diou = float(compute_iou([bx0, by0, bx1, by1], [dx0, dy0, dx1, dy1]))
+                            seen.add(did)
+                            suggestions.append(
+                                {
+                                    "id": str(did),
+                                    "type": "double",
+                                    "iou": float(diou),
+                                    "inter": float(dinter),
+                                    "confidence": float(dconf),
+                                    "source": "double_from_components",
+                                }
+                            )
+                except Exception:
+                    pass
 
                 # Expand doubles into component swings so the reviewer can cycle to them.
                 if str(cand.get("type") or "") == "double":
@@ -796,6 +930,110 @@ def _process_draw_event_if_any(
     # Server-side snap is the source of truth (uses full candidate list).
     with perf_span("ui.draw_event.snap_server", file_id=str(file_id), event_id=str(event_id), candidates=int(len(candidates))):
         best_server, iou_server = _snap_to_candidate(drawn_full, candidates=candidates)
+
+    # Prefer a double snap when the drawn ROI overlaps both component swings and the
+    # double itself is high-confidence. This avoids the common UX failure:
+    # "I drew around a double door, but snap picked just one leaf."
+    try:
+        if isinstance(best_server, dict) and str(best_server.get("type") or "") != "double":
+            nb = _normalize_bbox_xyxy(drawn_full)
+            if nb is not None:
+                bx0, by0, bx1, by1 = nb
+                drawn = [bx0, by0, bx1, by1]
+                overlap_swings: set[str] = set()
+                by_id = {str(c.get("id")): c for c in candidates if isinstance(c, dict) and c.get("id") is not None}
+                for c in candidates:
+                    if not (isinstance(c, dict) and str(c.get("type") or "") == "swing"):
+                        continue
+                    cid = c.get("id")
+                    cb = _normalize_bbox_xyxy(c.get("bbox_xyxy"))
+                    if cid is None or cb is None:
+                        continue
+                    if float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]])) > 0.0:
+                        overlap_swings.add(str(cid))
+
+                if len(overlap_swings) >= 2:
+                    MIN_DOUBLE_SNAP_CONF = 0.55
+                    best_d = None
+                    best_d_iou = 0.0
+                    best_score = 0.0
+                    for c in candidates:
+                        if not (isinstance(c, dict) and str(c.get("type") or "") == "double"):
+                            continue
+                        did = str(c.get("id") or "")
+                        if not did:
+                            continue
+                        try:
+                            dconf = float(c.get("confidence", c.get("heuristic_confidence", 0.0)) or 0.0)
+                        except Exception:
+                            dconf = 0.0
+                        if dconf < MIN_DOUBLE_SNAP_CONF:
+                            continue
+                        comps = c.get("components") if isinstance(c.get("components"), dict) else {}
+                        sids = comps.get("swing_ids") if isinstance(comps, dict) else None
+                        if not (isinstance(sids, list) and len(sids) == 2):
+                            continue
+                        sids2 = [str(s) for s in sids if s not in (None, "")]
+                        if len(sids2) != 2:
+                            continue
+                        if not all(s in overlap_swings for s in sids2):
+                            continue
+                        cb = _normalize_bbox_xyxy(c.get("bbox_xyxy"))
+                        if cb is None:
+                            continue
+                        diou = float(compute_iou(drawn, [cb[0], cb[1], cb[2], cb[3]]))
+                        if diou <= 0.0:
+                            continue
+                        # Score prioritizes overlap but breaks ties with confidence.
+                        score = float(diou) + 0.02 * float(dconf)
+                        if score > best_score:
+                            best_score = score
+                            best_d = c
+                            best_d_iou = diou
+
+                    if best_d is not None:
+                        best_server = best_d
+                        iou_server = float(best_d_iou)
+                        # Ensure the chosen double appears in the suggestions list for cycling.
+                        try:
+                            srec = fstate.get("_last_draw_suggestions") or {}
+                            sugg = list(srec.get("suggestions") or [])
+                            did = str(best_d.get("id") or "")
+                            if did and not any(str(r.get("id") or "") == did for r in sugg if isinstance(r, dict)):
+                                db = _normalize_bbox_xyxy(best_d.get("bbox_xyxy"))
+                                if db is not None:
+                                    dx0, dy0, dx1, dy1 = db
+                                    dix0 = max(bx0, dx0)
+                                    diy0 = max(by0, dy0)
+                                    dix1 = min(bx1, dx1)
+                                    diy1 = min(by1, dy1)
+                                    dinter = max(0.0, dix1 - dix0) * max(0.0, diy1 - diy0)
+                                else:
+                                    dinter = 0.0
+                                try:
+                                    dconf = float(best_d.get("confidence", best_d.get("heuristic_confidence", 0.0)) or 0.0)
+                                except Exception:
+                                    dconf = 0.0
+                                sugg.insert(
+                                    0,
+                                    {
+                                        "id": did,
+                                        "type": "double",
+                                        "iou": float(best_d_iou),
+                                        "inter": float(dinter),
+                                        "confidence": float(dconf),
+                                        "source": "snap_prefer_double",
+                                    },
+                                )
+                                fstate["_last_draw_suggestions"] = {
+                                    "event_id": str(event_id),
+                                    "drawn_bbox_xyxy": [float(v) for v in drawn_full],
+                                    "suggestions": sugg[:50],
+                                }
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
     # Client-proposed snap (from the viewer's candidatePool) is only a hint.
     # The pool is intentionally downsampled for performance, so accepting it blindly
@@ -1258,6 +1496,96 @@ def main() -> None:
 
                 full_dims = get_full_page_dims(meta_data)
 
+                # Debug: verify label actions persist across the st.rerun boundary.
+                # The right panel stores a one-shot snapshot *after* mutating label state;
+                # on the next run we compare the current fstate (post id-remap) against that snapshot.
+                try:
+                    raw_expect = st.session_state.pop(f"_door_detector_expected_label_state_{file_id}", None)
+                except Exception:
+                    raw_expect = None
+                if raw_expect:
+                    try:
+                        expect = json.loads(raw_expect) if isinstance(raw_expect, str) else (raw_expect if isinstance(raw_expect, dict) else {})
+                    except Exception:
+                        expect = {}
+
+                    try:
+                        act_id = str((expect or {}).get("door_id") or "")
+                    except Exception:
+                        act_id = ""
+                    try:
+                        action = str((expect or {}).get("action") or "")
+                    except Exception:
+                        action = ""
+                    try:
+                        expect_inst = str((expect or {}).get("fstate_instance") or "")
+                    except Exception:
+                        expect_inst = ""
+
+                    try:
+                        working_now = _get_working_label_state(fstate)
+                        confirmed_now = set(flatten_confirmed_ids(working_now.get("confirmed_by_type", {})))
+                        rejected_now = set(flatten_rejected_ids(working_now.get("rejected_by_type", {})))
+                        deleted_now = set(coerce_id_set(working_now.get("deleted_ids", set())))
+                    except Exception:
+                        confirmed_now, rejected_now, deleted_now = set(), set(), set()
+                    hidden_now = set(rejected_now) | set(deleted_now)
+
+                    cur_inst = str(fstate.get("_door_detector_fstate_instance") or "")
+
+                    # Disk state (best-effort): helps distinguish "save didn't persist" vs "session state drift".
+                    disk = None
+                    try:
+                        labels_path = Path(file_dir) / "labels.json"
+                        if labels_path.exists():
+                            with open(labels_path, "r") as f:
+                                disk_obj = json.load(f)
+                            cbt = disk_obj.get("confirmed_by_type", {}) if isinstance(disk_obj, dict) else {}
+                            rbt = disk_obj.get("rejected_by_type", {}) if isinstance(disk_obj, dict) else {}
+                            dids = disk_obj.get("deleted_ids", []) if isinstance(disk_obj, dict) else []
+                            disk_confirmed = (
+                                set(flatten_confirmed_ids({k: set(v or []) for k, v in (cbt or {}).items()})) if isinstance(cbt, dict) else set()
+                            )
+                            disk_rejected = (
+                                set(flatten_rejected_ids({k: set(v or []) for k, v in (rbt or {}).items()})) if isinstance(rbt, dict) else set()
+                            )
+                            disk_deleted = set(coerce_id_set(dids))
+                            disk = {
+                                "exists": True,
+                                "confirmed_len": int(len(disk_confirmed)),
+                                "deleted_len": int(len(disk_deleted)),
+                                "rejected_len": int(len(disk_rejected)),
+                                "door_in_confirmed": bool(act_id and act_id in disk_confirmed),
+                                "door_in_hidden": bool(act_id and act_id in (disk_deleted | disk_rejected)),
+                            }
+                        else:
+                            disk = {"exists": False}
+                    except Exception:
+                        disk = {"exists": None}
+
+                    ui_event_log(
+                        "label_action_persistence_check",
+                        {
+                            "file_id": str(file_id),
+                            "action": action,
+                            "door_id": act_id,
+                            "expect": expect,
+                            "fstate_instance_current": cur_inst,
+                            "fstate_instance_expected": expect_inst,
+                            "fstate_instance_matches": bool(expect_inst and cur_inst and expect_inst == cur_inst),
+                            "current": {
+                                "confirmed_len": int(len(confirmed_now)),
+                                "deleted_len": int(len(deleted_now)),
+                                "rejected_len": int(len(rejected_now)),
+                                "hidden_len": int(len(hidden_now)),
+                                "door_in_confirmed": bool(act_id and act_id in confirmed_now),
+                                "door_in_hidden": bool(act_id and act_id in hidden_now),
+                            },
+                            "disk": disk,
+                            "ts": time.time(),
+                        },
+                    )
+
                 # --- Consume PDF.js component events early (before snapping + selection sync) ---
                 # The PDF.js viewer is a Streamlit custom component keyed by `pdfjs_viewer_{file_id}`.
                 # Its value is available in session_state at the start of a rerun after user actions.
@@ -1494,10 +1822,11 @@ def main() -> None:
                 except Exception:
                     expected = None
                 if expected not in (None, ""):
+                    expected_norm = _normalize_door_filter_value(expected)
                     try:
-                        st.session_state[door_filter_key] = str(expected)
-                        st.session_state[door_filter_widget_key] = str(expected)
-                        fstate["_door_filter"] = str(expected)
+                        st.session_state[door_filter_key] = expected_norm
+                        st.session_state[door_filter_widget_key] = expected_norm
+                        fstate["_door_filter"] = expected_norm
                     except Exception:
                         pass
 
@@ -1513,18 +1842,19 @@ def main() -> None:
                     except Exception:
                         user_value = None
                     if user_value not in (None, ""):
+                        user_value_norm = _normalize_door_filter_value(user_value)
                         try:
-                            st.session_state[door_filter_key] = str(user_value)
-                            fstate["_door_filter"] = str(user_value)
+                            st.session_state[door_filter_key] = user_value_norm
+                            fstate["_door_filter"] = user_value_norm
                         except Exception:
                             pass
 
                 if door_filter_key not in st.session_state:
                     try:
-                        st.session_state[door_filter_key] = str(fstate.get("_door_filter") or "All")
+                        st.session_state[door_filter_key] = _normalize_door_filter_value(fstate.get("_door_filter") or "All")
                     except Exception:
                         st.session_state[door_filter_key] = "All"
-                selected_filter = str(st.session_state.get(door_filter_key) or "All")
+                selected_filter = _normalize_door_filter_value(st.session_state.get(door_filter_key) or "All")
                 try:
                     fstate["_door_filter"] = str(selected_filter)
                 except Exception:
@@ -1532,7 +1862,7 @@ def main() -> None:
 
                 # Map id -> type from the full (hidden-filtered) list for click-driven filter switching.
                 id_to_type = {
-                    str(d.get("id")): str(d.get("type") or "").strip()
+                    str(d.get("id")): normalize_door_type(d.get("type"), default="")
                     for d in active_doors_all
                     if d.get("id") is not None
                 }
@@ -1543,6 +1873,7 @@ def main() -> None:
                 clicked_id = st.session_state.get(click_sink_label)
                 if clicked_id is not None and selected_filter not in ("All", "Confirmed", "Unconfirmed"):
                     clicked_type = id_to_type.get(str(clicked_id))
+                    clicked_type = _normalize_door_filter_value(clicked_type) if clicked_type else ""
                     if clicked_type and clicked_type != selected_filter:
                         st.session_state[door_filter_key] = clicked_type
                         try:
@@ -1567,7 +1898,9 @@ def main() -> None:
                     active_doors = [d for d in active_doors_all if str(d.get("id") or "") not in confirmed_ids]
                 elif selected_filter and selected_filter != "All":
                     active_doors = [
-                        d for d in active_doors_all if str(d.get("type") or "").strip() == selected_filter
+                        d
+                        for d in active_doors_all
+                        if normalize_door_type(d.get("type"), default="") == str(selected_filter)
                     ]
                 else:
                     active_doors = active_doors_all

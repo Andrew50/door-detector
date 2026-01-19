@@ -272,6 +272,7 @@ def run_step2(
     det = detect_doors(primitives, meta, config)
     doors = list(det.get("doors", []) if isinstance(det, dict) else (det or []))
     candidates = list(det.get("candidates", []) if isinstance(det, dict) else [])
+    dedupe_debug = det.get("dedupe_debug") if isinstance(det, dict) else None
     detect_ms = (time.time() - start_time) * 1000
 
     # 3b. Add PDF-space bboxes for UI (PDF.js) and future-proofed downstream use.
@@ -335,6 +336,8 @@ def run_step2(
         "doors": doors,
         "candidates": candidates,
     }
+    if isinstance(dedupe_debug, dict) and dedupe_debug:
+        doors_data["dedupe_debug"] = dedupe_debug
     if remap_summary:
         doors_data["id_remap_summary"] = remap_summary
     

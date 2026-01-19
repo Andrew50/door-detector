@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "model_type": "logreg",
+  "door_type": "double",
+  "feature_order": [
+    "center_dist",
+    "radius_ratio",
+    "avg_swing_conf",
+    "pair_score"
+  ],
+  "scaler": {
+    "type": "zscore",
+    "mean": [
+      34.81761595461346,
+      1.0098606261900946,
+      0.8133830219411988,
+      0.2658203252854596
+    ],
+    "std": [
+      116.24254638739085,
+      0.010473682433251578,
+      0.109020175359287,
+      0.19556130736498906
+    ]
+  },
+  "weights": [
+    -0.10635046622254679,
+    0.24922758886413096,
+    -0.35134296837305407,
+    -0.14178946615064175
+  ],
+  "bias": -2.02691273454159,
+  "trained_at": "2026-01-19T05:37:49Z",
+  "num_samples": 40,
+  "num_pos": 3,
+  "num_neg": 37,
+  "train_accuracy": 0.925,
+  "train_logloss": 0.23009172184504845,
+  "warm_start_used": true,
+  "prior_path": "/home/aj/dev/door_detector/models/reweighter_double_v1.json",
+  "reg_lambda": 0.5,
+  "reg_lambda_bias": 0.25
+}

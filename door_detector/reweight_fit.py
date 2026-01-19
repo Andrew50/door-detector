@@ -213,18 +213,27 @@ def fit_reweighter(
         elif schema_v == 3:
             cbt = labels_data.get("confirmed_by_type") or {}
             if isinstance(cbt, dict):
-                for t in DOOR_TYPES:
-                    confirmed_by_type[t] = {str(x) for x in (cbt.get(t) or []) if x is not None}
+                # Backwards-compatible: normalize keys like "double doors", "bi-fold", etc.
+                for k, ids in cbt.items():
+                    t_norm = normalize_door_type(k, default="")
+                    if t_norm and t_norm in confirmed_by_type:
+                        confirmed_by_type[t_norm] |= {str(x) for x in (ids or []) if x is not None}
             deleted = {str(x) for x in (labels_data.get("deleted_ids") or []) if x is not None}
         elif schema_v == 4:
             cbt = labels_data.get("confirmed_by_type") or {}
             if isinstance(cbt, dict):
-                for t in DOOR_TYPES:
-                    confirmed_by_type[t] = {str(x) for x in (cbt.get(t) or []) if x is not None}
+                # Backwards-compatible: normalize keys like "double doors", "bi-fold", etc.
+                for k, ids in cbt.items():
+                    t_norm = normalize_door_type(k, default="")
+                    if t_norm and t_norm in confirmed_by_type:
+                        confirmed_by_type[t_norm] |= {str(x) for x in (ids or []) if x is not None}
             rbt = labels_data.get("rejected_by_type") or {}
             if isinstance(rbt, dict):
-                for t in DOOR_TYPES:
-                    rejected_by_type[t] = {str(x) for x in (rbt.get(t) or []) if x is not None}
+                # Backwards-compatible: normalize keys like "double doors", "bi-fold", etc.
+                for k, ids in rbt.items():
+                    t_norm = normalize_door_type(k, default="")
+                    if t_norm and t_norm in rejected_by_type:
+                        rejected_by_type[t_norm] |= {str(x) for x in (ids or []) if x is not None}
             deleted = {str(x) for x in (labels_data.get("deleted_ids") or []) if x is not None}
         else:
             # Ignore unknown schema versions.

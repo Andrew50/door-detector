@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,8 +20,34 @@ from door_detector.doors.geometry import (
     get_bbox,
     sample_bezier,
 )
+from door_detector.doors.dedupe import bbox_containment, is_duplicate, suppress_duplicates
 from door_detector.perf import enabled as perf_enabled, span as perf_span, log as perf_log
 
+
+def _truthy_env(name: str) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    return s not in ("", "0", "false", "f", "no", "n", "off")
+
+
+def _dedupe_debug_log(enabled: bool, kind: str, **fields: Any) -> None:
+    """Best-effort debug logging for dedupe investigation.
+
+    We avoid relying on logging configuration (Step 2 CLI often has none).
+    """
+    if not enabled:
+        return
+    try:
+        payload = {"kind": str(kind), **fields}
+        s = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        s = str({"kind": kind, **fields})
+    try:
+        sys.stderr.write(f"[door_detector][dedupe] {s}\n")
+    except Exception:
+        return
 
 class SpatialIndex:
     """Simple grid-based spatial index for fast neighborhood searches."""
@@ -2034,9 +2062,35 @@ def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: 
     max_radius_ratio = float(pairing.get("max_radius_ratio", 1.35) or 1.35)
     max_bbox_iou = float(pairing.get("max_bbox_iou", 0.15) or 0.15)
     max_pairs = int(pairing.get("max_pairs", 600) or 600)
+    # Optional volume-control: require both component swings to be reasonably confident
+    # before pairing. When a per-type reweighter is present, it is best to apply this
+    # threshold *after* swing reweighting (see detect_doors pipeline ordering).
+    min_component_conf = float(pairing.get("min_component_confidence", 0.0) or 0.0)
+    # Double-acting doors: allow pairing of two swing candidates that share the same hinge
+    # and leaf tip, but have distinct arc directions (door swings both ways).
+    double_acting = pairing.get("double_acting") if isinstance(pairing, dict) else None
+    acting_enabled = True
+    acting_conf = double_acting if isinstance(double_acting, dict) else {}
+    if isinstance(double_acting, dict) and ("enabled" in double_acting):
+        acting_enabled = bool(double_acting.get("enabled"))
+    max_same_hinge_ratio = float(acting_conf.get("max_same_hinge_dist_ratio", 0.10) or 0.10)
+    max_same_tip_ratio = float(acting_conf.get("max_same_tip_dist_ratio", 0.10) or 0.10)
+    min_arc_dir_sep_deg = float(acting_conf.get("min_arc_dir_separation_deg", 25.0) or 25.0)
 
     w_pair = float(scoring.get("w_pair", 0.40) or 0.40)
     w_avg_conf = float(scoring.get("w_avg_conf", 0.60) or 0.60)
+
+    # IMPORTANT:
+    # Historically this stage was intentionally permissive: it created "double" *candidates*
+    # for many nearby swing pairs and relied on a per-type reweighter to downrank false pairs.
+    #
+    # In practice, the double reweighter file may be missing (common in local/dev setups),
+    # which makes the heuristic score the source of truth for final selection. That can
+    # cause false positives: two nearby but unrelated swings get promoted to "double".
+    #
+    # So we keep candidate generation broad (to preserve snapping/debugging + test coverage),
+    # but make confidence depend strongly on "double-likeness" geometry (hinge/tip alignment),
+    # so unrelated nearby swings produce low-confidence double candidates.
 
     out: List[Dict[str, Any]] = []
     n = len(swing_candidates)
@@ -2048,11 +2102,36 @@ def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: 
     swings.sort(key=lambda c: float(c.get("confidence", 0.0) or 0.0), reverse=True)
     swings = swings[: min(len(swings), 500)]
 
+    def _pt(v: Any) -> Optional[Tuple[float, float]]:
+        try:
+            if not (isinstance(v, list) and len(v) == 2):
+                return None
+            x, y = float(v[0]), float(v[1])
+            if not (math.isfinite(x) and math.isfinite(y)):
+                return None
+            return (x, y)
+        except Exception:
+            return None
+
+    def _unit(vx: float, vy: float) -> Optional[Tuple[float, float]]:
+        try:
+            n2 = float(vx * vx + vy * vy)
+            if not (n2 > 1e-9):
+                return None
+            n = math.sqrt(n2)
+            return (vx / n, vy / n)
+        except Exception:
+            return None
+
     for i in range(len(swings)):
         a = swings[i]
         a_id = a.get("id")
         if a_id is None:
             continue
+        try:
+            a_conf = float(a.get("confidence", a.get("heuristic_confidence", 0.0)) or 0.0)
+        except Exception:
+            a_conf = 0.0
         a_geom = (a.get("geom") or {}) if isinstance(a.get("geom"), dict) else {}
         bba = _normalize_bbox_xyxy(a.get("bbox_xyxy"))
         if bba is None:
@@ -2062,6 +2141,8 @@ def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: 
             ax, ay = float(ca[0]), float(ca[1])
         except Exception:
             continue
+        ha = _pt(a_geom.get("hinge_xy")) or (ax, ay)
+        ta = _pt(a_geom.get("tip_xy"))
         ra = float((a.get("features") or {}).get("radius", 0.0) or 0.0)
         if not (ra > 0):
             continue
@@ -2071,6 +2152,10 @@ def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: 
             b_id = b.get("id")
             if b_id is None:
                 continue
+            try:
+                b_conf = float(b.get("confidence", b.get("heuristic_confidence", 0.0)) or 0.0)
+            except Exception:
+                b_conf = 0.0
             b_geom = (b.get("geom") or {}) if isinstance(b.get("geom"), dict) else {}
             bbb = _normalize_bbox_xyxy(b.get("bbox_xyxy"))
             if bbb is None:
@@ -2080,6 +2165,8 @@ def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: 
                 bx, by = float(cb[0]), float(cb[1])
             except Exception:
                 continue
+            hb = _pt(b_geom.get("hinge_xy")) or (bx, by)
+            tb = _pt(b_geom.get("tip_xy"))
             rb = float((b.get("features") or {}).get("radius", 0.0) or 0.0)
             if not (rb > 0):
                 continue
@@ -2093,14 +2180,164 @@ def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: 
             if center_dist > (max_center_dist_ratio * rmax):
                 continue
 
-            if compute_iou(bba, bbb) > max_bbox_iou:
+            bbox_iou = float(compute_iou(bba, bbb))
+            if bbox_iou > max_bbox_iou:
+                # Normally we skip high-overlap swing pairs as duplicates. However, a common
+                # door symbol is "double-acting" (one leaf swings both directions), which
+                # yields two swing candidates with the *same* hinge+tip but different arcs.
+                if not acting_enabled:
+                    continue
+                # Require hinge+tip consistency (same leaf).
+                try:
+                    hinge_dist = float(math.hypot(ha[0] - hb[0], ha[1] - hb[1]))
+                except Exception:
+                    hinge_dist = float("inf")
+                tip_dist = None
+                if ta is not None and tb is not None:
+                    try:
+                        tip_dist = float(math.hypot(ta[0] - tb[0], ta[1] - tb[1]))
+                    except Exception:
+                        tip_dist = None
+                if not (math.isfinite(hinge_dist) and hinge_dist <= max_same_hinge_ratio * float(rmax)):
+                    continue
+                if tip_dist is None or not (tip_dist <= max_same_tip_ratio * float(rmax)):
+                    continue
+
+                # Require distinct arc directions (avoid pairing true duplicates).
+                try:
+                    a_eps = (a_geom.get("arc_endpoints_xy") or []) if isinstance(a_geom, dict) else []
+                    b_eps = (b_geom.get("arc_endpoints_xy") or []) if isinstance(b_geom, dict) else []
+                    if not (isinstance(a_eps, list) and len(a_eps) == 2 and isinstance(b_eps, list) and len(b_eps) == 2):
+                        continue
+                    acx, acy = float(ax), float(ay)
+                    # Average endpoint directions (unit vectors) to get a coarse arc "mid direction".
+                    def _arc_dir(endpoints):
+                        (x0, y0), (x1, y1) = endpoints
+                        u0 = _unit(float(x0) - acx, float(y0) - acy)
+                        u1 = _unit(float(x1) - acx, float(y1) - acy)
+                        if u0 is None or u1 is None:
+                            return None
+                        ux, uy = (u0[0] + u1[0], u0[1] + u1[1])
+                        u = _unit(ux, uy)
+                        return u
+                    uda = _arc_dir(a_eps)
+                    udb = _arc_dir(b_eps)
+                    if uda is None or udb is None:
+                        continue
+                    dot = max(-1.0, min(1.0, float(uda[0] * udb[0] + uda[1] * udb[1])))
+                    sep_deg = float(math.degrees(math.acos(dot)))
+                except Exception:
+                    continue
+                if not (sep_deg >= min_arc_dir_sep_deg):
+                    continue
+
+                # Build a "double" candidate representing a double-acting door.
+                union = _bbox_union(bba, bbb)
+                avg_conf = 0.5 * (float(a_conf) + float(b_conf))
+                # Score from arc separation + tip/hinge agreement.
+                sep_score = max(0.0, min(1.0, (sep_deg - min_arc_dir_sep_deg) / max(1e-6, (90.0 - min_arc_dir_sep_deg))))
+                tip_score = 1.0 - (float(tip_dist) / max(1e-6, max_same_tip_ratio * float(rmax)))
+                tip_score = max(0.0, min(1.0, float(tip_score)))
+                hinge_score = 1.0 - (float(hinge_dist) / max(1e-6, max_same_hinge_ratio * float(rmax)))
+                hinge_score = max(0.0, min(1.0, float(hinge_score)))
+                pair_score = max(0.0, min(1.0, 0.55 * float(sep_score) + 0.25 * float(tip_score) + 0.20 * float(hinge_score)))
+                conf_pair = (w_pair * pair_score + w_avg_conf * avg_conf)
+                conf_pair = max(0.0, min(1.0, float(conf_pair)))
+
+                cid = _stable_double_candidate_id(swing_ids=(str(a_id), str(b_id)), bbox_xyxy=union, quant_step_px=1.0)
+                out.append(
+                    {
+                        "id": cid,
+                        "legacy_ids": [],
+                        "type": "double",
+                        "bbox_xyxy": union,
+                        "components": {"swing_ids": sorted([str(a_id), str(b_id)])},
+                        "heuristic_confidence": float(conf_pair),
+                        "confidence": float(conf_pair),
+                        "pool": True,
+                        "features": {
+                            "double_acting": 1.0,
+                            "center_dist": float(center_dist),
+                            "radius_ratio": float(rmax / rmin),
+                            "avg_swing_conf": float(avg_conf),
+                            "pair_score": float(pair_score),
+                            "bbox_iou": float(bbox_iou),
+                            "hinge_dist": float(hinge_dist),
+                            "tip_dist": float(tip_dist),
+                            "arc_dir_sep_deg": float(sep_deg),
+                        },
+                    }
+                )
                 continue
 
             union = _bbox_union(bba, bbb)
-            pair_score = 1.0 - (center_dist / max(1e-6, (max_center_dist_ratio * rmax)))
+
+            # --- "double-likeness" geometry scoring ---
+            #
+            # Two unrelated nearby doors often pass the center/radius gates above.
+            # Double doors, however, have an extra structure:
+            # - each leaf's hinge-to-tip direction points toward the *other* hinge (meeting stile)
+            # - the two tips are close to each other (meet in the middle)
+            #
+            # We compute a bounded score in [0,1] and later use it to *gate* confidence
+            # (multiply), so high-confidence swings cannot produce a high-confidence double
+            # unless geometry is double-like.
+            hinge_dist = float(math.hypot(ha[0] - hb[0], ha[1] - hb[1]))
+            sum_r = float(ra + rb)
+            hinge_ratio = (hinge_dist / max(1e-6, sum_r)) if sum_r > 0 else 0.0
+            # Prefer hinge_dist ~= (ra+rb), tolerate moderate mismatch.
+            hinge_tol = 0.40
+            hinge_sep_score = 1.0 - (abs(hinge_ratio - 1.0) / max(1e-6, hinge_tol))
+            hinge_sep_score = max(0.0, min(1.0, float(hinge_sep_score)))
+
+            # Leaf direction alignment: va should point from ha toward hb, vb from hb toward ha.
+            ux = hb[0] - ha[0]
+            uy = hb[1] - ha[1]
+            uu = _unit(ux, uy)
+            axis_score = 0.0
+            cos_a = 0.0
+            cos_b = 0.0
+            if uu is not None and ta is not None and tb is not None:
+                uux, uuy = uu
+                vax, vay = (ta[0] - ha[0]), (ta[1] - ha[1])
+                vbx, vby = (tb[0] - hb[0]), (tb[1] - hb[1])
+                va_u = _unit(vax, vay)
+                vb_u = _unit(vbx, vby)
+                if va_u is not None and vb_u is not None:
+                    vaxu, vayu = va_u
+                    vbxu, vbyu = vb_u
+                    # Clamp to [0,1] by requiring "toward the other hinge".
+                    cos_a = max(0.0, min(1.0, float(vaxu * uux + vayu * uuy)))
+                    cos_b = max(0.0, min(1.0, float(vbxu * (-uux) + vbyu * (-uuy))))
+                    axis_score = 0.5 * (cos_a + cos_b)
+            axis_score = max(0.0, min(1.0, float(axis_score)))
+
+            # Tips should be near each other relative to hinge separation (meeting stile).
+            tip_score = 0.0
+            tip_dist = None
+            tip_ratio = None
+            if ta is not None and tb is not None:
+                tip_dist = float(math.hypot(ta[0] - tb[0], ta[1] - tb[1]))
+                tip_ratio = float(tip_dist / max(1e-6, hinge_dist))
+                # If tips are within ~40% of hinge separation, score grows to 1.
+                tip_meet_max = 0.40
+                tip_score = 1.0 - (float(tip_ratio) / max(1e-6, tip_meet_max))
+                tip_score = max(0.0, min(1.0, float(tip_score)))
+
+            # Coarse proximity still matters (keeps very far pairs low even if geometry is noisy).
+            prox_score = 1.0 - (center_dist / max(1e-6, (max_center_dist_ratio * rmax)))
+            prox_score = max(0.0, min(1.0, float(prox_score)))
+
+            # Composite double-likeness score.
+            pair_score = 0.45 * float(axis_score) + 0.35 * float(tip_score) + 0.15 * float(hinge_sep_score) + 0.05 * float(prox_score)
             pair_score = max(0.0, min(1.0, float(pair_score)))
             avg_conf = 0.5 * (float(a.get("confidence", 0.0) or 0.0) + float(b.get("confidence", 0.0) or 0.0))
-            conf_pair = w_pair * pair_score + w_avg_conf * avg_conf
+            # Optional: require both component swings to be reasonably confident before
+            # creating a double-leaf candidate (volume control). This is intentionally
+            # NOT applied to double-acting pairing above.
+            if min_component_conf > 0.0 and (float(a_conf) < min_component_conf or float(b_conf) < min_component_conf):
+                continue
+            conf_pair = (w_pair * pair_score + w_avg_conf * avg_conf) * pair_score
             conf_pair = max(0.0, min(1.0, float(conf_pair)))
 
             cid = _stable_double_candidate_id(swing_ids=(str(a_id), str(b_id)), bbox_xyxy=union, quant_step_px=1.0)
@@ -2119,6 +2356,15 @@ def detect_double_candidates(*, swing_candidates: List[Dict[str, Any]], config: 
                         "radius_ratio": float(rmax / rmin),
                         "avg_swing_conf": float(avg_conf),
                         "pair_score": float(pair_score),
+                        "hinge_dist": float(hinge_dist),
+                        "hinge_dist_over_sum_r": float(hinge_ratio),
+                        "leaf_axis_cos_a": float(cos_a),
+                        "leaf_axis_cos_b": float(cos_b),
+                        "axis_score": float(axis_score),
+                        "tip_dist": float(tip_dist) if tip_dist is not None else 0.0,
+                        "tip_dist_over_hinge_dist": float(tip_ratio) if tip_ratio is not None else 0.0,
+                        "tip_score": float(tip_score),
+                        "prox_score": float(prox_score),
                     },
                 }
             )
@@ -2405,6 +2651,75 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
         ]
         line_index.add(i, bbox)
 
+    # Output thresholds (used for final selection and candidate export).
+    out_conf = config.get("output", {}) or {}
+    legacy_min_conf = float(out_conf.get("min_confidence", 0.55) or 0.55)
+    min_candidate_conf = float(out_conf.get("min_candidate_confidence", 0.0) or 0.0)
+    min_keep_conf = float(out_conf.get("min_confidence_after_reweight", legacy_min_conf) or legacy_min_conf)
+    max_candidates_out = int(out_conf.get("max_candidates", 5000) or 5000)
+    max_candidates_before_nms = out_conf.get("max_candidates_before_nms", None)
+    try:
+        max_candidates_before_nms_int: Optional[int] = int(max_candidates_before_nms) if max_candidates_before_nms is not None else None
+    except Exception:
+        max_candidates_before_nms_int = None
+
+    nms_iou = float(out_conf.get("nms_iou", 0.35) or 0.35)
+    max_doors = int(out_conf.get("max_doors", 500) or 500)
+    dedupe_conf = out_conf.get("dedupe") if isinstance(out_conf.get("dedupe"), dict) else {}
+    dedupe_enabled = bool(dedupe_conf.get("enabled", False)) if isinstance(dedupe_conf, dict) else False
+    dedupe_debug = bool(dedupe_conf.get("debug_log", False)) or _truthy_env("DOOR_DETECTOR_DEDUPE_DEBUG")
+    dedupe_debug_blob: Dict[str, Any] = {
+        "dedupe_enabled": bool(dedupe_enabled),
+        "dedupe_debug": bool(dedupe_debug),
+        "pool": {},
+        "final": {},
+        "remaining_overlaps": [],
+        "note": "Enable output.dedupe.debug_log=true (or env DOOR_DETECTOR_DEDUPE_DEBUG=1) for detailed pair dumps.",
+    }
+
+    _dedupe_debug_log(
+        dedupe_debug,
+        "dedupe.config",
+        file_id=str(meta.get("id") or ""),
+        mode=str(meta.get("mode") or ""),
+        dedupe_enabled=bool(dedupe_enabled),
+        dedupe_conf={k: v for k, v in (dedupe_conf or {}).items() if k not in ("swing", "swing_arc")},
+        swing_conf=(dedupe_conf.get("swing") if isinstance(dedupe_conf.get("swing"), dict) else {}),
+        swing_arc_conf=(dedupe_conf.get("swing_arc") if isinstance(dedupe_conf.get("swing_arc"), dict) else {}),
+    )
+
+    # Per-type reweighters (preferred) + backward compatibility with single `reweighter_path`.
+    #
+    # IMPORTANT ordering detail:
+    # The double reweighter frequently uses `avg_swing_conf` as a key feature.
+    # So we resolve models early and apply the swing reweighter *before* generating
+    # double candidates, ensuring double features are computed from calibrated swings.
+    base_dirs = _door_detector_base_dirs_from_config(config)
+    model_paths_by_type: Dict[str, str] = {}
+    cfg_reweighters = config.get("reweighters")
+    if isinstance(cfg_reweighters, dict):
+        for k, v in cfg_reweighters.items():
+            if not (isinstance(v, str) and v.strip()):
+                continue
+            t = str(k).strip().lower()
+            resolved = _resolve_existing_path(v, base_dirs=base_dirs)
+            if resolved:
+                model_paths_by_type[t] = resolved
+    legacy_model_path = config.get("reweighter_path")
+    if isinstance(legacy_model_path, str) and legacy_model_path.strip():
+        resolved = _resolve_existing_path(legacy_model_path, base_dirs=base_dirs)
+        if resolved:
+            model_paths_by_type.setdefault("swing", resolved)
+    if not model_paths_by_type:
+        for t in ("swing", "double", "pocket", "bifold"):
+            resolved = _resolve_existing_path(f"models/reweighter_{t}_v1.json", base_dirs=base_dirs)
+            if resolved:
+                model_paths_by_type[t] = resolved
+        legacy = _resolve_existing_path("models/reweighter_v1.json", base_dirs=base_dirs)
+        if legacy:
+            model_paths_by_type.setdefault("swing", legacy)
+    has_any_model = bool(model_paths_by_type)
+
     strict_candidates_all: List[Dict[str, Any]] = []
     candidate_pool_all: List[Dict[str, Any]] = []
 
@@ -2413,6 +2728,17 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     # This is important because many PDFs approximate arcs as polylines (line chains).
     if bool((config.get("swing") or {}).get("enabled")) and (beziers or lines):
         strict_swing, pool_swing = detect_swing_candidates(lines=lines, beziers=beziers, line_index=line_index, config=config)
+        # If a swing reweighter exists, apply it now so downstream pairing logic
+        # (especially double pairing) uses calibrated swing confidences.
+        if has_any_model and model_paths_by_type.get("swing"):
+            try:
+                apply_reweighter(strict_swing, model_paths_by_type["swing"])
+            except Exception:
+                pass
+            try:
+                apply_reweighter(pool_swing, model_paths_by_type["swing"])
+            except Exception:
+                pass
         strict_candidates_all.extend(strict_swing)
         candidate_pool_all.extend(pool_swing)
         # Optional: leaf-only swing candidates (for cases where the leaf is vector but the arc is missing/raster).
@@ -2429,6 +2755,13 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     # --- Double (pair swing candidates) ---
     if bool((config.get("double") or {}).get("enabled")) and candidate_pool_all:
         double_cands = detect_double_candidates(swing_candidates=[c for c in candidate_pool_all if c.get("type") == "swing"], config=config)
+        # Apply the double reweighter immediately so candidate export + final selection
+        # operate on calibrated "double" confidence.
+        if has_any_model and model_paths_by_type.get("double"):
+            try:
+                apply_reweighter(double_cands, model_paths_by_type["double"])
+            except Exception:
+                pass
         # For now, treat these as both pool + strict (no strict-vs-pool distinction).
         strict_candidates_all.extend(double_cands)
         candidate_pool_all.extend(double_cands)
@@ -2436,66 +2769,24 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     # --- Pocket (dashed tracks) ---
     if bool((config.get("pocket") or {}).get("enabled")) and lines:
         pocket_cands = detect_pocket_candidates(lines=lines, config=config)
+        if has_any_model and model_paths_by_type.get("pocket"):
+            try:
+                apply_reweighter(pocket_cands, model_paths_by_type["pocket"])
+            except Exception:
+                pass
         strict_candidates_all.extend(pocket_cands)
         candidate_pool_all.extend(pocket_cands)
 
     # --- Bi-fold (zig-zag chains) ---
     if bool((config.get("bifold") or {}).get("enabled")) and lines:
         bifold_cands = detect_bifold_candidates(lines=lines, config=config)
+        if has_any_model and model_paths_by_type.get("bifold"):
+            try:
+                apply_reweighter(bifold_cands, model_paths_by_type["bifold"])
+            except Exception:
+                pass
         strict_candidates_all.extend(bifold_cands)
         candidate_pool_all.extend(bifold_cands)
-
-    out_conf = config.get("output", {}) or {}
-    legacy_min_conf = float(out_conf.get("min_confidence", 0.55) or 0.55)
-    min_candidate_conf = float(out_conf.get("min_candidate_confidence", 0.0) or 0.0)
-    min_keep_conf = float(out_conf.get("min_confidence_after_reweight", legacy_min_conf) or legacy_min_conf)
-    max_candidates_out = int(out_conf.get("max_candidates", 5000) or 5000)
-    max_candidates_before_nms = out_conf.get("max_candidates_before_nms", None)
-    try:
-        max_candidates_before_nms_int: Optional[int] = int(max_candidates_before_nms) if max_candidates_before_nms is not None else None
-    except Exception:
-        max_candidates_before_nms_int = None
-
-    nms_iou = float(out_conf.get("nms_iou", 0.35) or 0.35)
-    max_doors = int(out_conf.get("max_doors", 500) or 500)
-
-    # Per-type reweighters (preferred) + backward compatibility with single `reweighter_path`.
-    base_dirs = _door_detector_base_dirs_from_config(config)
-
-    model_paths_by_type: Dict[str, str] = {}
-    cfg_reweighters = config.get("reweighters")
-    if isinstance(cfg_reweighters, dict):
-        for k, v in cfg_reweighters.items():
-            if not (isinstance(v, str) and v.strip()):
-                continue
-            t = str(k).strip().lower()
-            resolved = _resolve_existing_path(v, base_dirs=base_dirs)
-            if resolved:
-                model_paths_by_type[t] = resolved
-
-    # Backward compatibility: single model path is treated as swing reweighter.
-    legacy_model_path = config.get("reweighter_path")
-    if isinstance(legacy_model_path, str) and legacy_model_path.strip():
-        resolved = _resolve_existing_path(legacy_model_path, base_dirs=base_dirs)
-        if resolved:
-            model_paths_by_type.setdefault("swing", resolved)
-
-    # If config didn't specify any usable models, auto-discover default per-type files.
-    if not model_paths_by_type:
-        for t in ("swing", "double", "pocket", "bifold"):
-            resolved = _resolve_existing_path(f"models/reweighter_{t}_v1.json", base_dirs=base_dirs)
-            if resolved:
-                model_paths_by_type[t] = resolved
-        # Legacy single-file convention.
-        legacy = _resolve_existing_path("models/reweighter_v1.json", base_dirs=base_dirs)
-        if legacy:
-            model_paths_by_type.setdefault("swing", legacy)
-
-    has_any_model = bool(model_paths_by_type)
-
-    if has_any_model:
-        strict_candidates_all = apply_reweighters_by_type(strict_candidates_all, model_paths_by_type=model_paths_by_type)
-        candidate_pool_all = apply_reweighters_by_type(candidate_pool_all, model_paths_by_type=model_paths_by_type)
 
     # Deduplicate candidate pool by stable id (keep highest-confidence record).
     # This matters for snapping (UI pool transport) and prevents duplicates from
@@ -2512,6 +2803,31 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
                 by_id[sid] = c
         if by_id:
             candidate_pool_all = list(by_id.values())
+
+    # Deduplicate by near-duplicate geometry (IoU + containment + keypoints) if enabled.
+    # This reduces candidate crowding for snapping/review without collapsing adjacent doors.
+    if dedupe_enabled and candidate_pool_all:
+        pool_before = int(len(candidate_pool_all))
+        try:
+            candidate_pool_all, _dup_map = suppress_duplicates(candidate_pool_all, dedupe_conf)
+            dedupe_debug_blob["pool"] = {
+                "before": pool_before,
+                "after": int(len(candidate_pool_all)),
+                "suppressed": int(max(0, pool_before - int(len(candidate_pool_all)))),
+            }
+            _dedupe_debug_log(
+                dedupe_debug,
+                "dedupe.pool",
+                file_id=str(meta.get("id") or ""),
+                before=pool_before,
+                after=int(len(candidate_pool_all)),
+                suppressed=int(max(0, pool_before - int(len(candidate_pool_all)))),
+                dup_map_sample=dict(list(_dup_map.items())[:10]) if isinstance(_dup_map, dict) else {},
+            )
+        except Exception:
+            # Safety: never fail detection due to dedupe bugs.
+            _dedupe_debug_log(dedupe_debug, "dedupe.pool.error", file_id=str(meta.get("id") or ""))
+            pass
 
     # Always export candidates (for snapping/training), sorted by current confidence.
     candidate_pool_all.sort(key=lambda x: float(x.get("confidence", 0.0) or 0.0), reverse=True)
@@ -2566,23 +2882,162 @@ def detect_doors(primitives: Dict[str, Any], meta: Dict[str, Any], config: Dict[
     if not kept:
         return {"doors": [], "candidates": exported_candidates}
 
-    # NMS on kept candidates, highest confidence first.
-    final: List[Dict[str, Any]] = []
-    for cand in kept:
-        cb = cand.get("bbox_xyxy")
-        if not isinstance(cb, list) or len(cb) != 4:
-            continue
-        overlap = False
-        for prev in final:
-            if compute_iou(cb, prev["bbox_xyxy"]) > nms_iou:
-                overlap = True
+    # Final duplicate suppression:
+    # Replace IoU-only NMS with a stricter "same-door" duplicate predicate (IoU + containment
+    # + type-specific keypoints). This avoids collapsing adjacent doors while still removing
+    # bbox/geometry variants of the same door.
+    if dedupe_enabled:
+        try:
+            kept_before = int(len(kept))
+            final, _dup_map = suppress_duplicates(kept, dedupe_conf)
+            dedupe_debug_blob["final"] = {
+                "before": kept_before,
+                "after": int(len(final)),
+                "suppressed": int(max(0, kept_before - int(len(final)))),
+            }
+            _dedupe_debug_log(
+                dedupe_debug,
+                "dedupe.final",
+                file_id=str(meta.get("id") or ""),
+                before=kept_before,
+                after=int(len(final)),
+                suppressed=int(max(0, kept_before - int(len(final)))),
+                dup_map_sample=dict(list(_dup_map.items())[:10]) if isinstance(_dup_map, dict) else {},
+            )
+        except Exception:
+            final = list(kept)
+            _dedupe_debug_log(dedupe_debug, "dedupe.final.error", file_id=str(meta.get("id") or ""))
+        final = final[: max(0, max_doors)]
+    else:
+        # Backward-compat fallback: IoU-only NMS (older configs/tests may rely on this).
+        final = []
+        for cand in kept:
+            cb = cand.get("bbox_xyxy")
+            if not isinstance(cb, list) or len(cb) != 4:
+                continue
+            overlap = False
+            for prev in final:
+                if compute_iou(cb, prev["bbox_xyxy"]) > nms_iou:
+                    overlap = True
+                    break
+            if not overlap:
+                final.append(cand)
+            if len(final) >= max_doors:
                 break
-        if not overlap:
-            final.append(cand)
-        if len(final) >= max_doors:
-            break
 
-    return {"doors": final, "candidates": exported_candidates}
+    # Post-check: report any *remaining* high-overlap pairs in final doors.
+    # This helps diagnose why duplicates still appear.
+    try:
+        debug_iou = float(dedupe_conf.get("debug_overlap_min_iou", 0.70) or 0.70)
+        debug_contain = float(dedupe_conf.get("debug_overlap_min_contain", 0.92) or 0.92)
+        debug_max_pairs = int(dedupe_conf.get("debug_overlap_max_pairs", 12) or 12)
+    except Exception:
+        debug_iou, debug_contain, debug_max_pairs = 0.70, 0.92, 12
+
+    overlaps: List[Dict[str, Any]] = []
+    if final and (dedupe_debug or dedupe_enabled):
+        for i in range(len(final)):
+            a = final[i]
+            bba = a.get("bbox_xyxy")
+            if not (isinstance(bba, list) and len(bba) == 4):
+                continue
+            for j in range(i + 1, len(final)):
+                b = final[j]
+                bbb = b.get("bbox_xyxy")
+                if not (isinstance(bbb, list) and len(bbb) == 4):
+                    continue
+                iou = float(compute_iou(bba, bbb))
+                if iou < debug_iou:
+                    # containment can catch big/small bbox variants
+                    try:
+                        contain = float(bbox_containment(bba, bbb))
+                    except Exception:
+                        contain = 0.0
+                    if contain < debug_contain:
+                        continue
+                else:
+                    try:
+                        contain = float(bbox_containment(bba, bbb))
+                    except Exception:
+                        contain = 0.0
+                overlaps.append(
+                    {
+                        "iou": float(iou),
+                        "contain": float(contain),
+                        "a": {"id": str(a.get("id") or ""), "type": str(a.get("type") or ""), "conf": float(a.get("confidence", 0.0) or 0.0)},
+                        "b": {"id": str(b.get("id") or ""), "type": str(b.get("type") or ""), "conf": float(b.get("confidence", 0.0) or 0.0)},
+                    }
+                )
+                if len(overlaps) >= max(50, debug_max_pairs * 4):
+                    break
+            if len(overlaps) >= max(50, debug_max_pairs * 4):
+                break
+
+    if overlaps:
+        overlaps.sort(key=lambda r: (-(float(r.get("iou", 0.0) or 0.0)), -(float(r.get("contain", 0.0) or 0.0))))
+        overlaps = overlaps[: max(1, debug_max_pairs)]
+        try:
+            dedupe_debug_blob["remaining_overlaps"] = overlaps
+        except Exception:
+            pass
+        # If we have remaining overlaps with dedupe enabled, emit at least a summary even
+        # when debug logging is off (so users know to enable it).
+        _dedupe_debug_log(
+            dedupe_debug or dedupe_enabled,
+            "dedupe.remaining_overlaps",
+            file_id=str(meta.get("id") or ""),
+            overlaps=overlaps,
+            note="Set output.dedupe.debug_log=true (or env DOOR_DETECTOR_DEDUPE_DEBUG=1) for more detail.",
+        )
+
+        # Detailed analysis (only when debug is on): run the predicate and dump key geom.
+        if dedupe_debug:
+            for rec in overlaps:
+                aid = str((rec.get("a") or {}).get("id") or "")
+                bid = str((rec.get("b") or {}).get("id") or "")
+                a_obj = next((x for x in final if str(x.get("id") or "") == aid), None)
+                b_obj = next((x for x in final if str(x.get("id") or "") == bid), None)
+                if not (isinstance(a_obj, dict) and isinstance(b_obj, dict)):
+                    continue
+                try:
+                    ab = a_obj.get("bbox_xyxy")
+                    bb = b_obj.get("bbox_xyxy")
+                    pred_ab = bool(is_duplicate(a_obj, b_obj, dedupe_conf))
+                    pred_ba = bool(is_duplicate(b_obj, a_obj, dedupe_conf))
+                except Exception:
+                    ab, bb, pred_ab, pred_ba = a_obj.get("bbox_xyxy"), b_obj.get("bbox_xyxy"), False, False
+                _dedupe_debug_log(
+                    True,
+                    "dedupe.overlap_pair",
+                    file_id=str(meta.get("id") or ""),
+                    iou=float(rec.get("iou", 0.0) or 0.0),
+                    contain=float(rec.get("contain", 0.0) or 0.0),
+                    a_id=aid,
+                    a_type=str(a_obj.get("type") or ""),
+                    a_conf=float(a_obj.get("confidence", 0.0) or 0.0),
+                    a_bbox=ab,
+                    a_geom=(a_obj.get("geom") if isinstance(a_obj.get("geom"), dict) else {}),
+                    a_feat=(a_obj.get("features") if isinstance(a_obj.get("features"), dict) else {}),
+                    b_id=bid,
+                    b_type=str(b_obj.get("type") or ""),
+                    b_conf=float(b_obj.get("confidence", 0.0) or 0.0),
+                    b_bbox=bb,
+                    b_geom=(b_obj.get("geom") if isinstance(b_obj.get("geom"), dict) else {}),
+                    b_feat=(b_obj.get("features") if isinstance(b_obj.get("features"), dict) else {}),
+                    pred_a_to_b=bool(pred_ab),
+                    pred_b_to_a=bool(pred_ba),
+                )
+
+    out = {"doors": final, "candidates": exported_candidates}
+    # Make debug discoverable even when stderr is not visible (e.g. Streamlit UI).
+    # Keep it compact: only populate when dedupe debug is enabled OR overlaps were detected.
+    try:
+        has_overlaps = bool(dedupe_debug_blob.get("remaining_overlaps"))
+    except Exception:
+        has_overlaps = False
+    if bool(dedupe_debug) or has_overlaps:
+        out["dedupe_debug"] = dedupe_debug_blob
+    return out
 
 
 def debug_explain_unmatched_box(

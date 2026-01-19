@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "model_type": "logreg",
+  "door_type": "bifold",
+  "feature_order": [
+    "num_segments",
+    "avg_turn_angle_deg",
+    "path_length_px",
+    "compactness"
+  ],
+  "scaler": {
+    "type": "zscore",
+    "mean": [
+      7.457446808510638,
+      48.235486287655476,
+      607.3200022095469,
+      2.9836702774679242
+    ],
+    "std": [
+      0.8336652424878754,
+      21.740557745317517,
+      906.9784739390943,
+      2.2153762377579556
+    ]
+  },
+  "weights": [
+    1.311627002137811,
+    -2.4601200661195315,
+    -0.9973245180996384,
+    0.1780763349105737
+  ],
+  "bias": -2.2931075396687812,
+  "trained_at": "2026-01-19T06:22:16Z",
+  "num_samples": 94,
+  "num_pos": 26,
+  "num_neg": 68,
+  "train_accuracy": 0.9893617021276596,
+  "train_logloss": 0.2614785587618976,
+  "warm_start_used": true,
+  "prior_path": "/home/aj/dev/door_detector/models/reweighter_bifold_v1.json",
+  "reg_lambda": 0.2127659574468085,
+  "reg_lambda_bias": 0.25
+}

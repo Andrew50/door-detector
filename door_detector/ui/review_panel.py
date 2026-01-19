@@ -20,6 +20,7 @@ from door_detector.ui.labels import (
     make_labels_payload_from_fstate,
     save_labels,
 )
+from door_detector.doors.dedupe import is_duplicate
 from door_detector.doors.types import DOOR_TYPES, normalize_door_type
 from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids, ui_event_log
 
@@ -301,13 +302,22 @@ def main_viewer_controls(
         base_confirmed = 0
     base_unconfirmed = max(0, base_total - base_confirmed)
 
-    counts: dict[str, int] = {}
+    # Door-type counts for the filter pills.
+    #
+    # Important: the detector may emit swing-related subtypes like `swing_arc` / `swing_leaf`.
+    # For UI filtering, those should be treated as canonical `swing` (and never appear as
+    # separate filter options).
+    counts: dict[str, int] = {t: 0 for t in DOOR_TYPES}
     for d in visible_items:
-        t = str(d.get("type") or "").strip()
-        if not t:
+        t_norm = normalize_door_type(d.get("type"), default="")
+        if not t_norm:
             continue
-        counts[t] = counts.get(t, 0) + 1
-    type_values = sorted(counts.keys())
+        if t_norm in counts:
+            counts[t_norm] = int(counts.get(t_norm, 0)) + 1
+
+    # Always show the full set of canonical door types (even if count is 0),
+    # so reviewers can quickly switch to Pocket/Bifold.
+    type_values = list(DOOR_TYPES)
     # IMPORTANT: keep filter state separate from the widget key.
     #
     # Using the same key for both the Streamlit widget and our application state caused
@@ -320,14 +330,29 @@ def main_viewer_controls(
     door_filter_state_key = f"_door_detector_door_filter_state_{file_id}"
     door_filter_widget_key = f"door_filter_widget_{file_id}"  # radio widget key
     filter_options = ["All", "Confirmed", "Unconfirmed"] + type_values
+    def _normalize_filter_value(v: Any) -> str:
+        try:
+            s = str(v).strip()
+        except Exception:
+            return "All"
+        sl = s.lower()
+        if sl == "all":
+            return "All"
+        if sl == "confirmed":
+            return "Confirmed"
+        if sl == "unconfirmed":
+            return "Unconfirmed"
+        t = normalize_door_type(s, default="")
+        return t if t else "All"
+
     if door_filter_state_key not in st.session_state:
         try:
-            prev = str(fstate.get("_door_filter") or "")
+            prev = _normalize_filter_value(fstate.get("_door_filter") or "")
         except Exception:
-            prev = ""
+            prev = "All"
         st.session_state[door_filter_state_key] = prev if prev else "All"
     # Initialize widget state from canonical state when needed.
-    canonical_filter = str(st.session_state.get(door_filter_state_key) or "All")
+    canonical_filter = _normalize_filter_value(st.session_state.get(door_filter_state_key) or "All")
     if door_filter_widget_key not in st.session_state:
         st.session_state[door_filter_widget_key] = canonical_filter
     # Preserve the user's filter choice even if its current count becomes 0.
@@ -377,10 +402,11 @@ def main_viewer_controls(
         try:
             st.session_state[f"_door_filter_user_changed_{file_id}"] = True
             v = str(st.session_state.get(door_filter_widget_key) or "All")
-            st.session_state[f"_door_filter_user_value_{file_id}"] = v
+            v_norm = _normalize_filter_value(v)
+            st.session_state[f"_door_filter_user_value_{file_id}"] = v_norm
             # Canonicalize into the app-state key for immediate use at rerun start.
-            st.session_state[door_filter_state_key] = v
-            fstate["_door_filter"] = v
+            st.session_state[door_filter_state_key] = v_norm
+            fstate["_door_filter"] = v_norm
         except Exception:
             return
 
@@ -406,8 +432,9 @@ def main_viewer_controls(
     # This preserves immediate updates on reruns (app.py reads the canonical key).
     try:
         v = str(st.session_state.get(door_filter_widget_key) or "All")
-        st.session_state[door_filter_state_key] = v
-        fstate["_door_filter"] = v
+        v_norm = _normalize_filter_value(v)
+        st.session_state[door_filter_state_key] = v_norm
+        fstate["_door_filter"] = v_norm
     except Exception:
         pass
 
@@ -701,13 +728,13 @@ def right_panel_review(
             st.session_state[idx_key] = 0
 
         # Type dropdown behavior:
-        # - Never show "All types"
+        # - Only show canonical label types (Swing/Double/Pocket/Bifold).
         # - If the user has never interacted with it, DO NOT filter cycling; instead,
-        #   auto-set the dropdown value to match the currently highlighted suggestion's type.
+        #   auto-set the dropdown value to match the currently highlighted suggestion's canonical type.
         # - Once the user selects a type, filter cycling to that type only.
-        types = sorted({str(s.get("type") or "").strip() for s in sugg_all if str(s.get("type") or "").strip()})
-        if not types:
-            types = ["swing"]
+        #
+        # Detector subtypes like `swing_arc` / `swing_leaf` should be treated as `swing`.
+        types = list(DOOR_TYPES)
 
         def _mark_type_touched() -> None:
             try:
@@ -731,20 +758,20 @@ def right_panel_review(
 
         if not touched:
             cur_unfiltered = sugg_all[idx] if sugg_all else {}
-            cur_unfiltered_type = str(cur_unfiltered.get("type") or "").strip()
+            cur_unfiltered_type = normalize_door_type(cur_unfiltered.get("type"), default=types[0])
             if cur_unfiltered_type in types:
                 st.session_state[type_key] = cur_unfiltered_type
-            elif str(st.session_state.get(type_key) or "") not in types:
+            elif normalize_door_type(st.session_state.get(type_key), default="") not in types:
                 st.session_state[type_key] = types[0]
         else:
-            if str(st.session_state.get(type_key) or "") not in types:
+            if normalize_door_type(st.session_state.get(type_key), default="") not in types:
                 st.session_state[type_key] = types[0]
 
-        chosen_type = str(st.session_state.get(type_key) or types[0])
+        chosen_type = normalize_door_type(st.session_state.get(type_key), default=types[0])
 
         use_filter = bool(st.session_state.get(type_touched_key, False))
         if use_filter:
-            filtered = [s for s in sugg_all if str(s.get("type") or "").strip() == str(chosen_type)]
+            filtered = [s for s in sugg_all if normalize_door_type(s.get("type"), default="") == str(chosen_type)]
         else:
             filtered = sugg_all
         if not filtered:
@@ -823,6 +850,69 @@ def right_panel_review(
                     if isinstance(ids, set):
                         ids.discard(cur_id)
 
+            # Auto-hide near-duplicate variants of the confirmed candidate so review
+            # doesn't get cluttered by multiple bbox/geometry versions of the same door.
+            try:
+                # Load config to access output.dedupe thresholds (use doors_data hint when available).
+                config_path = str(doors_data.get("config_path") or _default_config_path_str())
+                cfg = json.loads(Path(config_path).read_bytes())
+                out_conf = (cfg.get("output") or {}) if isinstance(cfg, dict) else {}
+                dedupe_conf = out_conf.get("dedupe") if isinstance(out_conf.get("dedupe"), dict) else {}
+                dedupe_enabled = bool(dedupe_conf.get("enabled", False)) if isinstance(dedupe_conf, dict) else False
+            except Exception:
+                cfg = {}
+                dedupe_conf = {}
+                dedupe_enabled = False
+
+            if dedupe_enabled:
+                try:
+                    candidates_full = list(doors_data.get("candidates", []) or [])
+                except Exception:
+                    candidates_full = []
+                try:
+                    candidates_full.extend(list(working.get("manual_candidates", []) or []))
+                except Exception:
+                    pass
+
+                by_id = {str(c.get("id")): c for c in candidates_full if isinstance(c, dict) and c.get("id") is not None}
+                cur_full = by_id.get(str(cur_id))
+                if isinstance(cur_full, dict):
+                    dup_ids: set[str] = set()
+                    for other in candidates_full:
+                        if not isinstance(other, dict) or other.get("id") is None:
+                            continue
+                        oid = str(other.get("id"))
+                        if not oid or oid == str(cur_id):
+                            continue
+                        try:
+                            if is_duplicate(cur_full, other, dedupe_conf):
+                                dup_ids.add(oid)
+                        except Exception:
+                            continue
+
+                    if dup_ids:
+                        # Hide duplicates via deleted_ids (recoverable) and ensure they are not confirmed.
+                        try:
+                            for did in dup_ids:
+                                working["deleted_ids"].add(str(did))
+                        except Exception:
+                            pass
+                        try:
+                            cbt2 = working.get("confirmed_by_type")
+                            if isinstance(cbt2, dict):
+                                for t in DOOR_TYPES:
+                                    ids = cbt2.get(t)
+                                    if isinstance(ids, set):
+                                        for did in dup_ids:
+                                            ids.discard(str(did))
+                        except Exception:
+                            pass
+                        # Never hide the actual confirmed id.
+                        try:
+                            working["deleted_ids"].discard(str(cur_id))
+                        except Exception:
+                            pass
+
             # Persist immediately and clear proposal.
             save_current_labels(str(file_id), file_dir)
             fstate["_proposal"] = None
@@ -894,7 +984,10 @@ def right_panel_review(
     selected_idx = door_ids.index(current_id) if current_id in door_ids else 0
     selected_door = all_visible[selected_idx]
     did = str(selected_door.get("id") or "")
-    door_type = html.escape(str(selected_door.get("type", "")))
+    door_type_raw = str(selected_door.get("type", "") or "").strip()
+    door_type_norm = normalize_door_type(door_type_raw, default="")
+    door_type_display = (door_type_norm or door_type_raw).capitalize() if (door_type_norm or door_type_raw) else ""
+    door_type = html.escape(door_type_display)
     try:
         conf = float(selected_door.get("confidence", 0.0) or 0.0)
     except Exception:
@@ -1050,6 +1143,29 @@ def right_panel_review(
                 "is_deleted_now": bool(str(did) in set(map(str, deleted_ids))),
             },
         )
+
+        # One-shot persistence probe: store what we *think* the state is after mutation,
+        # then app.py will compare it at the top of the next rerun.
+        if after_mutation:
+            try:
+                st.session_state[f"_door_detector_expected_label_state_{file_id}"] = json.dumps(
+                    {
+                        "action": str(action),
+                        "door_id": str(did),
+                        "ts": time.time(),
+                        "fstate_instance": str(fstate.get("_door_detector_fstate_instance") or ""),
+                        "confirmed_len": int(len(set(map(str, confirmed_ids)))),
+                        "rejected_len": int(len(set(map(str, rejected_ids)))),
+                        "deleted_len": int(len(set(map(str, deleted_ids)))),
+                        "door_in_confirmed": bool(str(did) in set(map(str, confirmed_ids))),
+                        "door_in_hidden": bool(str(did) in (set(map(str, deleted_ids)) | set(map(str, rejected_ids)))),
+                        "edit_mode": bool(fstate.get("edit_mode")),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            except Exception:
+                pass
 
         # Persist the last action so app.py can report what it computed on the next run.
         try:

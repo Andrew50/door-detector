@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from door_detector.doors.types import DOOR_TYPES
+from door_detector.doors.types import DOOR_TYPES, normalize_door_type
 
 
 LABELS_SCHEMA_VERSION = 4
@@ -141,24 +141,28 @@ def coerce_id_set(v: Any) -> set[str]:
 def coerce_confirmed_by_type(v: Any) -> dict[str, set[str]]:
     """Coerce confirmed_by_type into dict[str, set[str]] with stable keys."""
     out: dict[str, set[str]] = {t: set() for t in DOOR_TYPES}
-    if v is None:
+    if v is None or not isinstance(v, dict):
         return out
-    if not isinstance(v, dict):
-        return out
-    for t in DOOR_TYPES:
-        out[t] = coerce_id_set(v.get(t, []))
+
+    # Backwards-compatible: allow legacy/non-canonical keys (e.g. "double doors", "bi-fold").
+    for k, ids in v.items():
+        t_norm = normalize_door_type(k, default="")
+        if t_norm in out:
+            out[t_norm] |= coerce_id_set(ids)
     return out
 
 
 def coerce_rejected_by_type(v: Any) -> dict[str, set[str]]:
     """Coerce rejected_by_type into dict[str, set[str]] with stable keys."""
     out: dict[str, set[str]] = {t: set() for t in DOOR_TYPES}
-    if v is None:
+    if v is None or not isinstance(v, dict):
         return out
-    if not isinstance(v, dict):
-        return out
-    for t in DOOR_TYPES:
-        out[t] = coerce_id_set(v.get(t, []))
+
+    # Backwards-compatible: allow legacy/non-canonical keys (e.g. "double doors", "bi-fold").
+    for k, ids in v.items():
+        t_norm = normalize_door_type(k, default="")
+        if t_norm in out:
+            out[t_norm] |= coerce_id_set(ids)
     return out
 
 
@@ -208,9 +212,8 @@ def migrate_labels_v3_to_v4(labels_v3: Dict[str, Any]) -> Dict[str, Any]:
     those ids as global `deleted_ids` and start with empty `rejected_by_type`.
     """
     deleted_ids = labels_v3.get("deleted_ids", []) if isinstance(labels_v3, dict) else []
-    cbt = labels_v3.get("confirmed_by_type", {}) if isinstance(labels_v3, dict) else {}
-    if not isinstance(cbt, dict):
-        cbt = {}
+    cbt_raw = labels_v3.get("confirmed_by_type", {}) if isinstance(labels_v3, dict) else {}
+    cbt = coerce_confirmed_by_type(cbt_raw)
     return {
         "schema_version": LABELS_SCHEMA_VERSION,
         "reviewed_at": labels_v3.get("reviewed_at", None),
