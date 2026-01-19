@@ -322,6 +322,63 @@ def _manual_overlay_payload_for_pdfjs(
     return {"manual_additions": out_manual, "unmatched_manual_boxes": out_unmatched}
 
 
+def _proposal_overlay_payload_for_pdfjs(
+    *,
+    fstate: Dict[str, Any],
+    pix_to_pdf_affine: Optional[List[float]],
+    cropbox: Dict[str, float],
+) -> Dict[str, Any]:
+    """Return PDF-space proposal overlays for the PDF.js component.
+
+    Proposal state lives in `fstate["_proposal"]` and is used to keep the user's most
+    recent Shift+drag region visible after the Streamlit rerun completes.
+    """
+    prop = fstate.get("_proposal")
+    if not isinstance(prop, dict):
+        return {}
+
+    drawn_pdf = None
+    try:
+        bb = prop.get("drawn_bbox_pdf_xyxy")
+        if isinstance(bb, list) and len(bb) == 4:
+            drawn_pdf = normalize_bbox_xyxy([float(v) for v in bb])
+    except Exception:
+        drawn_pdf = None
+
+    snapped_pdf = None
+    if pix_to_pdf_affine is not None:
+        try:
+            snapped_full = prop.get("snapped_bbox_xyxy")
+            if isinstance(snapped_full, list) and len(snapped_full) == 4:
+                snapped_fitz = apply_affine_bbox_xyxy(pix_to_pdf_affine, normalize_bbox_xyxy(snapped_full))
+                snapped_pdf = fitz_bbox_to_pdfjs_bbox_xyxy(snapped_fitz, cropbox=cropbox)
+        except Exception:
+            snapped_pdf = None
+
+    try:
+        iou = prop.get("iou")
+        iou_f = float(iou) if isinstance(iou, (int, float)) else None
+    except Exception:
+        iou_f = None
+
+    try:
+        sid = prop.get("snapped_candidate_id")
+        sid_s = str(sid) if sid not in (None, "") else ""
+    except Exception:
+        sid_s = ""
+
+    out: Dict[str, Any] = {}
+    if drawn_pdf is not None:
+        out["drawn_bbox_pdf_xyxy"] = drawn_pdf
+    if snapped_pdf is not None:
+        out["snapped_bbox_pdf_xyxy"] = snapped_pdf
+    if sid_s:
+        out["snapped_candidate_id"] = sid_s
+    if iou_f is not None:
+        out["iou"] = iou_f
+    return out
+
+
 def _image_path_to_streamlit_url(image_path: str) -> str:
     """Return a URL (or small data URL fallback) for an on-disk image."""
     p = Path(image_path)
@@ -2263,6 +2320,16 @@ def main_viewer_canvas(
     else:
         manual_payload = {"manual_additions": [], "unmatched_manual_boxes": []}
 
+    # Proposal overlays: keep the most recent Shift+drag visible after reruns.
+    try:
+        proposal_payload = _proposal_overlay_payload_for_pdfjs(
+            fstate=fstate,
+            pix_to_pdf_affine=pix_to_pdf_affine,
+            cropbox={"x0": cropbox_x0, "y0": cropbox_y0, "x1": cropbox_x1, "y1": cropbox_y1},
+        )
+    except Exception:
+        proposal_payload = {}
+
     unmatched_debug_raw = str(fstate.get("_last_unmatched_debug") or "")
     viewer_display = _viewer_display_mode_to_sink_value(str(fstate.get("viewer_display_mode") or "Highlight All"))
     viewer_key = f"pdfjs_viewer_{file_id}"
@@ -2286,6 +2353,7 @@ def main_viewer_canvas(
         viewer_display_mode=str(viewer_display),
         door_state=door_state,
         manual_overlays=manual_payload,
+        proposal_overlays=proposal_payload,
         unmatched_debug_raw=unmatched_debug_raw,
         last_ack_event_id=last_ack,
         key=viewer_key,

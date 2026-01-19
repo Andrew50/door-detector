@@ -71,6 +71,8 @@ def init_file_state(file_id: str, doors_data: Dict, labels_data: Dict) -> None:
             "_edit_draft": None,
             "_edit_manual_confirmed_ids": set(),
             "_last_draw_event_id": None,
+            "_last_draw_suggestions": None,
+            "_proposal": None,
             "_last_viewer_event_id": None,
             "_last_unmatched_debug": None,
             "_focus_seq": 0,
@@ -313,13 +315,6 @@ def _process_draw_event_if_any(
         return
     fstate["_last_draw_event_id"] = str(event_id)
 
-    # JS only emits in edit mode, but guard anyway.
-    if not bool(fstate.get("edit_mode")):
-        return
-
-    _enter_edit_mode(fstate)
-    draft = _get_working_label_state(fstate)
-
     # PDF.js emits bbox_pdf_xyxy in PDF coords; convert PDF → pixel using Step1 transform.
     if not (isinstance(bbox_pdf, list) and len(bbox_pdf) == 4):
         return
@@ -347,7 +342,7 @@ def _process_draw_event_if_any(
     # Candidate pool: detected candidates + any UI-generated manual candidates.
     candidates = list(doors_data.get("candidates", doors_data.get("doors", [])) or [])
     try:
-        candidates.extend(list(draft.get("manual_candidates", []) or []))
+        candidates.extend(list(fstate.get("manual_candidates", []) or []))
     except Exception:
         pass
 
@@ -534,23 +529,32 @@ def _process_draw_event_if_any(
         pass
 
     # If nothing overlaps, create a UI-only manual candidate from the drawn box so
-    # the reviewer can still proceed (snap + confirm) even when detection missed.
+    # the reviewer can still proceed (propose + confirm) even when detection missed.
+    created_manual_candidate_id = ""
     if best is None:
         try:
             cid = _manual_candidate_id_from_bbox(file_id=str(file_id), bbox_xyxy=drawn_full, quant_step_px=1.0)
+            mtype = _preferred_label_type_for_draw(file_id=str(file_id), default="swing")
             manual = {
                 "id": str(cid),
-                "type": "manual_box",
+                # Use the UI's preferred type so downstream controls (label defaults,
+                # typed reject button text, filters) behave consistently for manual boxes.
+                "type": str(mtype),
                 "bbox_xyxy": list(drawn_full),
                 "confidence": 0.0,
                 "heuristic_confidence": 0.0,
                 "pool": True,
                 "features": {},
             }
-            draft.setdefault("manual_candidates", [])
+            fstate.setdefault("manual_candidates", [])
             # Deduplicate by id (keep first).
-            if not any(str(c.get("id") or "") == str(cid) for c in (draft.get("manual_candidates") or []) if isinstance(c, dict)):
-                draft["manual_candidates"].append(manual)
+            if not any(
+                str(c.get("id") or "") == str(cid)
+                for c in (fstate.get("manual_candidates") or [])
+                if isinstance(c, dict)
+            ):
+                fstate["manual_candidates"].append(manual)
+                created_manual_candidate_id = str(cid)
             best = manual
             iou = 1.0
             # Ensure it shows up in Selection matches immediately.
@@ -562,7 +566,7 @@ def _process_draw_event_if_any(
                     0,
                     {
                         "id": str(cid),
-                        "type": "manual_box",
+                        "type": str(mtype),
                         "iou": 1.0,
                         "inter": 0.0,
                         "confidence": 0.0,
@@ -591,49 +595,31 @@ def _process_draw_event_if_any(
                 st.session_state[f"_draw_suggest_idx_{file_id}"] = int(idx)
         except Exception:
             pass
-        snapped_full = _normalize_bbox_xyxy(best.get("bbox_xyxy")) or _normalize_bbox_xyxy(drawn_full) or (0.0, 0.0, 0.0, 0.0)
-        # Manual candidates are "type-less" by design; use the user's last type filter
-        # (if touched) to choose the intended label type.
-        if str(best.get("type") or "") == "manual_box":
-            label_type = _preferred_label_type_for_draw(file_id=str(file_id), default="swing")
-        else:
-            label_type = normalize_door_type(best.get("type"), default="swing")
-        rec = {
-            "drawn_bbox_xyxy": drawn_full,
-            "snapped_candidate_id": cid,
-            "iou": float(iou),
-            "snapped_bbox_xyxy": [float(snapped_full[0]), float(snapped_full[1]), float(snapped_full[2]), float(snapped_full[3])],
-            "label_type": label_type,
-        }
-        draft["manual_additions"].append(rec)
-        # Typed confirmation: ensure the id belongs to exactly one confirmed bucket.
+        snapped_full = (
+            _normalize_bbox_xyxy(best.get("bbox_xyxy"))
+            or _normalize_bbox_xyxy(drawn_full)
+            or (0.0, 0.0, 0.0, 0.0)
+        )
+        # Record proposal state (used for overlays + discard behavior).
         try:
-            cbt = draft.get("confirmed_by_type")
-            if not isinstance(cbt, dict):
-                cbt = {}
-                draft["confirmed_by_type"] = cbt
-            for t, ids in list(cbt.items()):
-                if isinstance(ids, set):
-                    ids.discard(cid)
-            cbt.setdefault(label_type, set()).add(cid)
+            fstate["_proposal"] = {
+                "event_id": str(event_id),
+                "drawn_bbox_xyxy": [float(v) for v in drawn_full],
+                "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf],
+                "snapped_candidate_id": str(cid),
+                "snapped_bbox_xyxy": [
+                    float(snapped_full[0]),
+                    float(snapped_full[1]),
+                    float(snapped_full[2]),
+                    float(snapped_full[3]),
+                ],
+                "iou": float(iou),
+                "created_manual_candidate_id": str(created_manual_candidate_id) if created_manual_candidate_id else "",
+            }
         except Exception:
             pass
-        # A confirmed candidate must not be marked as rejected/deleted.
-        draft["deleted_ids"].discard(cid)
-        try:
-            rbt = draft.get("rejected_by_type")
-            if isinstance(rbt, dict):
-                for t in list(rbt.keys()):
-                    ids = rbt.get(t)
-                    if isinstance(ids, set):
-                        ids.discard(cid)
-        except Exception:
-            pass
-        try:
-            fstate["_edit_manual_confirmed_ids"].add(cid)
-        except Exception:
-            pass
-        # Make the snapped door the current selection.
+
+        # Make the snapped candidate the current selection (but do not label it yet).
         try:
             fstate["selected_door_id"] = cid
             st.session_state[f"jump_{file_id}"] = cid
@@ -642,17 +628,17 @@ def _process_draw_event_if_any(
         except Exception:
             pass
     else:
-        # Persist the unmatched box (in the edit draft only) so it survives reruns.
-        # The viewer will render only the *current edit session* unmatched boxes.
+        # No match (unexpected). Record a proposal so the UI can show the drawn region.
         try:
-            draft.setdefault("unmatched_manual_boxes", [])
-            draft["unmatched_manual_boxes"].append(
-                {
-                    "bbox_xyxy": drawn_full,
-                    "note": "unmatched (no overlapping candidate)",
-                    "event_id": str(event_id),
-                }
-            )
+            fstate["_proposal"] = {
+                "event_id": str(event_id),
+                "drawn_bbox_xyxy": [float(v) for v in drawn_full],
+                "drawn_bbox_pdf_xyxy": [float(v) for v in bbox_pdf],
+                "snapped_candidate_id": "",
+                "snapped_bbox_xyxy": [],
+                "iou": 0.0,
+                "created_manual_candidate_id": "",
+            }
         except Exception:
             pass
         fstate["_last_unmatched_debug"] = _debug_unmatched_region(
@@ -872,15 +858,38 @@ def main() -> None:
                 # Ensure any confirmed snapped candidates are also rendered (even if they were
                 # not in the strict output doors list).
                 try:
-                    extra_ids = flatten_confirmed_ids(working.get("confirmed_by_type", {}))
+                    extra_ids = set(flatten_confirmed_ids(working.get("confirmed_by_type", {})))
                     for rec in list(working.get("manual_additions", [])):
                         cid = rec.get("snapped_candidate_id")
                         if cid:
                             extra_ids.add(str(cid))
 
+                    # Always include any persisted manual candidates (so they can be selected/labeled).
+                    for mc in list(working.get("manual_candidates", []) or []):
+                        if not isinstance(mc, dict):
+                            continue
+                        mid = mc.get("id")
+                        if mid not in (None, ""):
+                            extra_ids.add(str(mid))
+
+                    # Also include the currently proposed candidate (if any), so it is labelable
+                    # even when it is not part of the strict `doors` output list.
+                    try:
+                        prop = fstate.get("_proposal") or {}
+                        if isinstance(prop, dict):
+                            pid = prop.get("snapped_candidate_id")
+                            if pid not in (None, ""):
+                                extra_ids.add(str(pid))
+                    except Exception:
+                        pass
+
                     # If a double candidate was rejected (e.g. it was actually two swings),
                     # reveal its component swing candidates so the reviewer can label them.
                     pool = list(doors_data.get("candidates", []) or [])
+                    try:
+                        pool.extend(list(working.get("manual_candidates", []) or []))
+                    except Exception:
+                        pass
                     pool_map = {str(c.get("id")): c for c in pool if c.get("id") is not None}
                     try:
                         rbt = working.get("rejected_by_type", {})

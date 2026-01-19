@@ -57,7 +57,7 @@ STEP1_SIGNATURE_VERSION = 1
 
 # Bump this when Step 1 logic changes but you don't want to bump the global schema.
 # (Keeps the signature invalidating old artifacts after code changes.)
-STEP1_LOGIC_VERSION = "transform_prerotate_v1"
+STEP1_LOGIC_VERSION = "transform_prerotate_v2"
 
 
 def compute_step1_signature(*, pdf_path: Path, dpi: int, page_index: int) -> Dict[str, Any]:

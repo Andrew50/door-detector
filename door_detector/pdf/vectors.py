@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict
 
 import fitz  # PyMuPDF
+
+
+logger = logging.getLogger("door_detector.step1")
 
 
 def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
@@ -15,6 +19,36 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
     lines = []
     beziers = []
     rects = []
+
+    # IMPORTANT:
+    # PyMuPDF's `page.get_drawings()` returns coordinates in the normalized `page.rect`
+    # coordinate system (typically x0=y0=0), even when the PDF's native page box has
+    # non-zero / negative origins (common in CAD exports).
+    #
+    # Our Step1 transform math is defined in the page's native cropbox coordinate
+    # system (it can have negative x0/y0). To keep the transform + raster aligned,
+    # shift drawing coordinates into cropbox space before downstream transforms.
+    dx = 0.0
+    dy = 0.0
+    try:
+        cb = page.cropbox
+        r = page.rect
+        dx = float(cb.x0) - float(r.x0)
+        dy = float(cb.y0) - float(r.y0)
+    except Exception:
+        dx = 0.0
+        dy = 0.0
+    if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+        try:
+            logger.warning(
+                "get_drawings coord origin differs from cropbox; applying offset dx=%.6f dy=%.6f (rect=%s cropbox=%s)",
+                float(dx),
+                float(dy),
+                str(getattr(page, "rect", None)),
+                str(getattr(page, "cropbox", None)),
+            )
+        except Exception:
+            pass
 
     drawings = page.get_drawings()
 
@@ -66,8 +100,8 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
             item_type = item[0]
 
             if item_type == "l":  # Line segment
-                p0 = {"x": item[1][0], "y": item[1][1]}
-                p1 = {"x": item[2][0], "y": item[2][1]}
+                p0 = {"x": float(item[1][0]) + dx, "y": float(item[1][1]) + dy}
+                p1 = {"x": float(item[2][0]) + dx, "y": float(item[2][1]) + dy}
                 lines.append(
                     {
                         "p0": p0,
@@ -80,10 +114,10 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
                 )
 
             elif item_type == "c":  # Cubic Bezier curve
-                p0 = {"x": item[1][0], "y": item[1][1]}
-                p1 = {"x": item[2][0], "y": item[2][1]}
-                p2 = {"x": item[3][0], "y": item[3][1]}
-                p3 = {"x": item[4][0], "y": item[4][1]}
+                p0 = {"x": float(item[1][0]) + dx, "y": float(item[1][1]) + dy}
+                p1 = {"x": float(item[2][0]) + dx, "y": float(item[2][1]) + dy}
+                p2 = {"x": float(item[3][0]) + dx, "y": float(item[3][1]) + dy}
+                p3 = {"x": float(item[4][0]) + dx, "y": float(item[4][1]) + dy}
                 beziers.append(
                     {
                         "p0": p0,
@@ -99,10 +133,10 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
 
             elif item_type == "re":  # Rectangle
                 rect_coords = item[1]
-                x0 = min(rect_coords[0], rect_coords[2])
-                y0 = min(rect_coords[1], rect_coords[3])
-                x1 = max(rect_coords[0], rect_coords[2])
-                y1 = max(rect_coords[1], rect_coords[3])
+                x0 = min(float(rect_coords[0]), float(rect_coords[2])) + dx
+                y0 = min(float(rect_coords[1]), float(rect_coords[3])) + dy
+                x1 = max(float(rect_coords[0]), float(rect_coords[2])) + dx
+                y1 = max(float(rect_coords[1]), float(rect_coords[3])) + dy
 
                 rects.append(
                     {
@@ -126,6 +160,8 @@ def extract_primitives(page: fitz.Page) -> Dict[str, Any]:
             "num_rects": len(rects),
             "num_drawings": len(drawings),
             "extract_time_ms": extract_time_ms,
+            "drawings_offset_dx": float(dx),
+            "drawings_offset_dy": float(dy),
         },
     }
 

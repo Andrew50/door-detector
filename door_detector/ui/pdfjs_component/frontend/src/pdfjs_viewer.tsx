@@ -64,6 +64,13 @@ type ManualOverlayPayload = {
   }>;
 };
 
+type ProposalOverlayPayload = {
+  drawn_bbox_pdf_xyxy?: BBox;
+  snapped_bbox_pdf_xyxy?: BBox;
+  snapped_candidate_id?: string;
+  iou?: number;
+};
+
 type ViewerEvent =
   | { type: "door_click"; event_id: string; door_id: string; ts: number }
   | {
@@ -193,6 +200,7 @@ export function PdfJsViewer(props: ComponentProps) {
 
   const doorState = (args.doorState ?? {}) as DoorState;
   const manualOverlays = (args.manualOverlays ?? {}) as ManualOverlayPayload;
+  const proposalOverlays = (args.proposalOverlays ?? {}) as ProposalOverlayPayload;
 
   const overlayDoors = (args.overlayDoors ?? []) as OverlayDoor[];
   const candidatePool = (args.candidatePool ?? []) as Candidate[];
@@ -1055,15 +1063,9 @@ export function PdfJsViewer(props: ComponentProps) {
       }
     }
 
-    // 2) Manual overlays (edit-mode only).
+    // 2) Proposal/cycling overlays (always-on) + optional server overlays.
     const manualLayer = ensureLayer("pz_manual");
     const tempLayer = ensureLayer("pz_temp");
-    if (!editMode) {
-      clearSvgLayer(manualLayer);
-      clearSvgLayer(tempLayer);
-      return;
-    }
-
     clearSvgLayer(manualLayer);
     // Once server overlays update, drop any client-only temp boxes to avoid duplicates.
     clearSvgLayer(tempLayer);
@@ -1079,6 +1081,20 @@ export function PdfJsViewer(props: ComponentProps) {
       } catch {
         // ignore
       }
+    }
+
+    // Proposal overlay: keep the last Shift+drag visible after reruns.
+    try {
+      const drawn = (proposalOverlays as any)?.drawn_bbox_pdf_xyxy;
+      if (drawn && Array.isArray(drawn) && drawn.length === 4) {
+        drawBox(manualLayer, pdfBBoxToViewportBBox(vp, drawn as BBox), "rgb(0,255,255)", 2, "6,4", 0.47);
+      }
+      const snapped = (proposalOverlays as any)?.snapped_bbox_pdf_xyxy;
+      if (snapped && Array.isArray(snapped) && snapped.length === 4) {
+        drawBox(manualLayer, pdfBBoxToViewportBBox(vp, snapped as BBox), "rgb(0,255,0)", 3, "4,3", 0.77);
+      }
+    } catch {
+      // ignore
     }
 
     const manual = manualOverlays.manual_additions ?? [];
@@ -1105,7 +1121,18 @@ export function PdfJsViewer(props: ComponentProps) {
       ty: tyRef.current,
       ts: Date.now(),
     });
-  }, [candidatePool, clearSvgLayer, cycleCandidateId, drawBox, editMode, ensureLayer, manualOverlays, overlayDoors, pageSize]);
+  }, [
+    candidatePool,
+    clearSvgLayer,
+    cycleCandidateId,
+    drawBox,
+    editMode,
+    ensureLayer,
+    manualOverlays,
+    overlayDoors,
+    pageSize,
+    proposalOverlays,
+  ]);
 
   const snapCandidateForDrawPdf = useCallback(
     (drawnPdf: BBox) => {
@@ -1432,7 +1459,7 @@ export function PdfJsViewer(props: ComponentProps) {
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       if (resetBtnRef.current && e.target instanceof Node && resetBtnRef.current.contains(e.target)) return;
-      if (editMode && e.shiftKey) {
+      if (e.shiftKey) {
         drawing = true;
         stage.style.cursor = "crosshair";
         drawStart = clientToContent(e.clientX, e.clientY);
@@ -1585,7 +1612,7 @@ export function PdfJsViewer(props: ComponentProps) {
     };
 
     const onSvgPointerDownCapture = (e: PointerEvent) => {
-      if (editMode && e.shiftKey) return;
+      if (e.shiftKey) return;
       const t = e.target as any;
       if (t && t.getAttribute && t.getAttribute("data-door-id")) {
         e.preventDefault();

@@ -15,13 +15,10 @@ import streamlit as st
 from door_detector.signatures import compute_analysis_signature
 
 from door_detector.ui.labels import (
-    cancel_edit_mode as _cancel_edit_mode,
-    enter_edit_mode as _enter_edit_mode,
     flatten_confirmed_ids,
     flatten_rejected_ids,
     get_working_label_state as _get_working_label_state,
     make_labels_payload_from_fstate,
-    save_edit_mode as _save_edit_mode,
     save_labels,
 )
 from door_detector.doors.types import DOOR_TYPES, normalize_door_type
@@ -225,104 +222,145 @@ def main_viewer_controls(
 
     c3, c4 = st.columns(2)
     with c3:
-        if not bool(fstate.get("edit_mode")):
-            if st.button("Edit Doors", use_container_width=True, type="secondary"):
-                _enter_edit_mode(fstate)
-                st.rerun()
-        else:
-            col_save, col_cancel = st.columns(2)
-            if col_save.button("Save", use_container_width=True, type="primary"):
-                _save_edit_mode(fstate)
-                save_current_labels(str(file_id), file_dir)
-                st.rerun()
-            if col_cancel.button("Cancel", use_container_width=True, type="secondary"):
-                _cancel_edit_mode(fstate)
-                st.rerun()
-            st.caption("Shift+drag to add rectangles (snap-to-candidate).")
-
-            # After a Shift+drag, allow cycling through candidate matches under that selection.
-            # This addresses the core UX issue: snapping can only pick *one* candidate, but
-            # the correct label may be a different overlapping candidate (or a component of
-            # a double-door candidate).
-            try:
-                srec = fstate.get("_last_draw_suggestions") or {}
-                suggestions = list(srec.get("suggestions") or [])
-            except Exception:
-                suggestions = []
-            if suggestions:
-                st.divider()
-                st.subheader("Selection matches")
-
-                idx_key = f"_draw_suggest_idx_{file_id}"
-                # Type filter dropdown (starts as "All types"; filtering only activates after user changes it).
-                type_key = f"_draw_suggest_type_{file_id}"
-                type_prev_key = f"_draw_suggest_type_prev_{file_id}"
-                type_touched_key = f"_draw_suggest_type_touched_{file_id}"
-
-                types = sorted({str(s.get("type") or "").strip() for s in suggestions if str(s.get("type") or "").strip()})
-                type_options = ["All types"] + types
-                if type_key not in st.session_state:
-                    st.session_state[type_key] = "All types"
-                if str(st.session_state.get(type_key) or "All types") not in type_options:
-                    st.session_state[type_key] = "All types"
-
-                chosen_type = st.selectbox("Type filter", type_options, key=type_key, label_visibility="collapsed")
-                prev_type = st.session_state.get(type_prev_key)
-                if prev_type is None:
-                    st.session_state[type_prev_key] = chosen_type
-                elif chosen_type != prev_type:
-                    st.session_state[type_prev_key] = chosen_type
-                    st.session_state[type_touched_key] = True
-
-                # Apply filter only after user has touched the dropdown.
-                use_filter = bool(st.session_state.get(type_touched_key, False)) and (chosen_type != "All types")
-                filtered = [s for s in suggestions if (not use_filter) or (str(s.get("type") or "") == chosen_type)]
-                if not filtered:
-                    filtered = suggestions
-                    use_filter = False
-
-                if idx_key not in st.session_state:
-                    st.session_state[idx_key] = 0
-                try:
-                    idx = int(st.session_state.get(idx_key) or 0)
-                except Exception:
-                    idx = 0
-                if idx < 0:
-                    idx = 0
-                if idx >= len(filtered):
-                    idx = 0
-                st.session_state[idx_key] = idx
-
-                cur = filtered[idx] if filtered else suggestions[0]
-                cur_type = str(cur.get("type") or "")
-                cur_src = str(cur.get("source") or "")
-                cur_iou = cur.get("iou")
-                cur_conf = cur.get("confidence")
-                bits = []
-                if cur_type:
-                    bits.append(f"type={cur_type}")
-                if isinstance(cur_iou, (int, float)):
-                    bits.append(f"iou={float(cur_iou):.3f}")
-                if isinstance(cur_conf, (int, float)):
-                    bits.append(f"conf={float(cur_conf):.2f}")
-                if cur_src:
-                    bits.append(str(cur_src))
-                st.caption(f"Showing **{idx+1} / {len(filtered)}**" + (" (filtered)" if use_filter else ""))
-                st.write(" / ".join(bits) if bits else "Match")
-
-                c_prev, c_next = st.columns(2)
-                if c_prev.button("Prev", use_container_width=True, key=f"prev_draw_suggest_{file_id}"):
-                    st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) - 1) % len(filtered)
-                    st.rerun()
-                if c_next.button("Next", use_container_width=True, key=f"next_draw_suggest_{file_id}"):
-                    st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) + 1) % len(filtered)
-                    st.rerun()
+        st.caption("Shift+drag to propose a selection (snap-to-candidate).")
     with c4:
         auto_focus_key = f"auto_focus_{file_id}"
         # Keep widget state and per-file fstate in sync.
         if auto_focus_key not in st.session_state:
             st.session_state[auto_focus_key] = bool(fstate.get("auto_focus", True))
         fstate["auto_focus"] = st.checkbox("Auto-focus", key=auto_focus_key)
+
+    # After a Shift+drag, allow cycling through candidate matches under that selection.
+    # This addresses the core UX issue: snapping can only pick *one* candidate, but the
+    # correct label may be a different overlapping candidate (or a component of a double).
+    try:
+        srec = fstate.get("_last_draw_suggestions") or {}
+        suggestions = list(srec.get("suggestions") or [])
+    except Exception:
+        suggestions = []
+    if suggestions:
+        st.divider()
+        st.subheader("Proposal / Matches")
+
+        idx_key = f"_draw_suggest_idx_{file_id}"
+        # Type filter dropdown (starts as "All types"; filtering only activates after user changes it).
+        type_key = f"_draw_suggest_type_{file_id}"
+        type_prev_key = f"_draw_suggest_type_prev_{file_id}"
+        type_touched_key = f"_draw_suggest_type_touched_{file_id}"
+
+        types = sorted({str(s.get("type") or "").strip() for s in suggestions if str(s.get("type") or "").strip()})
+        type_options = ["All types"] + types
+        if type_key not in st.session_state:
+            st.session_state[type_key] = "All types"
+        if str(st.session_state.get(type_key) or "All types") not in type_options:
+            st.session_state[type_key] = "All types"
+
+        chosen_type = st.selectbox("Type filter", type_options, key=type_key, label_visibility="collapsed")
+        prev_type = st.session_state.get(type_prev_key)
+        if prev_type is None:
+            st.session_state[type_prev_key] = chosen_type
+        elif chosen_type != prev_type:
+            st.session_state[type_prev_key] = chosen_type
+            st.session_state[type_touched_key] = True
+
+        # Apply filter only after user has touched the dropdown.
+        use_filter = bool(st.session_state.get(type_touched_key, False)) and (chosen_type != "All types")
+        filtered = [s for s in suggestions if (not use_filter) or (str(s.get("type") or "") == chosen_type)]
+        if not filtered:
+            filtered = suggestions
+            use_filter = False
+
+        if idx_key not in st.session_state:
+            st.session_state[idx_key] = 0
+        try:
+            idx = int(st.session_state.get(idx_key) or 0)
+        except Exception:
+            idx = 0
+        if idx < 0:
+            idx = 0
+        if filtered and idx >= len(filtered):
+            idx = 0
+        st.session_state[idx_key] = idx
+
+        cur = filtered[idx] if filtered else suggestions[0]
+        cur_id = str(cur.get("id") or "")
+        cur_type = str(cur.get("type") or "")
+        cur_src = str(cur.get("source") or "")
+        cur_iou = cur.get("iou")
+        cur_conf = cur.get("confidence")
+        bits = []
+        if cur_id:
+            bits.append(f"id={cur_id}")
+        if cur_type:
+            bits.append(f"type={cur_type}")
+        if isinstance(cur_iou, (int, float)):
+            bits.append(f"iou={float(cur_iou):.3f}")
+        if isinstance(cur_conf, (int, float)):
+            bits.append(f"conf={float(cur_conf):.2f}")
+        if cur_src:
+            bits.append(str(cur_src))
+        st.caption(f"Showing **{idx+1} / {len(filtered)}**" + (" (filtered)" if use_filter else ""))
+        st.write(" / ".join(bits) if bits else "Match")
+
+        c_prev, c_next = st.columns(2)
+        if c_prev.button("Prev", use_container_width=True, key=f"prev_draw_suggest_{file_id}"):
+            st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) - 1) % len(filtered)
+            st.rerun()
+        if c_next.button("Next", use_container_width=True, key=f"next_draw_suggest_{file_id}"):
+            st.session_state[idx_key] = (int(st.session_state.get(idx_key) or 0) + 1) % len(filtered)
+            st.rerun()
+
+        c_use, c_discard = st.columns(2)
+        if c_use.button(
+            "Use highlighted match",
+            use_container_width=True,
+            type="primary",
+            key=f"use_draw_suggest_{file_id}",
+            disabled=not bool(cur_id),
+        ):
+            try:
+                st.session_state[f"door_click_sink_{file_id}"] = str(cur_id)
+            except Exception:
+                pass
+            _mark_nav_intent(str(file_id))
+            st.rerun()
+
+        if c_discard.button(
+            "Discard proposal",
+            use_container_width=True,
+            type="secondary",
+            key=f"discard_draw_suggest_{file_id}",
+        ):
+            # Clear proposal state. If the proposal created a manual candidate id, drop it.
+            try:
+                prop = fstate.get("_proposal") or {}
+            except Exception:
+                prop = {}
+            try:
+                created_id = str(prop.get("created_manual_candidate_id") or "")
+            except Exception:
+                created_id = ""
+            if created_id:
+                try:
+                    mc = list(fstate.get("manual_candidates", []) or [])
+                    fstate["manual_candidates"] = [
+                        c for c in mc if not (isinstance(c, dict) and str(c.get("id") or "") == created_id)
+                    ]
+                except Exception:
+                    pass
+            try:
+                fstate["_proposal"] = None
+            except Exception:
+                pass
+            try:
+                fstate["_last_draw_suggestions"] = None
+            except Exception:
+                pass
+            try:
+                st.session_state[idx_key] = 0
+            except Exception:
+                pass
+            st.rerun()
 
 
 def _sync_selected_door_for_run(
@@ -561,6 +599,11 @@ def right_panel_review(
     conf = max(0.0, min(1.0, conf))
     conf_pct = int(round(conf * 100))
 
+    # Make it explicit that the panel below refers to the currently selected door.
+    st.markdown(f"**Door {int(selected_idx) + 1} / {len(all_visible)}**")
+    if did:
+        st.caption(f"ID: `{did}`")
+
     # Use the *current working* label state so this reflects draft changes in edit mode.
     working = _get_working_label_state(fstate)
     try:
@@ -642,7 +685,7 @@ def right_panel_review(
     ui_label_type = normalize_door_type(st.session_state.get(label_type_key), default=default_label_type)
     detected_type = normalize_door_type(selected_door.get("type"), default="swing")
     confirm_label = f"Confirm {str(ui_label_type).capitalize()} door"
-    reject_label = f"Delete / Reject {str(detected_type).capitalize()} door"
+    reject_label = f"Not a {str(detected_type).capitalize()} door"
 
     if c1.button(confirm_label, use_container_width=True, key=f"confirm_btn_{key_suffix}"):
         # Ensure confirmed_by_type exists.
@@ -684,6 +727,15 @@ def right_panel_review(
                 pass
         else:
             save_current_labels(str(file_id), file_dir)
+
+        # Clear any active proposal/match list after committing a label.
+        try:
+            fstate["_proposal"] = None
+            fstate["_last_draw_suggestions"] = None
+            st.session_state[f"_draw_suggest_idx_{file_id}"] = 0
+        except Exception:
+            pass
+
         # UX: advance to the next door (wrap) after confirming.
         #
         # IMPORTANT: don't rely on mutating the number_input's idx key here; Streamlit can
@@ -701,7 +753,7 @@ def right_panel_review(
         reject_label,
         use_container_width=True,
         key=f"reject_btn_{key_suffix}",
-        help="Reject this candidate as its detected door type (e.g. 'not a double').",
+        help="Typed negative: mark this candidate as NOT its detected door type (e.g. 'not a double').",
     ):
         # Ensure rejected_by_type exists.
         try:
@@ -746,6 +798,15 @@ def right_panel_review(
             ]
         else:
             save_current_labels(str(file_id), file_dir)
+
+        # Clear any active proposal/match list after committing a label.
+        try:
+            fstate["_proposal"] = None
+            fstate["_last_draw_suggestions"] = None
+            st.session_state[f"_draw_suggest_idx_{file_id}"] = 0
+        except Exception:
+            pass
+
         # UX: selection will advance automatically. Treat this as explicit navigation so
         # auto-focus (if enabled) will focus the next selected door.
         _mark_nav_intent(str(file_id))
@@ -758,7 +819,7 @@ def right_panel_review(
         use_container_width=True,
         type="secondary",
         key=f"not_door_btn_{key_suffix}",
-        help="Use this only when the highlighted item is truly not any door type (global negative).",
+        help="Global negative: use only when the highlighted item is truly not any door type (hide it).",
     ):
         working["deleted_ids"].add(did)
         try:
@@ -791,6 +852,15 @@ def right_panel_review(
             ]
         else:
             save_current_labels(str(file_id), file_dir)
+
+        # Clear any active proposal/match list after committing a label.
+        try:
+            fstate["_proposal"] = None
+            fstate["_last_draw_suggestions"] = None
+            st.session_state[f"_draw_suggest_idx_{file_id}"] = 0
+        except Exception:
+            pass
+
         # UX: selection will advance automatically. Treat this as explicit navigation so
         # auto-focus (if enabled) will focus the next selected door.
         _mark_nav_intent(str(file_id))
@@ -808,7 +878,4 @@ def right_panel_review(
         f"{len(working.get('unmatched_manual_boxes', []))} unmatched"
     )
 
-    if is_editing:
-        st.divider()
-        st.subheader("Edit Doors")
-
+    # Edit-mode controls were removed; all actions apply immediately.
