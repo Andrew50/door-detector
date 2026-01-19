@@ -21,7 +21,7 @@ from door_detector.ui.labels import (
     save_labels,
 )
 from door_detector.doors.dedupe import is_duplicate
-from door_detector.doors.types import DOOR_TYPES, normalize_door_type
+from door_detector.doors.types import DOOR_TYPES, UI_DOOR_TYPES, normalize_door_type
 from door_detector.ui.ui_debug import push_breadcrumb, tail_breadcrumbs, warn_once, sample_ids, ui_event_log
 
 
@@ -307,7 +307,7 @@ def main_viewer_controls(
     # Important: the detector may emit swing-related subtypes like `swing_arc` / `swing_leaf`.
     # For UI filtering, those should be treated as canonical `swing` (and never appear as
     # separate filter options).
-    counts: dict[str, int] = {t: 0 for t in DOOR_TYPES}
+    counts: dict[str, int] = {t: 0 for t in UI_DOOR_TYPES}
     for d in visible_items:
         t_norm = normalize_door_type(d.get("type"), default="")
         if not t_norm:
@@ -315,9 +315,8 @@ def main_viewer_controls(
         if t_norm in counts:
             counts[t_norm] = int(counts.get(t_norm, 0)) + 1
 
-    # Always show the full set of canonical door types (even if count is 0),
-    # so reviewers can quickly switch to Pocket/Bifold.
-    type_values = list(DOOR_TYPES)
+    # UI only exposes Swing/Double as distinct type filters.
+    type_values = list(UI_DOOR_TYPES)
     # IMPORTANT: keep filter state separate from the widget key.
     #
     # Using the same key for both the Streamlit widget and our application state caused
@@ -343,7 +342,7 @@ def main_viewer_controls(
         if sl == "unconfirmed":
             return "Unconfirmed"
         t = normalize_door_type(s, default="")
-        return t if t else "All"
+        return t if (t and t in UI_DOOR_TYPES) else "All"
 
     if door_filter_state_key not in st.session_state:
         try:
@@ -728,13 +727,14 @@ def right_panel_review(
             st.session_state[idx_key] = 0
 
         # Type dropdown behavior:
-        # - Only show canonical label types (Swing/Double/Pocket/Bifold).
+        # - Only show UI label types (Swing/Double).
         # - If the user has never interacted with it, DO NOT filter cycling; instead,
         #   auto-set the dropdown value to match the currently highlighted suggestion's canonical type.
         # - Once the user selects a type, filter cycling to that type only.
         #
         # Detector subtypes like `swing_arc` / `swing_leaf` should be treated as `swing`.
-        types = list(DOOR_TYPES)
+        # UI types: only Swing/Double are exposed as explicit choices.
+        types = list(UI_DOOR_TYPES)
 
         def _mark_type_touched() -> None:
             try:
@@ -1074,6 +1074,9 @@ def right_panel_review(
     except Exception:
         labeled_type = None
     default_label_type = labeled_type or normalize_door_type(selected_door.get("type"), default="swing")
+    # UI only exposes Swing/Double; coerce any other types (e.g. Pocket) to Swing.
+    if str(default_label_type) not in UI_DOOR_TYPES:
+        default_label_type = "swing"
 
     # UX: default "Label as" to the *currently selected door's* detected type.
     # The widget key is per-file, so we explicitly reset it when selection changes.
@@ -1083,12 +1086,12 @@ def right_panel_review(
 
     if label_type_key not in st.session_state:
         st.session_state[label_type_key] = default_label_type
-    if str(st.session_state.get(label_type_key) or "") not in DOOR_TYPES:
+    if str(st.session_state.get(label_type_key) or "") not in UI_DOOR_TYPES:
         st.session_state[label_type_key] = default_label_type
 
     st.selectbox(
         "Label as",
-        list(DOOR_TYPES),
+        list(UI_DOOR_TYPES),
         key=label_type_key,
         format_func=lambda t: str(t).capitalize(),
     )

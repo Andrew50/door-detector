@@ -1,6 +1,6 @@
 # Door Detector: Door Detection in Floor Plans
 
-Detect and review door candidates (swing/double/pocket/bifold) in architectural floor plan PDFs.
+Detect and review door candidates (swing/double) in architectural floor plan PDFs.
 
 This repo is set up to be easy to run locally (Streamlit UI) and easy to inspect (artifacts + overlays).
 
@@ -21,6 +21,10 @@ In the UI:
 - Click **Analyze** (runs Step 1 + Step 2)
 - Review detections (confirm / reject / delete) and add missed doors (**Edit Doors → Shift+drag**)
 - Labels are saved to `artifacts/library/<file_id>/labels.json` (schema v4)
+
+## Architecture diagram (good for Loom)
+
+See `docs/ARCHITECTURE_DIAGRAM.md` for a one-screen diagram of the pipeline and the review → retrain loop.
 
 ## Data
 
@@ -73,6 +77,13 @@ For a single processed page (CLI or UI), you’ll typically see:
 - `labels.json`: reviewer feedback (created/updated by the UI)
 
 For detection and learning details, see `docs/door_selection_process.md`.
+
+
+Notes:
+
+- The UI includes a bundled **PDF.js** viewer; **you do not need Node/npm** to run the app.
+- Only if you edit the TypeScript/React viewer under `door_detector/ui/pdfjs_component/frontend/`, rebuild it with `npm install` + `npm run build` (details in `docs/SETUP.md`).
+
 
 ## Testing
 

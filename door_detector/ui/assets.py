@@ -303,6 +303,16 @@ GLOBAL_STYLE_HTML = r"""
     [data-testid="stFileUploader"] section > div {
         display: none !important;
     }
+    /* When a file is selected, Streamlit may render a file "chip" row with an X
+       remove button. We never want to show that in the sidebar; we immediately
+       rerun after processing the upload, and also hide it defensively here. */
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"],
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"],
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderFileData"],
+    [data-testid="stFileUploader"] button[title="Remove file"],
+    [data-testid="stFileUploader"] button[aria-label*="Remove file"] {
+        display: none !important;
+    }
     [data-testid="stFileUploader"] button {
         background-color: #ff4b4b !important;
         color: white !important;

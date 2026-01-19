@@ -22,8 +22,9 @@ def test_coerce_by_type_normalizes_legacy_keys() -> None:
     )
     assert "d1" in cbt["double"]
     assert "d2" in cbt["double"]
-    assert "b1" in cbt["bifold"]
-    assert "b2" in cbt["bifold"]
+    # Bifold labels are mapped to double.
+    assert "b1" in cbt["double"]
+    assert "b2" in cbt["double"]
 
     rbt = coerce_rejected_by_type({"pocket doors": ["p1"]})
     assert "p1" in rbt["pocket"]

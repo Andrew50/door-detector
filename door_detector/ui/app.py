@@ -24,7 +24,7 @@ from door_detector.step2_pipeline import run_step2
 
 from door_detector.ui import assets
 from door_detector.ui.artifacts_io import get_full_page_dims, load_file_artifacts
-from door_detector.doors.types import normalize_door_type
+from door_detector.doors.types import UI_DOOR_TYPES, normalize_door_type
 from door_detector.ui.labels import (
     coerce_confirmed_by_type,
     coerce_rejected_by_type,
@@ -59,7 +59,7 @@ def _default_config_path_str() -> str:
 
 
 def _normalize_door_filter_value(v: object) -> str:
-    """Coerce UI filter value to one of {All, Confirmed, Unconfirmed, <canonical door type>}."""
+    """Coerce UI filter value to one of {All, Confirmed, Unconfirmed, <UI door type>}."""
     try:
         s = str(v).strip()
     except Exception:
@@ -72,7 +72,7 @@ def _normalize_door_filter_value(v: object) -> str:
     if sl == "unconfirmed":
         return "Unconfirmed"
     t = normalize_door_type(s, default="")
-    return t if t else "All"
+    return t if (t and t in UI_DOOR_TYPES) else "All"
 
 
 
@@ -292,8 +292,10 @@ def _preferred_label_type_for_draw(*, file_id: str, default: str = "swing") -> s
     except Exception:
         touched, chosen = False, ""
     if touched and chosen and chosen != "All types":
-        return normalize_door_type(chosen, default=default)
-    return normalize_door_type(default, default="swing")
+        t = normalize_door_type(chosen, default=default)
+        return t if t in UI_DOOR_TYPES else normalize_door_type(default, default="swing")
+    t0 = normalize_door_type(default, default="swing")
+    return t0 if t0 in UI_DOOR_TYPES else "swing"
 
 
 def _snap_to_candidate(

@@ -14,6 +14,13 @@ DoorType = Literal["swing", "double", "pocket", "bifold"]
 DOOR_TYPES: tuple[str, ...] = ("swing", "double", "pocket", "bifold")
 DOOR_TYPES_SET: set[str] = set(DOOR_TYPES)
 
+# Door types exposed as explicit UI choices (review filter + "Label as" dropdowns).
+#
+# Note: The detector may still emit `pocket` and `bifold`, but the review UI treats those
+# as non-separate categories (see `normalize_door_type` mapping + UI usage).
+UI_DOOR_TYPES: tuple[str, ...] = ("swing", "double")
+UI_DOOR_TYPES_SET: set[str] = set(UI_DOOR_TYPES)
+
 
 def normalize_door_type(v: object, *, default: str = "swing") -> str:
     """Return a canonical door type string (or default)."""
@@ -35,20 +42,22 @@ def normalize_door_type(v: object, *, default: str = "swing") -> str:
         "swing_leaf": "swing",
         "leaf_arc": "swing",
         # Common human-friendly variants.
-        "bi_fold": "bifold",
-        "bi_fold_door": "bifold",
-        "bi_fold_doors": "bifold",
-        "bifold_door": "bifold",
-        "bifold_doors": "bifold",
+        # Bifold doors are treated as double doors in the UI/training mapper.
+        "bifold": "double",
+        "bi_fold": "double",
+        "bi_fold_door": "double",
+        "bi_fold_doors": "double",
+        "bifold_door": "double",
+        "bifold_doors": "double",
         "double_door": "double",
         "double_doors": "double",
         "pocket_door": "pocket",
         "pocket_doors": "pocket",
     }
 
-    if s in DOOR_TYPES_SET:
-        return s
     if s in aliases:
         return aliases[s]
+    if s in DOOR_TYPES_SET:
+        return s
     return default
 

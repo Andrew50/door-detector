@@ -163,6 +163,9 @@ def sidebar_library(lib: Library) -> None:
                 # don't re-add it on the next rerun.
                 st.session_state.selected_file_id = file_id
                 st.session_state.upload_widget_seq = int(st.session_state.get("upload_widget_seq") or 0) + 1
+                # Immediately rerun so the transient "uploaded file + X" row from
+                # Streamlit's uploader doesn't flash above the library list.
+                st.rerun()
     else:
         col_input, col_close = st.sidebar.columns([5, 1])
         with col_input:
