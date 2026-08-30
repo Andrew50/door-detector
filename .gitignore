@@ -33,16 +33,18 @@ ENV/
 *.swo
 *~
 
-# Project specific
+# Project-specific local/source data
 inputs/
 artifacts/
 *.pdf
 
+# Locally trained model artifacts
+models/reweighter_*.json
+models/retrain_state*.json
+
 # OS
 .DS_Store
 Thumbs.db
-
-
 
 # node.js
 node_modules/
