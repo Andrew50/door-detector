@@ -26,9 +26,11 @@ In the UI:
 
 See `docs/ARCHITECTURE_DIAGRAM.md` for a one-screen diagram of the pipeline and the review → retrain loop.
 
-## Data
+## Data and pretrained models
 
-- Floor plan PDFs: [Google Drive folder](https://drive.google.com/drive/folders/1QSsrLCr13xX6h-LYBolEslI369vtahwc?usp=sharing)
+Floor-plan datasets are **not included or linked from this repository**. Use PDFs that you have permission to process by uploading them through the review UI or passing them to the CLI.
+
+Generated inputs, review artifacts, PDFs, labels, and locally trained reweighter models are intentionally excluded from version control. The detector runs without pretrained reweighters; optional models can be trained locally from your own reviewed documents.
 
 ## Setup
 
@@ -61,7 +63,7 @@ door-detector-step2 --artifacts artifacts/floor_plan --config configs/door_rules
 door-detector-reweight --artifacts artifacts --out-dir models
 ```
 
-If you train models and save them under non default names, update `configs/door_rules.json` → `reweighters` to point at them (see `docs/retraining.md`).
+To use locally trained models, add their paths under `configs/door_rules.json` → `reweighters` (see `docs/retraining.md`).
 
 ## Outputs (what to look at)
 
@@ -78,12 +80,10 @@ For a single processed page (CLI or UI), you’ll typically see:
 
 For detection and learning details, see `docs/door_selection_process.md`.
 
-
 Notes:
 
 - The UI includes a bundled **PDF.js** viewer; **you do not need Node/npm** to run the app.
 - Only if you edit the TypeScript/React viewer under `door_detector/ui/pdfjs_component/frontend/`, rebuild it with `npm install` + `npm run build` (details in `docs/SETUP.md`).
-
 
 ## Testing
 
@@ -98,4 +98,3 @@ pytest -q
 ```
 
 More tests and local workflows: see `docs/TESTING.md`.
-
