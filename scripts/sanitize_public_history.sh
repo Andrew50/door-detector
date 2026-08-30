@@ -35,6 +35,7 @@ git filter-repo --force \
   --path-glob 'artifacts/**' \
   --path-glob 'inputs/**' \
   --path-glob '*.pdf' \
+  --path-glob '**/*.pdf' \
   --path 'docs/candidate_failure_log.md' \
   --path-glob 'models/reweighter_*.json' \
   --path-glob 'models/retrain_state*.json' \
@@ -56,7 +57,7 @@ if [[ -n "$remaining_paths" ]]; then
 fi
 
 echo
- echo "History rewrite completed locally and verification passed."
+echo "History rewrite completed locally and verification passed."
 echo "git-filter-repo normally removes the origin remote as a safety measure."
 if [[ -n "$origin_url" ]]; then
   echo "Original origin was: $origin_url"
