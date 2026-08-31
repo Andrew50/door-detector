@@ -1,11 +1,6 @@
 {
   "schema_version": 2,
-  "reweighters": {
-    "swing": "models/reweighter_swing_v1.json",
-    "double": "models/reweighter_double_v1.json",
-    "pocket": "models/reweighter_pocket_v1.json",
-    "bifold": "models/reweighter_bifold_v1.json"
-  },
+  "reweighters": {},
   "mode_policy": {
     "vector": "vector_rules",
     "hybrid": "vector_rules",

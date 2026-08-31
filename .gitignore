@@ -20,6 +20,14 @@ wheels/
 .installed.cfg
 *.egg
 
+# Test / coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
+
 # Virtual environments
 venv/
 env/
@@ -33,16 +41,18 @@ ENV/
 *.swo
 *~
 
-# Project specific
+# Project-specific local/source data
 inputs/
 artifacts/
 *.pdf
 
+# Locally trained model artifacts
+models/reweighter_*.json
+models/retrain_state*.json
+
 # OS
 .DS_Store
 Thumbs.db
-
-
 
 # node.js
 node_modules/

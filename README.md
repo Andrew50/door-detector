@@ -1,12 +1,47 @@
-# Door Detector: Door Detection in Floor Plans
+# Door Detector
 
-Detect and review door candidates (swing/double) in architectural floor plan PDFs.
+Detects door symbols in vector architectural floor-plan PDFs, then lets a reviewer confirm, reject, or add doors in a Streamlit UI.
 
-This repo is set up to be easy to run locally (Streamlit UI) and easy to inspect (artifacts + overlays).
+Built for CAD-style plans where doors are drawn as swing arcs, leaf lines, dashed pocket tracks, or bifold zig-zags—not for scanned raster-only sheets.
 
-## Quickstart (run the review UI)
+## Overview
 
-Requirements: **Python 3.10+**.
+Floor-plan PDFs store door geometry as vector primitives. This project turns those primitives into door candidates with a two-step pipeline:
+
+1. **Step 1** rasterizes a page and extracts lines, Beziers, and related primitives into pixel-space artifacts (`primitives.json`, `transform.json`, `page.png`).
+2. **Step 2** proposes candidates with geometric rules (circle-fit arcs, leaf pairing, spatial indexing, NMS/dedupe), optionally re-scores them with a small logistic model trained from review labels, and writes `doors.json`.
+
+A Streamlit review app wraps the pipeline: upload a PDF, run analysis, inspect overlays in a bundled PDF.js viewer, label results, and retrain per-door-type reweighters locally.
+
+## Highlights
+
+- Geometry-first detection for swing, double, pocket, and bifold doors, with thresholds in `configs/door_rules.json`.
+- Broad candidate pool plus stricter final `doors` list so missed doors can still be snapped/labeled during review.
+- Handles drafting variation such as Bezier arcs vs polyline (including dashed) arc approximations.
+- Human-in-the-loop labels (`labels.json` schema v4) feed `door-detector-reweight`, which fits per-type logistic reweighters without a deep-learning stack.
+- Custom PDF.js Streamlit component for zoomable overlay review; prebuilt frontend assets are committed so Node is not required to run the app.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  PDF["Floor-plan PDF"] --> S1["Step 1: normalize"]
+  S1 --> Art["Artifacts<br/>primitives / transform / page.png"]
+  Art --> S2["Step 2: detect"]
+  CFG["door_rules.json"] --> S2
+  MOD["optional reweighters"] --> S2
+  S2 --> Out["doors.json + overlay"]
+  Out --> UI["Streamlit review UI"]
+  UI --> Labels["labels.json"]
+  Labels --> Train["door-detector-reweight"]
+  Train --> MOD
+```
+
+More detail: [`docs/ARCHITECTURE_DIAGRAM.md`](docs/ARCHITECTURE_DIAGRAM.md), [`docs/door_selection_process.md`](docs/door_selection_process.md).
+
+**Stack:** Python 3.10+, PyMuPDF, NumPy, Pillow, Streamlit, TypeScript/React PDF.js viewer (Vite)
+
+## Run locally
 
 ```bash
 python3 -m venv venv
@@ -15,87 +50,45 @@ python3 -m pip install -e .
 streamlit run door_detector/review_app.py
 ```
 
-In the UI:
+In the UI: upload a PDF you are allowed to process → **Analyze** → confirm/reject/delete detections, or **Edit Doors → Shift+drag** to add missed doors. Labels land under `artifacts/library/<file_id>/`.
 
-- Upload a PDF (saved under `artifacts/library/<file_id>/source.pdf`)
-- Click **Analyze** (runs Step 1 + Step 2)
-- Review detections (confirm / reject / delete) and add missed doors (**Edit Doors → Shift+drag**)
-- Labels are saved to `artifacts/library/<file_id>/labels.json` (schema v4)
-
-## Architecture diagram
-
-See `docs/ARCHITECTURE_DIAGRAM.md` for a one-screen diagram of the pipeline and the review → retrain loop.
-
-## Data
-
-- Floor plan PDFs: [Google Drive folder](https://drive.google.com/drive/folders/1QSsrLCr13xX6h-LYBolEslI369vtahwc?usp=sharing)
-
-## Setup
-
-Requirements: **Python 3.10+**.
+CLI (optional):
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-python3 -m pip install -e .
-```
-
-Optional (dev / tests):
-
-```bash
-python3 -m pip install -e ".[dev]"
-```
-
-More details (incl. troubleshooting / optional PDF.js rebuild notes): see `docs/SETUP.md`.
-
-## Run (optional): CLI pipeline
-
-```bash
-# Step 1: PDF → normalized artifacts (raster + extracted vector primitives)
-door-detector-step1 inputs/floor_plan.pdf --out artifacts/floor_plan --dpi 400 --page-index 0
-
-# Step 2: detect doors
-door-detector-step2 --artifacts artifacts/floor_plan --config configs/door_rules.json
-
-# (Optional) learn from review labels (writes per-type models under --out-dir)
+door-detector-step1 inputs/plan.pdf --out artifacts/plan --dpi 400 --page-index 0
+door-detector-step2 --artifacts artifacts/plan --config configs/door_rules.json
 door-detector-reweight --artifacts artifacts --out-dir models
 ```
 
-If you train models and save them under non default names, update `configs/door_rules.json` → `reweighters` to point at them (see `docs/retraining.md`).
+Point `configs/door_rules.json` → `reweighters` at locally trained models when you have them. See [`docs/retraining.md`](docs/retraining.md).
 
-## Outputs (what to look at)
+Floor-plan datasets and pretrained models are **not** shipped or linked here. Use documents you have permission to process. Local PDFs, review artifacts, and trained model JSON are gitignored.
 
-For a single processed page (CLI or UI), you’ll typically see:
+Setup notes (venv troubleshooting, PDF.js rebuild): [`docs/SETUP.md`](docs/SETUP.md).
 
-- `page.png`: rasterized page
-- `primitives.json`: extracted vector primitives (pixel space)
-- `transform.json`: PDF↔pixel transforms
-- `meta.json`: timings + mode (scan/vector/hybrid)
-- `debug_overlay.png`: optional Step 1 debug overlay (can be disabled)
-- `doors.json`: Step 2 output (final `doors` + broader `candidates`)
-- `doors_overlay.png`: Step 2 visualization overlay
-- `labels.json`: reviewer feedback (created/updated by the UI)
+## Tests
 
-For detection and learning details, see `docs/door_selection_process.md`.
-
-
-Notes:
-
-- The UI includes a bundled **PDF.js** viewer; **you do not need Node/npm** to run the app.
-- Only if you edit the TypeScript/React viewer under `door_detector/ui/pdfjs_component/frontend/`, rebuild it with `npm install` + `npm run build` (details in `docs/SETUP.md`).
-
-
-## Testing
+Smoke test (synthetic PDF, no external data):
 
 ```bash
 python3 tests/test_step2_smoke.py
 ```
 
-If you prefer `pytest`, install the dev extra and run:
+Full suite:
 
 ```bash
+python3 -m pip install -e ".[dev]"
 pytest -q
 ```
 
-More tests and local workflows: see `docs/TESTING.md`.
+Details: [`docs/TESTING.md`](docs/TESTING.md).
 
+## Project layout
+
+- `door_detector/pdf/` — render, vector extract, transforms, page-mode classify
+- `door_detector/doors/` — detection, geometry, dedupe, overlays
+- `door_detector/ui/` — Streamlit app and PDF.js component
+- `door_detector/step1_pipeline.py`, `step2_pipeline.py` — CLI entrypoints
+- `door_detector/reweight_fit.py` — train reweighters from labels
+- `configs/door_rules.json` — thresholds and scoring
+- `tests/` — unit and smoke tests
